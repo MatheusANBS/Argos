@@ -76,3 +76,11 @@ Requisitos cumulativos:
 2. attach com `access: "read_write"`;
 3. chamada com `confirmation: "AUTHORIZED_DEBUG_WRITE"`;
 4. tamanho dentro de `ARGOS_MCP_MAX_WRITE_BYTES`.
+
+## Tools propostas (ainda não implementadas)
+
+`memory_debug.strings`, `memory_debug.scan_pointers_to`,
+`memory_debug.pdb_list_types`, `memory_debug.scan_first`/`scan_next` e
+`memory_debug.launch`/`read_output` estão especificadas mas ainda não
+existem no servidor. Ver
+[`docs/specs/0000-roadmap-introspeccao-runtime.md`](../specs/0000-roadmap-introspeccao-runtime.md).
