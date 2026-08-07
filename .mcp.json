@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "argos-memory": {
+      "type": "stdio",
+      "command": "C:\\Users\\matheuss\\Desktop\\Sistemas\\Yggdrasil\\build\\dev\\Release\\argos_runtime_memory_mcp.exe",
+      "args": [],
+      "env": {
+        "ARGOS_MCP_LOG_LEVEL": "info",
+        "ARGOS_MCP_ALLOW_WRITE": "0",
+        "ARGOS_MCP_ALLOW_FOREIGN_USER": "0"
+      }
+    }
+  }
+}

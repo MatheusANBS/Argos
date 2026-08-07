@@ -1,0 +1,21 @@
+{
+  "skills": [
+    "cpp-api-design",
+    "cpp-architecture",
+    "cpp-build-system",
+    "cpp-concurrency",
+    "cpp-data-structures",
+    "cpp-dependency-management",
+    "cpp-interop",
+    "cpp-memory-safety",
+    "cpp-modern",
+    "cpp-observability",
+    "cpp-performance",
+    "cpp-review",
+    "cpp-security",
+    "cpp-testing",
+    "cpp-toolchain"
+  ],
+  "count": 15,
+  "language": "pt-BR"
+}

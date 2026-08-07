@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "argos-memory": {
+      "command": "C:/absolute/path/to/argos_runtime_memory_mcp.exe",
+      "args": [],
+      "env": {
+        "ARGOS_MCP_LOG_LEVEL": "info",
+        "ARGOS_MCP_ALLOW_WRITE": "0"
+      }
+    }
+  }
+}
