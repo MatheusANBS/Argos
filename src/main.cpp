@@ -11,12 +11,27 @@
 #include <iostream>
 #include <memory>
 
+#if defined(_WIN32)
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 int main() {
     try {
+#if defined(_WIN32)
+        // Defense in depth alongside the explicit handle allowlist used by
+        // memory_debug.launch (see native_process_memory.cpp): make sure
+        // this process's own standard handles are never inheritable, so a
+        // launched child can never end up holding the MCP's own protocol
+        // pipe open regardless of how it was started.
+        SetHandleInformation(GetStdHandle(STD_INPUT_HANDLE), HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(GetStdHandle(STD_OUTPUT_HANDLE), HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(GetStdHandle(STD_ERROR_HANDLE), HANDLE_FLAG_INHERIT, 0);
+#endif
         const auto policy = argos::security::SecurityPolicy::from_environment();
         argos::observability::Logger logger{argos::observability::log_level_from_environment()};
         auto provider = std::make_unique<argos::infrastructure::NativeProcessMemoryProvider>(
-            policy.allow_foreign_user
+            policy.allow_foreign_user, policy.max_captured_output_bytes
         );
         auto metadata_provider = std::make_unique<argos::infrastructure::PdbTypeMetadataProvider>();
         argos::application::MemoryDebugService service{

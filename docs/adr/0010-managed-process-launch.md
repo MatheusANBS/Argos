@@ -1,6 +1,6 @@
 # ADR-0010 — Início gerenciado de processo com captura de saída
 
-Status: proposto
+Status: aceito
 
 ## Contexto
 

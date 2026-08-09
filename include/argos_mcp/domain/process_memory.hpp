@@ -2,12 +2,29 @@
 
 #include "argos_mcp/domain/types.hpp"
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
 namespace argos::domain {
+
+struct LaunchSpec {
+    std::string executable;
+    std::vector<std::string> arguments;
+    std::optional<std::string> working_directory;
+    bool capture_output{true};
+};
+
+struct OutputChunk {
+    std::string stdout_text;
+    std::string stderr_text;
+    std::uint64_t cursor{};
+    bool process_alive{true};
+};
 
 class ProcessSession {
 public:
@@ -31,6 +48,22 @@ public:
     [[nodiscard]] virtual Result<std::vector<ModuleInfo>> modules() const = 0;
 };
 
+// A ProcessSession for a process the MCP itself started with launch(). In
+// addition to the read-only/read-write memory access every ProcessSession
+// offers, an owned session can be polled for captured stdout/stderr and can
+// be terminated by the server -- capabilities attach() sessions never gain.
+class LaunchedProcessSession : public ProcessSession {
+public:
+    [[nodiscard]] virtual Result<OutputChunk> read_output(
+        std::uint64_t since_cursor,
+        std::size_t max_bytes
+    ) = 0;
+
+    [[nodiscard]] virtual Result<void> terminate() = 0;
+
+    [[nodiscard]] virtual bool owned() const noexcept = 0;
+};
+
 class ProcessMemoryProvider {
 public:
     virtual ~ProcessMemoryProvider() = default;
@@ -42,6 +75,11 @@ public:
 
     [[nodiscard]] virtual Result<std::unique_ptr<ProcessSession>> attach(
         ProcessId pid,
+        AccessMode access
+    ) const = 0;
+
+    [[nodiscard]] virtual Result<std::unique_ptr<LaunchedProcessSession>> launch(
+        const LaunchSpec& spec,
         AccessMode access
     ) const = 0;
 };

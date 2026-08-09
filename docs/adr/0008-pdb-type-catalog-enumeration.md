@@ -1,6 +1,6 @@
 # ADR-0008 — Enumeração de tipos do PDB
 
-Status: proposto
+Status: aceito
 
 ## Contexto
 

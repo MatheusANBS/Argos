@@ -1,6 +1,6 @@
 # Spec 0003 — `memory_debug.pdb_list_types`
 
-Status: proposto · ADR: [0008](../adr/0008-pdb-type-catalog-enumeration.md)
+Status: aceito · ADR: [0008](../adr/0008-pdb-type-catalog-enumeration.md)
 
 ## Objetivo
 

@@ -26,9 +26,39 @@ private:
     std::string value_;
 };
 
+class ScanSessionId final {
+public:
+    static std::expected<ScanSessionId, std::string> create(std::string value);
+
+    [[nodiscard]] const std::string& value() const noexcept { return value_; }
+    [[nodiscard]] bool operator==(const ScanSessionId&) const = default;
+
+private:
+    explicit ScanSessionId(std::string value) : value_(std::move(value)) {}
+    std::string value_;
+};
+
 enum class AccessMode {
     read_only,
     read_write,
+};
+
+enum class ScanValueType {
+    u8, u16, u32, u64,
+    i8, i16, i32, i64,
+    f32, f64,
+};
+
+enum class ScanComparison {
+    exact,
+    unknown,
+    in_range,
+    changed,
+    unchanged,
+    increased,
+    decreased,
+    increased_by,
+    decreased_by,
 };
 
 enum class DebugErrorCode {
@@ -89,7 +119,19 @@ struct SessionInfo {
     AccessMode access{AccessMode::read_only};
 };
 
+struct ScanSessionInfo {
+    ScanSessionId id;
+    SessionId owner;
+    ScanValueType value_type{};
+    std::size_t candidate_count{};
+    std::uint32_t generation{};
+};
+
 [[nodiscard]] std::string_view to_string(AccessMode mode) noexcept;
 [[nodiscard]] std::string_view to_string(DebugErrorCode code) noexcept;
+[[nodiscard]] std::string_view to_string(ScanValueType type) noexcept;
+[[nodiscard]] std::size_t scan_value_size(ScanValueType type) noexcept;
+[[nodiscard]] std::optional<ScanValueType> scan_value_type_from_string(std::string_view text) noexcept;
+[[nodiscard]] std::optional<ScanComparison> scan_comparison_from_string(std::string_view text) noexcept;
 
 }  // namespace argos::domain

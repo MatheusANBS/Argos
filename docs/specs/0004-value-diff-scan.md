@@ -1,6 +1,6 @@
 # Spec 0004 — Scan incremental (`scan_first` / `scan_next`)
 
-Status: proposto · ADR: [0009](../adr/0009-value-diff-scan-sessions.md)
+Status: aceito · ADR: [0009](../adr/0009-value-diff-scan-sessions.md)
 
 ## Objetivo
 

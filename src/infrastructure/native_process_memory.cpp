@@ -1,5 +1,7 @@
 #include "argos_mcp/infrastructure/native_process_memory.hpp"
 
+#include "argos_mcp/infrastructure/output_ring_buffer.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -14,12 +16,14 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -172,6 +176,92 @@ private:
     return utf8_from_wide(buffer);
 }
 
+[[nodiscard]] Result<std::size_t> windows_read_memory(HANDLE handle, Address address, std::span<std::byte> output) {
+    SIZE_T read_count = 0;
+    if (output.empty()) {
+        return std::size_t{0};
+    }
+    const auto* remote = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address));
+    if (!ReadProcessMemory(handle, remote, output.data(), output.size(), &read_count)) {
+        return std::unexpected(error(DebugErrorCode::io_error, "ReadProcessMemory failed"));
+    }
+    return static_cast<std::size_t>(read_count);
+}
+
+[[nodiscard]] Result<std::size_t> windows_write_memory(HANDLE handle, Address address, std::span<const std::byte> input) {
+    SIZE_T written = 0;
+    auto* remote = reinterpret_cast<void*>(static_cast<std::uintptr_t>(address));
+    if (!WriteProcessMemory(handle, remote, input.data(), input.size(), &written)) {
+        return std::unexpected(error(DebugErrorCode::io_error, "WriteProcessMemory failed"));
+    }
+    return static_cast<std::size_t>(written);
+}
+
+[[nodiscard]] Result<std::vector<MemoryRegion>> windows_query_regions(HANDLE handle) {
+    std::vector<MemoryRegion> output;
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    auto current = reinterpret_cast<std::uintptr_t>(info.lpMinimumApplicationAddress);
+    const auto maximum = reinterpret_cast<std::uintptr_t>(info.lpMaximumApplicationAddress);
+    while (current < maximum) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        const SIZE_T queried = VirtualQueryEx(
+            handle, reinterpret_cast<const void*>(current), &mbi, sizeof(mbi)
+        );
+        if (queried == 0) {
+            break;
+        }
+        const auto base = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+        const auto end = base + mbi.RegionSize;
+        const DWORD protection = mbi.Protect & 0xFFU;
+        const bool committed = mbi.State == MEM_COMMIT;
+        const bool guarded = (mbi.Protect & PAGE_GUARD) != 0U;
+        const bool readable_protection =
+            protection == PAGE_READONLY || protection == PAGE_READWRITE ||
+            protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_READ ||
+            protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+        const bool readable = committed && !guarded && readable_protection;
+        const bool writable = readable && (
+            protection == PAGE_READWRITE || protection == PAGE_WRITECOPY ||
+            protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY
+        );
+        const bool executable = readable && (
+            protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
+            protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY
+        );
+        output.push_back(MemoryRegion{
+            static_cast<Address>(base), static_cast<Address>(end), readable, writable,
+            executable, mbi.Type == MEM_PRIVATE, {}
+        });
+        if (end <= current) {
+            break;
+        }
+        current = end;
+    }
+    return output;
+}
+
+[[nodiscard]] Result<std::vector<ModuleInfo>> windows_query_modules(ProcessId pid) {
+    UniqueHandle snapshot{CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)};
+    if (!snapshot) {
+        return std::unexpected(error(DebugErrorCode::io_error, "module snapshot failed"));
+    }
+    MODULEENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    std::vector<ModuleInfo> output;
+    if (!Module32FirstW(snapshot.get(), &entry)) {
+        return output;
+    }
+    do {
+        output.push_back(ModuleInfo{
+            utf8_from_wide(entry.szModule), utf8_from_wide(entry.szExePath),
+            static_cast<Address>(reinterpret_cast<std::uintptr_t>(entry.modBaseAddr)),
+            static_cast<std::uint64_t>(entry.modBaseSize)
+        });
+    } while (Module32NextW(snapshot.get(), &entry));
+    return output;
+}
+
 class WindowsProcessSession final : public ProcessSession {
 public:
     WindowsProcessSession(ProcessId pid, std::string name, AccessMode access, UniqueHandle handle)
@@ -182,92 +272,22 @@ public:
     [[nodiscard]] AccessMode access_mode() const noexcept override { return access_; }
 
     [[nodiscard]] Result<std::size_t> read(Address address, std::span<std::byte> output) const override {
-        SIZE_T read_count = 0;
-        if (output.empty()) {
-            return std::size_t{0};
-        }
-        const auto* remote = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address));
-        if (!ReadProcessMemory(handle_.get(), remote, output.data(), output.size(), &read_count)) {
-            return std::unexpected(error(DebugErrorCode::io_error, "ReadProcessMemory failed"));
-        }
-        return static_cast<std::size_t>(read_count);
+        return windows_read_memory(handle_.get(), address, output);
     }
 
     [[nodiscard]] Result<std::size_t> write(Address address, std::span<const std::byte> input) override {
         if (access_ != AccessMode::read_write) {
             return std::unexpected(error(DebugErrorCode::access_denied, "session is read-only"));
         }
-        SIZE_T written = 0;
-        auto* remote = reinterpret_cast<void*>(static_cast<std::uintptr_t>(address));
-        if (!WriteProcessMemory(handle_.get(), remote, input.data(), input.size(), &written)) {
-            return std::unexpected(error(DebugErrorCode::io_error, "WriteProcessMemory failed"));
-        }
-        return static_cast<std::size_t>(written);
+        return windows_write_memory(handle_.get(), address, input);
     }
 
     [[nodiscard]] Result<std::vector<MemoryRegion>> regions() const override {
-        std::vector<MemoryRegion> output;
-        SYSTEM_INFO info{};
-        GetSystemInfo(&info);
-        auto current = reinterpret_cast<std::uintptr_t>(info.lpMinimumApplicationAddress);
-        const auto maximum = reinterpret_cast<std::uintptr_t>(info.lpMaximumApplicationAddress);
-        while (current < maximum) {
-            MEMORY_BASIC_INFORMATION mbi{};
-            const SIZE_T queried = VirtualQueryEx(
-                handle_.get(), reinterpret_cast<const void*>(current), &mbi, sizeof(mbi)
-            );
-            if (queried == 0) {
-                break;
-            }
-            const auto base = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
-            const auto end = base + mbi.RegionSize;
-            const DWORD protection = mbi.Protect & 0xFFU;
-            const bool committed = mbi.State == MEM_COMMIT;
-            const bool guarded = (mbi.Protect & PAGE_GUARD) != 0U;
-            const bool readable_protection =
-                protection == PAGE_READONLY || protection == PAGE_READWRITE ||
-                protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_READ ||
-                protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
-            const bool readable = committed && !guarded && readable_protection;
-            const bool writable = readable && (
-                protection == PAGE_READWRITE || protection == PAGE_WRITECOPY ||
-                protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY
-            );
-            const bool executable = readable && (
-                protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
-                protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY
-            );
-            output.push_back(MemoryRegion{
-                static_cast<Address>(base), static_cast<Address>(end), readable, writable,
-                executable, mbi.Type == MEM_PRIVATE, {}
-            });
-            if (end <= current) {
-                break;
-            }
-            current = end;
-        }
-        return output;
+        return windows_query_regions(handle_.get());
     }
 
     [[nodiscard]] Result<std::vector<ModuleInfo>> modules() const override {
-        UniqueHandle snapshot{CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid_)};
-        if (!snapshot) {
-            return std::unexpected(error(DebugErrorCode::io_error, "module snapshot failed"));
-        }
-        MODULEENTRY32W entry{};
-        entry.dwSize = sizeof(entry);
-        std::vector<ModuleInfo> output;
-        if (!Module32FirstW(snapshot.get(), &entry)) {
-            return output;
-        }
-        do {
-            output.push_back(ModuleInfo{
-                utf8_from_wide(entry.szModule), utf8_from_wide(entry.szExePath),
-                static_cast<Address>(reinterpret_cast<std::uintptr_t>(entry.modBaseAddr)),
-                static_cast<std::uint64_t>(entry.modBaseSize)
-            });
-        } while (Module32NextW(snapshot.get(), &entry));
-        return output;
+        return windows_query_modules(pid_);
     }
 
 private:
@@ -275,6 +295,260 @@ private:
     std::string name_;
     AccessMode access_{AccessMode::read_only};
     UniqueHandle handle_;
+};
+
+[[nodiscard]] std::wstring utf8_to_wide(std::string_view input) {
+    if (input.empty()) {
+        return {};
+    }
+    if (input.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return {};
+    }
+    const auto input_size = static_cast<int>(input.size());
+    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input.data(), input_size, nullptr, 0);
+    if (size <= 0) {
+        return {};
+    }
+    std::wstring output(static_cast<std::size_t>(size), L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input.data(), input_size, output.data(), size) != size) {
+        return {};
+    }
+    return output;
+}
+
+// Implements the argument-quoting rules documented by Microsoft for
+// CommandLineToArgvW / the Visual C++ runtime so that argv reaches the child
+// process exactly as provided -- never via a shell, never by naive string
+// concatenation. See "Everyone quotes command line arguments the wrong way".
+[[nodiscard]] std::wstring quote_windows_argument(const std::wstring& argument) {
+    if (!argument.empty() && argument.find_first_of(L" \t\n\v\"") == std::wstring::npos) {
+        return argument;
+    }
+    std::wstring output(1, L'"');
+    for (auto it = argument.begin(); ; ++it) {
+        std::size_t backslash_count = 0;
+        while (it != argument.end() && *it == L'\\') {
+            ++it;
+            ++backslash_count;
+        }
+        if (it == argument.end()) {
+            output.append(backslash_count * 2U, L'\\');
+            break;
+        }
+        if (*it == L'"') {
+            output.append(backslash_count * 2U + 1U, L'\\');
+            output.push_back(*it);
+        } else {
+            output.append(backslash_count, L'\\');
+            output.push_back(*it);
+        }
+    }
+    output.push_back(L'"');
+    return output;
+}
+
+[[nodiscard]] std::wstring build_windows_command_line(
+    const std::wstring& executable,
+    const std::vector<std::string>& arguments
+) {
+    std::wstring command_line = quote_windows_argument(executable);
+    for (const auto& argument : arguments) {
+        command_line.push_back(L' ');
+        command_line += quote_windows_argument(utf8_to_wide(argument));
+    }
+    return command_line;
+}
+
+// Captured child-process output is untrusted bytes that end up embedded in a
+// JSON-RPC response on the MCP's own stdout. json::Value::dump() does not
+// validate UTF-8 (the same responsibility utf8_from_wide already carries at
+// every other native boundary in this file), so invalid or truncated
+// multi-byte sequences and stray control bytes are replaced here before
+// anything is appended to a capture buffer.
+[[nodiscard]] std::string sanitize_utf8(std::string_view input) {
+    std::string output;
+    output.reserve(input.size());
+    std::size_t index = 0;
+    while (index < input.size()) {
+        const auto byte0 = static_cast<unsigned char>(input[index]);
+        if (byte0 == '\n' || byte0 == '\r' || byte0 == '\t') {
+            output.push_back(static_cast<char>(byte0));
+            ++index;
+            continue;
+        }
+        if (byte0 < 0x20U || byte0 == 0x7FU) {
+            ++index;
+            continue;
+        }
+        if (byte0 < 0x80U) {
+            output.push_back(static_cast<char>(byte0));
+            ++index;
+            continue;
+        }
+        std::size_t continuation_length = 0;
+        unsigned char first_data_mask = 0;
+        std::uint32_t codepoint_min = 0;
+        if ((byte0 & 0xE0U) == 0xC0U) {
+            continuation_length = 1U;
+            first_data_mask = 0x1FU;
+            codepoint_min = 0x80U;
+        } else if ((byte0 & 0xF0U) == 0xE0U) {
+            continuation_length = 2U;
+            first_data_mask = 0x0FU;
+            codepoint_min = 0x800U;
+        } else if ((byte0 & 0xF8U) == 0xF0U) {
+            continuation_length = 3U;
+            first_data_mask = 0x07U;
+            codepoint_min = 0x10000U;
+        } else {
+            output.push_back('?');
+            ++index;
+            continue;
+        }
+
+        bool valid = index + continuation_length < input.size();
+        std::uint32_t codepoint = byte0 & first_data_mask;
+        if (valid) {
+            for (std::size_t offset = 1; offset <= continuation_length; ++offset) {
+                const auto continuation = static_cast<unsigned char>(input[index + offset]);
+                if ((continuation & 0xC0U) != 0x80U) {
+                    valid = false;
+                    break;
+                }
+                codepoint = (codepoint << 6U) | (continuation & 0x3FU);
+            }
+        }
+        if (valid && codepoint >= codepoint_min && codepoint <= 0x10FFFFU &&
+            !(codepoint >= 0xD800U && codepoint <= 0xDFFFU)) {
+            output.append(input.substr(index, continuation_length + 1U));
+            index += continuation_length + 1U;
+        } else {
+            output.push_back('?');
+            ++index;
+        }
+    }
+    return output;
+}
+
+class WindowsLaunchedProcessSession final : public domain::LaunchedProcessSession {
+public:
+    WindowsLaunchedProcessSession(
+        ProcessId pid,
+        std::string name,
+        AccessMode access,
+        UniqueHandle process,
+        UniqueHandle stdout_read,
+        UniqueHandle stderr_read,
+        std::size_t max_captured_output_bytes
+    ) : pid_(pid), name_(std::move(name)), access_(access), process_(std::move(process)),
+        stdout_read_(std::move(stdout_read)), stderr_read_(std::move(stderr_read)),
+        stdout_buffer_(max_captured_output_bytes), stderr_buffer_(max_captured_output_bytes) {
+        stdout_thread_ = std::jthread{[this] { pump(stdout_read_.get(), stdout_buffer_, stdout_mutex_); }};
+        stderr_thread_ = std::jthread{[this] { pump(stderr_read_.get(), stderr_buffer_, stderr_mutex_); }};
+    }
+
+    ~WindowsLaunchedProcessSession() override {
+        // Closing the pipe read ends is what unblocks each reader thread's
+        // in-flight synchronous ReadFile (it fails once the handle is
+        // closed) -- there is no cooperative-cancellation path for a
+        // blocking ReadFile, so this is what lets the request_stop()+join()
+        // below complete instead of hanging on the child's pipe forever.
+        stdout_read_.reset();
+        stderr_read_.reset();
+        stdout_thread_ = {};
+        stderr_thread_ = {};
+    }
+
+    WindowsLaunchedProcessSession(const WindowsLaunchedProcessSession&) = delete;
+    WindowsLaunchedProcessSession& operator=(const WindowsLaunchedProcessSession&) = delete;
+
+    [[nodiscard]] ProcessId pid() const noexcept override { return pid_; }
+    [[nodiscard]] std::string_view process_name() const noexcept override { return name_; }
+    [[nodiscard]] AccessMode access_mode() const noexcept override { return access_; }
+
+    [[nodiscard]] Result<std::size_t> read(Address address, std::span<std::byte> output) const override {
+        return windows_read_memory(process_.get(), address, output);
+    }
+
+    [[nodiscard]] Result<std::size_t> write(Address address, std::span<const std::byte> input) override {
+        if (access_ != AccessMode::read_write) {
+            return std::unexpected(error(DebugErrorCode::access_denied, "session is read-only"));
+        }
+        return windows_write_memory(process_.get(), address, input);
+    }
+
+    [[nodiscard]] Result<std::vector<MemoryRegion>> regions() const override {
+        return windows_query_regions(process_.get());
+    }
+
+    [[nodiscard]] Result<std::vector<ModuleInfo>> modules() const override {
+        return windows_query_modules(pid_);
+    }
+
+    [[nodiscard]] Result<domain::OutputChunk> read_output(
+        const std::uint64_t since_cursor,
+        const std::size_t max_bytes
+    ) override {
+        const auto want_stdout = static_cast<std::uint32_t>(since_cursor >> 32U);
+        const auto want_stderr = static_cast<std::uint32_t>(since_cursor & 0xFFFFFFFFU);
+
+        infrastructure::OutputRingBuffer::ReadResult stdout_result;
+        {
+            std::scoped_lock lock(stdout_mutex_);
+            stdout_result = stdout_buffer_.read(want_stdout, max_bytes);
+        }
+        const auto remaining_budget = max_bytes - std::min(max_bytes, stdout_result.text.size());
+        infrastructure::OutputRingBuffer::ReadResult stderr_result;
+        {
+            std::scoped_lock lock(stderr_mutex_);
+            stderr_result = stderr_buffer_.read(want_stderr, remaining_budget);
+        }
+
+        domain::OutputChunk chunk;
+        chunk.stdout_text = std::move(stdout_result.text);
+        chunk.stderr_text = std::move(stderr_result.text);
+        chunk.cursor = (stdout_result.next_position << 32U) | (stderr_result.next_position & 0xFFFFFFFFU);
+        chunk.process_alive = WaitForSingleObject(process_.get(), 0) == WAIT_TIMEOUT;
+        return chunk;
+    }
+
+    [[nodiscard]] Result<void> terminate() override {
+        if (!TerminateProcess(process_.get(), 1U)) {
+            return std::unexpected(error(DebugErrorCode::io_error, "TerminateProcess failed"));
+        }
+        static_cast<void>(WaitForSingleObject(process_.get(), 2000U));
+        return {};
+    }
+
+    [[nodiscard]] bool owned() const noexcept override { return true; }
+
+private:
+    void pump(HANDLE handle, infrastructure::OutputRingBuffer& buffer, std::mutex& guard) {
+        std::array<char, 4096> chunk{};
+        DWORD read_count = 0;
+        while (ReadFile(handle, chunk.data(), static_cast<DWORD>(chunk.size()), &read_count, nullptr) &&
+               read_count > 0U) {
+            const auto sanitized = sanitize_utf8(std::string_view{chunk.data(), read_count});
+            std::scoped_lock lock(guard);
+            buffer.append(sanitized);
+        }
+    }
+
+    ProcessId pid_{};
+    std::string name_;
+    AccessMode access_{AccessMode::read_only};
+    UniqueHandle process_;
+    UniqueHandle stdout_read_;
+    UniqueHandle stderr_read_;
+
+    std::mutex stdout_mutex_;
+    infrastructure::OutputRingBuffer stdout_buffer_;
+
+    std::mutex stderr_mutex_;
+    infrastructure::OutputRingBuffer stderr_buffer_;
+
+    std::jthread stdout_thread_;
+    std::jthread stderr_thread_;
 };
 
 #elif defined(__linux__)
@@ -560,6 +834,158 @@ domain::Result<std::unique_ptr<domain::ProcessSession>> NativeProcessMemoryProvi
 #else
     (void)access;
     return std::unexpected(error(DebugErrorCode::unsupported, "platform is not supported"));
+#endif
+}
+
+domain::Result<std::unique_ptr<domain::LaunchedProcessSession>> NativeProcessMemoryProvider::launch(
+    const domain::LaunchSpec& spec,
+    const domain::AccessMode access
+) const {
+#if defined(_WIN32)
+    const std::filesystem::path requested_path{spec.executable};
+    if (!requested_path.is_absolute()) {
+        return std::unexpected(error(DebugErrorCode::invalid_argument, "executable path must be absolute"));
+    }
+    for (const auto& argument : spec.arguments) {
+        if (argument.find('\0') != std::string::npos) {
+            return std::unexpected(error(DebugErrorCode::invalid_argument, "arguments must not contain null bytes"));
+        }
+    }
+    std::error_code filesystem_error;
+    const auto canonical_path = std::filesystem::weakly_canonical(requested_path, filesystem_error);
+    if (filesystem_error || !std::filesystem::is_regular_file(canonical_path, filesystem_error) || filesystem_error) {
+        return std::unexpected(error(
+            DebugErrorCode::not_found, "executable does not exist or is not a regular file"
+        ));
+    }
+
+    SECURITY_ATTRIBUTES inheritable_sa{};
+    inheritable_sa.nLength = sizeof(inheritable_sa);
+    inheritable_sa.bInheritHandle = TRUE;
+    inheritable_sa.lpSecurityDescriptor = nullptr;
+
+    HANDLE raw_stdout_read = nullptr;
+    HANDLE raw_stdout_write = nullptr;
+    if (!CreatePipe(&raw_stdout_read, &raw_stdout_write, &inheritable_sa, 0)) {
+        return std::unexpected(error(DebugErrorCode::io_error, "CreatePipe failed for stdout"));
+    }
+    UniqueHandle stdout_read{raw_stdout_read};
+    UniqueHandle stdout_write{raw_stdout_write};
+    if (!SetHandleInformation(stdout_read.get(), HANDLE_FLAG_INHERIT, 0)) {
+        return std::unexpected(error(DebugErrorCode::io_error, "SetHandleInformation failed for stdout"));
+    }
+
+    HANDLE raw_stderr_read = nullptr;
+    HANDLE raw_stderr_write = nullptr;
+    if (!CreatePipe(&raw_stderr_read, &raw_stderr_write, &inheritable_sa, 0)) {
+        return std::unexpected(error(DebugErrorCode::io_error, "CreatePipe failed for stderr"));
+    }
+    UniqueHandle stderr_read{raw_stderr_read};
+    UniqueHandle stderr_write{raw_stderr_write};
+    if (!SetHandleInformation(stderr_read.get(), HANDLE_FLAG_INHERIT, 0)) {
+        return std::unexpected(error(DebugErrorCode::io_error, "SetHandleInformation failed for stderr"));
+    }
+
+    UniqueHandle stdin_null{CreateFileW(
+        L"NUL", GENERIC_READ, FILE_SHARE_READ, &inheritable_sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr
+    )};
+    if (!stdin_null) {
+        return std::unexpected(error(DebugErrorCode::io_error, "unable to open NUL for child stdin"));
+    }
+
+    // bInheritHandles=TRUE (required so the three pipe/NUL handles below
+    // reach the child) would, by itself, inherit *every* inheritable handle
+    // open in this process -- including the MCP's own stdin/stdout, which
+    // are frequently inheritable by default when the MCP itself was
+    // spawned by its client. An explicit PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+    // restricts inheritance to exactly these three handles, so a launched
+    // child can never end up holding the MCP's own protocol pipe open
+    // (which would otherwise keep that pipe alive, and the MCP's client
+    // blocked waiting for EOF, for as long as the child keeps running).
+    SIZE_T attribute_list_size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_list_size);
+    if (attribute_list_size == 0U) {
+        return std::unexpected(error(DebugErrorCode::io_error, "InitializeProcThreadAttributeList sizing failed"));
+    }
+    std::vector<std::byte> attribute_list_storage(attribute_list_size);
+    auto* attribute_list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attribute_list_storage.data());
+    if (!InitializeProcThreadAttributeList(attribute_list, 1, 0, &attribute_list_size)) {
+        return std::unexpected(error(DebugErrorCode::io_error, "InitializeProcThreadAttributeList failed"));
+    }
+    struct AttributeListDeleter final {
+        LPPROC_THREAD_ATTRIBUTE_LIST list;
+        ~AttributeListDeleter() { DeleteProcThreadAttributeList(list); }
+    } attribute_list_deleter{attribute_list};
+
+    std::array<HANDLE, 3> inherited_handles{stdin_null.get(), stdout_write.get(), stderr_write.get()};
+    if (!UpdateProcThreadAttribute(
+            attribute_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            inherited_handles.data(), inherited_handles.size() * sizeof(HANDLE), nullptr, nullptr
+        )) {
+        return std::unexpected(error(DebugErrorCode::io_error, "UpdateProcThreadAttribute failed"));
+    }
+
+    STARTUPINFOEXW startup_info{};
+    startup_info.StartupInfo.cb = sizeof(startup_info);
+    startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup_info.StartupInfo.hStdInput = stdin_null.get();
+    startup_info.StartupInfo.hStdOutput = stdout_write.get();
+    startup_info.StartupInfo.hStdError = stderr_write.get();
+    startup_info.lpAttributeList = attribute_list;
+
+    const auto wide_executable = canonical_path.wstring();
+    if (wide_executable.empty()) {
+        return std::unexpected(error(DebugErrorCode::invalid_argument, "executable path is not valid"));
+    }
+    const auto command_line = build_windows_command_line(wide_executable, spec.arguments);
+    std::vector<wchar_t> command_line_buffer(command_line.begin(), command_line.end());
+    command_line_buffer.push_back(L'\0');
+
+    std::optional<std::wstring> wide_working_directory;
+    if (spec.working_directory) {
+        wide_working_directory = utf8_to_wide(*spec.working_directory);
+        if (wide_working_directory->empty()) {
+            return std::unexpected(error(DebugErrorCode::invalid_argument, "working_directory is not valid"));
+        }
+    }
+
+    PROCESS_INFORMATION process_info{};
+    const BOOL created = CreateProcessW(
+        wide_executable.c_str(),
+        command_line_buffer.data(),
+        nullptr,
+        nullptr,
+        TRUE,
+        CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+        nullptr,
+        wide_working_directory ? wide_working_directory->c_str() : nullptr,
+        &startup_info.StartupInfo,
+        &process_info
+    );
+    if (!created) {
+        return std::unexpected(error(DebugErrorCode::io_error, "CreateProcessW failed"));
+    }
+    UniqueHandle process_handle{process_info.hProcess};
+    UniqueHandle thread_handle{process_info.hThread};
+    // The write ends (and the NUL read handle) now live only in the child's
+    // handle table; closing the parent's copies here is what lets the
+    // reader threads observe end-of-file once the child exits.
+    stdout_write.reset();
+    stderr_write.reset();
+    stdin_null.reset();
+
+    std::string name = canonical_path.filename().string();
+    const std::size_t capture_capacity = spec.capture_output ? max_captured_output_bytes_ : 0U;
+    return std::unique_ptr<domain::LaunchedProcessSession>{
+        std::make_unique<WindowsLaunchedProcessSession>(
+            static_cast<ProcessId>(process_info.dwProcessId), std::move(name), access,
+            std::move(process_handle), std::move(stdout_read), std::move(stderr_read), capture_capacity
+        )
+    };
+#else
+    (void)spec;
+    (void)access;
+    return std::unexpected(error(DebugErrorCode::unsupported, "process launch requires Windows"));
 #endif
 }
 

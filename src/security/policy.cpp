@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <string_view>
+#include <system_error>
 
 namespace argos::security {
 namespace {
@@ -40,6 +42,29 @@ namespace {
     return domain::DebugError{code, std::move(message)};
 }
 
+[[nodiscard]] std::vector<std::string> env_dir_list(std::string_view name) {
+    std::vector<std::string> output;
+    const char* value = std::getenv(std::string{name}.c_str());
+    if (value == nullptr) {
+        return output;
+    }
+    const std::string_view text{value};
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        const auto separator = text.find(';', start);
+        const auto end = separator == std::string_view::npos ? text.size() : separator;
+        const auto piece = text.substr(start, end - start);
+        if (!piece.empty()) {
+            output.emplace_back(piece);
+        }
+        if (separator == std::string_view::npos) {
+            break;
+        }
+        start = separator + 1U;
+    }
+    return output;
+}
+
 }  // namespace
 
 SecurityPolicy SecurityPolicy::from_environment() {
@@ -52,6 +77,17 @@ SecurityPolicy SecurityPolicy::from_environment() {
         "ARGOS_MCP_MAX_SCAN_BYTES", 32U * 1024U * 1024U, 256U * 1024U * 1024U
     );
     policy.max_scan_results = env_size("ARGOS_MCP_MAX_SCAN_RESULTS", 256U, 4096U);
+    policy.max_string_result_length = env_size("ARGOS_MCP_MAX_STRING_RESULT_LENGTH", 256U, 4096U);
+    policy.max_scan_session_candidates = env_size(
+        "ARGOS_MCP_MAX_SCAN_SESSION_CANDIDATES", 262144U, 4U * 1024U * 1024U
+    );
+    policy.max_scan_sessions_per_session = env_size("ARGOS_MCP_MAX_SCAN_SESSIONS_PER_SESSION", 4U, 64U);
+    policy.allow_launch = env_flag("ARGOS_MCP_ALLOW_LAUNCH");
+    policy.launch_allowed_dirs = env_dir_list("ARGOS_MCP_LAUNCH_ALLOWED_DIRS");
+    policy.max_launched_processes = env_size("ARGOS_MCP_MAX_LAUNCHED_PROCESSES", 4U, 64U);
+    policy.max_captured_output_bytes = env_size(
+        "ARGOS_MCP_MAX_CAPTURED_OUTPUT_BYTES", 1U * 1024U * 1024U, 64U * 1024U * 1024U
+    );
     return policy;
 }
 
@@ -112,6 +148,76 @@ domain::Result<void> SecurityPolicy::authorize_scan(
     }
     if (result_limit == 0U || result_limit > max_scan_results) {
         return std::unexpected(error(domain::DebugErrorCode::limit_exceeded, "scan result limit exceeds configured limit"));
+    }
+    return {};
+}
+
+domain::Result<void> SecurityPolicy::authorize_scan_session(
+    const std::size_t byte_budget,
+    const std::size_t result_limit
+) const {
+    if (byte_budget == 0U || byte_budget > max_scan_bytes) {
+        return std::unexpected(error(domain::DebugErrorCode::limit_exceeded, "scan byte budget exceeds configured limit"));
+    }
+    if (result_limit == 0U || result_limit > max_scan_session_candidates) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::limit_exceeded, "scan session candidate limit exceeds configured limit"
+        ));
+    }
+    return {};
+}
+
+domain::Result<void> SecurityPolicy::authorize_launch(
+    const bool user_acknowledged,
+    const std::string_view executable_path
+) const {
+    if (!allow_launch) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::access_denied,
+            "process launch is disabled; set ARGOS_MCP_ALLOW_LAUNCH=1 before starting the server"
+        ));
+    }
+    if (!user_acknowledged) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::unauthorized,
+            "launch requires explicit confirmation that starting this process is authorized"
+        ));
+    }
+    const std::filesystem::path requested{std::string{executable_path}};
+    if (!requested.is_absolute()) {
+        return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "executable path must be absolute"));
+    }
+    if (!launch_allowed_dirs.empty()) {
+        std::error_code canonical_error;
+        const auto canonical_requested = std::filesystem::weakly_canonical(requested, canonical_error);
+        if (canonical_error) {
+            return std::unexpected(error(
+                domain::DebugErrorCode::invalid_argument, "executable path could not be resolved"
+            ));
+        }
+        const auto& requested_native = canonical_requested.native();
+        bool allowed = false;
+        for (const auto& allowed_dir : launch_allowed_dirs) {
+            std::error_code dir_error;
+            const auto canonical_dir = std::filesystem::weakly_canonical(
+                std::filesystem::path{allowed_dir}, dir_error
+            );
+            if (dir_error) {
+                continue;
+            }
+            const auto& dir_native = canonical_dir.native();
+            if (requested_native.size() > dir_native.size() &&
+                requested_native.compare(0, dir_native.size(), dir_native) == 0 &&
+                requested_native[dir_native.size()] == std::filesystem::path::preferred_separator) {
+                allowed = true;
+                break;
+            }
+        }
+        if (!allowed) {
+            return std::unexpected(error(
+                domain::DebugErrorCode::access_denied, "executable path is outside ARGOS_MCP_LAUNCH_ALLOWED_DIRS"
+            ));
+        }
     }
     return {};
 }

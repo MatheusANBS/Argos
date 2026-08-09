@@ -1,6 +1,7 @@
 #include "argos_mcp/infrastructure/pdb_type_metadata.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -259,6 +260,16 @@ struct Il2CppMetadataLayout final {
     return selected;
 }
 
+[[nodiscard]] bool contains_case_insensitive(const std::string_view text, const std::string_view needle) {
+    if (needle.empty()) return true;
+    const auto lower = [](const unsigned char ch) { return static_cast<char>(std::tolower(ch)); };
+    std::string haystack{text};
+    std::string pattern{needle};
+    std::ranges::transform(haystack, haystack.begin(), lower);
+    std::ranges::transform(pattern, pattern.begin(), lower);
+    return haystack.find(pattern) != std::string::npos;
+}
+
 #ifdef _WIN32
 
 [[nodiscard]] std::wstring utf8_to_wide(const std::string_view input) {
@@ -430,6 +441,67 @@ BOOL CALLBACK unreal_symbol_callback(
         is_class ? "UCLASS" : "USTRUCT",
         symbol->Address >= output->module_base ? symbol->Address - output->module_base : 0U
     });
+    return TRUE;
+}
+
+[[nodiscard]] std::string udt_kind_name(const ULONG udt_kind) {
+    switch (udt_kind) {
+    case 0U: return "struct";
+    case 1U: return "class";
+    case 2U: return "union";
+    default: return "unknown";
+    }
+}
+
+struct TypeCatalogContext final {
+    HANDLE process{};
+    DWORD64 module_base{};
+    std::string name_filter;
+    std::string kind_filter;
+    std::size_t max_symbols{};
+    std::vector<domain::TypeSummary> types;
+    bool truncated{false};
+};
+
+BOOL CALLBACK type_catalog_callback(
+    PSYMBOL_INFOW symbol,
+    ULONG,
+    PVOID context
+) {
+    auto* output = static_cast<TypeCatalogContext*>(context);
+    if (output == nullptr || symbol == nullptr) return TRUE;
+    if (output->types.size() >= output->max_symbols) {
+        output->truncated = true;
+        return FALSE;
+    }
+    ULONG tag = 0U;
+    if (!type_info(output->process, output->module_base, symbol->TypeIndex, TI_GET_SYMTAG, tag)) {
+        return TRUE;
+    }
+    std::string kind;
+    if (tag == SymTagUDT) {
+        ULONG udt_kind = 0U;
+        if (!type_info(output->process, output->module_base, symbol->TypeIndex, TI_GET_UDTKIND, udt_kind)) {
+            return TRUE;
+        }
+        kind = udt_kind_name(udt_kind);
+    } else if (tag == SymTagEnum) {
+        kind = "enum";
+    } else {
+        return TRUE;
+    }
+    if (!output->kind_filter.empty() && kind != output->kind_filter) {
+        return TRUE;
+    }
+    const std::wstring wide_name{symbol->Name, symbol->NameLen};
+    const auto name = wide_to_utf8(wide_name);
+    if (name.empty()) return TRUE;
+    if (!output->name_filter.empty() && !contains_case_insensitive(name, output->name_filter)) {
+        return TRUE;
+    }
+    ULONG64 size = 0U;
+    static_cast<void>(type_info(output->process, output->module_base, symbol->TypeIndex, TI_GET_LENGTH, size));
+    output->types.push_back(domain::TypeSummary{name, kind, size});
     return TRUE;
 }
 
@@ -718,6 +790,65 @@ domain::Result<domain::ReflectionMetadata> PdbTypeMetadataProvider::inspect_unre
     metadata.symbols = std::move(context.symbols);
     metadata.truncated = context.truncated;
     return metadata;
+#endif
+}
+
+domain::Result<domain::TypeCatalog> PdbTypeMetadataProvider::list_pdb_types(
+    const std::string_view module_path,
+    const std::string_view name_filter,
+    const std::string_view kind_filter,
+    const std::size_t max_symbols
+) const {
+    if (module_path.empty()) {
+        return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "module_path is required"));
+    }
+    if (max_symbols == 0U || max_symbols > 65536U) {
+        return std::unexpected(error(domain::DebugErrorCode::limit_exceeded, "max_symbols must be between 1 and 65536"));
+    }
+    if (!kind_filter.empty() && kind_filter != "class" && kind_filter != "struct" &&
+        kind_filter != "enum" && kind_filter != "union") {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument, "kind_filter must be class, struct, enum or union"
+        ));
+    }
+#ifndef _WIN32
+    static_cast<void>(name_filter);
+    return std::unexpected(error(domain::DebugErrorCode::unsupported, "PDB type metadata requires Windows DbgHelp"));
+#else
+    const std::filesystem::path image_path{std::string{module_path}};
+    std::error_code filesystem_error;
+    if (!std::filesystem::is_regular_file(image_path, filesystem_error)) {
+        return std::unexpected(error(domain::DebugErrorCode::not_found, "module image is unavailable"));
+    }
+    const auto wide_image_path = image_path.wstring();
+    if (wide_image_path.empty()) {
+        return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "module path is not valid"));
+    }
+
+    std::scoped_lock lock{mutex_};
+    const auto search_path = image_path.parent_path().wstring();
+    DbgHelpSession symbols{search_path};
+    if (!symbols.initialized()) {
+        return std::unexpected(error(domain::DebugErrorCode::unsupported, "DbgHelp symbol session could not be initialized"));
+    }
+    if (symbols.load_module(wide_image_path) == 0U) {
+        return std::unexpected(error(domain::DebugErrorCode::not_found, "matching PDB symbols were not found"));
+    }
+
+    TypeCatalogContext context{
+        symbols.process(), symbols.base(), std::string{name_filter}, std::string{kind_filter}, max_symbols
+    };
+    const BOOL enumerated = SymEnumTypesW(symbols.process(), symbols.base(), type_catalog_callback, &context);
+    if (!enumerated && context.types.empty() && !context.truncated) {
+        return std::unexpected(error(domain::DebugErrorCode::not_found, "no PDB types were found in the matching module"));
+    }
+
+    domain::TypeCatalog catalog;
+    catalog.types = std::move(context.types);
+    catalog.source = "pdb:dbghelp";
+    catalog.confidence = "high";
+    catalog.truncated = context.truncated;
+    return catalog;
 #endif
 }
 

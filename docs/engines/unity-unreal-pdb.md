@@ -33,6 +33,14 @@ Fontes oficiais:
 Sem PDB correspondente, o MCP nao transforma assinatura, scan ou nome de
 funcao em layout confirmado.
 
+Quando o nome do tipo ainda nao e conhecido, `memory_debug.pdb_list_types`
+enumera os tipos (`class`/`struct`/`enum`/`union`) presentes no PDB do modulo
+carregado (via `SymEnumTypesW`), com filtro opcional por nome/kind. O
+resultado e so um indice leve (`name`, `kind`, `size`); o layout completo de
+campos continua exigindo `pdb_type` por nome. Mesmas regras de proveniencia:
+so aceita modulo ja listado na sessao, roda no processo do MCP e usa o mesmo
+mutex de DbgHelp.
+
 ## Unity
 
 Unity documenta dois backends principais: Mono e IL2CPP. O backend muda quais

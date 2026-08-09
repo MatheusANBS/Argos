@@ -28,16 +28,21 @@ PDB para completar offsets. `memory_debug.unreal_type` e
 |---|---|
 | `memory_debug.process_list` | Lista processos locais e informa correspondência de usuário. |
 | `memory_debug.attach` | Abre uma sessão explícita para um PID autorizado. |
-| `memory_debug.detach` | Fecha a sessão e libera handles. |
+| `memory_debug.detach` | Fecha a sessão e libera handles; `terminate: true` encerra sessões criadas por `launch`. |
 | `memory_debug.sessions` | Lista sessões ativas. |
 | `memory_debug.regions` | Lista regiões de memória e permissões. |
 | `memory_debug.modules` | Lista módulos carregados/mapeamentos de arquivo. |
+| `memory_debug.pdb_list_types` | Enumera tipos disponíveis no PDB de um módulo carregado. |
 | `memory_debug.read` | Lê bytes limitados e retorna hexadecimal. |
 | `memory_debug.read_batch` | Executa múltiplas leituras limitadas. |
 | `memory_debug.read_typed` | Decodifica inteiros, floats e UTF-8 little-endian. |
+| `memory_debug.strings` | Extrai strings ASCII/UTF-16LE legíveis da memória do processo. |
 | `memory_debug.scan_exact` | Busca um padrão exato de bytes com orçamento explícito. |
+| `memory_debug.scan_pointers_to` | Busca ponteiros que referenciam um endereço conhecido. |
+| `memory_debug.scan_first` / `scan_next` / `scan_results` / `scan_reset` | Scan incremental (first scan/next scan) para localizar offsets de campos dinâmicos sem PDB/RTTI. |
 | `memory_debug.resolve_pointer_chain` | Resolve pointer chains de 32 ou 64 bits. |
 | `memory_debug.write` | Escreve bytes somente quando habilitado e confirmado. |
+| `memory_debug.launch` / `read_output` | Inicia um executável escolhido pelo operador e captura `stdout`/`stderr`. Desligado por padrão (`ARGOS_MCP_ALLOW_LAUNCH`). |
 
 ## Plataformas
 
@@ -148,9 +153,18 @@ Depois disso, o `attach` deve solicitar `access: "read_write"`, e cada chamada d
 | `ARGOS_MCP_MAX_WRITE_BYTES` | 4.096 | 64 KiB |
 | `ARGOS_MCP_MAX_SCAN_BYTES` | 32 MiB | 256 MiB |
 | `ARGOS_MCP_MAX_SCAN_RESULTS` | 256 | 4.096 |
+| `ARGOS_MCP_MAX_STRING_RESULT_LENGTH` | 256 | 4.096 |
+| `ARGOS_MCP_MAX_SCAN_SESSION_CANDIDATES` | 262.144 | 4.194.304 |
+| `ARGOS_MCP_MAX_SCAN_SESSIONS_PER_SESSION` | 4 | 64 |
+| `ARGOS_MCP_ALLOW_LAUNCH` | `0` | booleano |
+| `ARGOS_MCP_LAUNCH_ALLOWED_DIRS` | (vazio = sem allowlist) | lista separada por `;` |
+| `ARGOS_MCP_MAX_LAUNCHED_PROCESSES` | 4 | 64 |
+| `ARGOS_MCP_MAX_CAPTURED_OUTPUT_BYTES` | 1 MiB | 64 MiB |
 | `ARGOS_MCP_LOG_LEVEL` | `info` | `debug`, `info`, `warning`, `error` |
 
 `ARGOS_MCP_ALLOW_FOREIGN_USER=1` remove somente a validação interna de proprietário. Ele não contorna permissões do sistema operacional e deve ser usado apenas em ambientes de laboratório controlados.
+
+`ARGOS_MCP_ALLOW_LAUNCH=1` habilita `memory_debug.launch` (o servidor cria um processo em vez de apenas ler um já existente). Desligado por padrão; útil apenas para alvos de teste/desenvolvimento controlados pelo próprio operador, não para anexar a processos de terceiros já em execução. Ver o threat model para os controles completos.
 
 ## Skills instaladas
 

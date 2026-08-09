@@ -1,6 +1,6 @@
 # ADR-0007 — Scan reverso de ponteiro
 
-Status: proposto
+Status: aceito
 
 ## Contexto
 

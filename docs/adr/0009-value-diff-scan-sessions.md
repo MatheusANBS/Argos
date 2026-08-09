@@ -1,6 +1,6 @@
 # ADR-0009 — Sessões de scan incremental (first scan / next scan)
 
-Status: proposto
+Status: aceito
 
 ## Contexto
 

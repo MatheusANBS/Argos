@@ -33,13 +33,21 @@ std::string SessionManager::generate_id() {
     if (ec0 != std::errc{}) {
         return generate_id();
     }
-    std::fill(buffer.data(), ptr0, '0');
+    const auto written0 = static_cast<std::size_t>(ptr0 - buffer.data());
+    if (written0 < 16U) {
+        std::copy_backward(buffer.data(), buffer.data() + written0, buffer.data() + 16);
+        std::fill(buffer.data(), buffer.data() + (16U - written0), '0');
+    }
 
     auto [ptr1, ec1] = std::to_chars(buffer.data() + 16, buffer.data() + 32, words[1], 16);
     if (ec1 != std::errc{}) {
         return generate_id();
     }
-    std::fill(buffer.data() + 16, ptr1, '0');
+    const auto written1 = static_cast<std::size_t>(ptr1 - (buffer.data() + 16));
+    if (written1 < 16U) {
+        std::copy_backward(buffer.data() + 16, buffer.data() + 16 + written1, buffer.data() + 32);
+        std::fill(buffer.data() + 16, buffer.data() + 16 + (16U - written1), '0');
+    }
 
     return std::string(buffer.data(), 32);
 }
@@ -85,6 +93,20 @@ domain::Result<void> SessionManager::remove(const domain::SessionId& id) {
         return std::unexpected(error(domain::DebugErrorCode::not_found, "debug session not found"));
     }
     return {};
+}
+
+std::size_t SessionManager::count_if(
+    const std::function<bool(const domain::ProcessSession&)>& predicate
+) const {
+    std::scoped_lock lock(mutex_);
+    std::size_t count = 0U;
+    for (const auto& [id_text, session] : sessions_) {
+        (void)id_text;
+        if (session && predicate(*session)) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 std::vector<domain::SessionInfo> SessionManager::list() const {

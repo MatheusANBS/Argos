@@ -1,6 +1,6 @@
 # ADR-0006 — Extração de strings no servidor
 
-Status: proposto
+Status: aceito
 
 ## Contexto
 

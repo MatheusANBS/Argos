@@ -1,6 +1,6 @@
 # Roadmap — Introspecção de runtime sem código-fonte
 
-Status: proposto
+Status: aceito
 
 ## Motivação
 

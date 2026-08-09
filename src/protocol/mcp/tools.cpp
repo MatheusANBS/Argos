@@ -183,6 +183,42 @@ using InputResult = std::expected<T, InputError>;
     return *id;
 }
 
+[[nodiscard]] InputResult<domain::ScanSessionId> scan_session_arg(const Value& arguments) {
+    auto text = string_arg(arguments, "scan_id", true);
+    if (!text) {
+        return std::unexpected(text.error());
+    }
+    auto id = domain::ScanSessionId::create(std::move(*text));
+    if (!id) {
+        return std::unexpected(InputError{id.error()});
+    }
+    return *id;
+}
+
+[[nodiscard]] InputResult<domain::ScanValueType> value_type_arg(const Value& arguments) {
+    auto text = string_arg(arguments, "value_type", true);
+    if (!text) {
+        return std::unexpected(text.error());
+    }
+    auto type = domain::scan_value_type_from_string(*text);
+    if (!type) {
+        return std::unexpected(InputError{"value_type must be one of u8,u16,u32,u64,i8,i16,i32,i64,f32,f64"});
+    }
+    return *type;
+}
+
+[[nodiscard]] InputResult<domain::ScanComparison> comparison_arg(const Value& arguments) {
+    auto text = string_arg(arguments, "comparison", true);
+    if (!text) {
+        return std::unexpected(text.error());
+    }
+    auto comparison = domain::scan_comparison_from_string(*text);
+    if (!comparison) {
+        return std::unexpected(InputError{"invalid comparison"});
+    }
+    return *comparison;
+}
+
 [[nodiscard]] int hex_digit(char ch) noexcept {
     if (ch >= '0' && ch <= '9') return ch - '0';
     if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
@@ -216,6 +252,24 @@ using InputResult = std::expected<T, InputError>;
         output.push_back(static_cast<std::byte>((high << 4) | low));
     }
     return output;
+}
+
+[[nodiscard]] InputResult<std::optional<std::vector<std::byte>>> optional_hex_arg(
+    const Value& arguments,
+    std::string_view key
+) {
+    if (arguments.find(key) == nullptr) {
+        return std::optional<std::vector<std::byte>>{};
+    }
+    auto text = string_arg(arguments, key, true);
+    if (!text) {
+        return std::unexpected(text.error());
+    }
+    auto bytes = parse_hex(*text);
+    if (!bytes) {
+        return std::unexpected(bytes.error());
+    }
+    return std::optional<std::vector<std::byte>>{*bytes};
 }
 
 [[nodiscard]] std::string hex_bytes(std::span<const std::byte> bytes) {
@@ -368,6 +422,61 @@ using InputResult = std::expected<T, InputError>;
     });
 }
 
+[[nodiscard]] Value string_scan_result_to_json(const application::StringScanResult& result) {
+    Value::Array matches;
+    matches.reserve(result.matches.size());
+    for (const auto& match : result.matches) {
+        matches.push_back(Value::object({
+            {"address", hex_address(match.address)},
+            {"text", match.text},
+            {"encoding", match.encoding}
+        }));
+    }
+    return Value::object({
+        {"matches", Value{std::move(matches)}},
+        {"bytes_scanned", static_cast<std::int64_t>(result.bytes_scanned)},
+        {"truncated", result.truncated}
+    });
+}
+
+[[nodiscard]] Value type_catalog_to_json(const domain::TypeCatalog& catalog) {
+    Value::Array types;
+    types.reserve(catalog.types.size());
+    for (const auto& summary : catalog.types) {
+        types.push_back(Value::object({
+            {"name", summary.name},
+            {"kind", summary.kind},
+            {"size", static_cast<std::int64_t>(std::min<std::uint64_t>(
+                summary.size, static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())
+            ))}
+        }));
+    }
+    return Value::object({
+        {"types", Value{std::move(types)}},
+        {"source", catalog.source},
+        {"confidence", catalog.confidence},
+        {"truncated", catalog.truncated}
+    });
+}
+
+[[nodiscard]] Value output_chunk_to_json(const domain::OutputChunk& chunk) {
+    return Value::object({
+        {"stdout_text", chunk.stdout_text},
+        {"stderr_text", chunk.stderr_text},
+        {"cursor", static_cast<std::int64_t>(chunk.cursor)},
+        {"process_alive", chunk.process_alive}
+    });
+}
+
+[[nodiscard]] Value scan_session_info_to_json(const domain::ScanSessionInfo& info) {
+    return Value::object({
+        {"scan_id", info.id.value()},
+        {"value_type", std::string{domain::to_string(info.value_type)}},
+        {"candidate_count", static_cast<std::int64_t>(info.candidate_count)},
+        {"generation", static_cast<std::int64_t>(info.generation)}
+    });
+}
+
 [[nodiscard]] Value reflection_metadata_to_json(const domain::ReflectionMetadata& metadata) {
     Value::Array symbols;
     symbols.reserve(metadata.symbols.size());
@@ -482,9 +591,40 @@ std::vector<ToolDefinition> ToolCatalog::definitions() const {
 
     tools.push_back(ToolDefinition{
         "memory_debug.detach",
-        "Close a debugging session and release its native process handle.",
-        object_schema({{"session_id", session}}, {"session_id"}),
+        "Close a debugging session and release its native process handle. terminate is only accepted for sessions created by memory_debug.launch.",
+        object_schema({
+            {"session_id", session},
+            {"terminate", boolean_schema()}
+        }, {"session_id"}),
         stateful_annotations()
+    });
+
+    tools.push_back(ToolDefinition{
+        "memory_debug.launch",
+        "Start an executable chosen by the operator and capture its stdout/stderr. Disabled unless the server was started with ARGOS_MCP_ALLOW_LAUNCH=1; not intended for attaching to third-party processes already running.",
+        object_schema({
+            {"executable", string_schema("Absolute path to the executable to launch.")},
+            {"arguments", Value::object({
+                {"type", "array"},
+                {"items", string_schema()}
+            })},
+            {"working_directory", string_schema("Optional absolute working directory for the child process.")},
+            {"access", enum_string_schema({"read_only", "read_write"})},
+            {"authorized", boolean_schema()},
+            {"capture_output", boolean_schema()}
+        }, {"executable", "authorized"}),
+        stateful_annotations()
+    });
+
+    tools.push_back(ToolDefinition{
+        "memory_debug.read_output",
+        "Poll captured stdout/stderr from a session created by memory_debug.launch.",
+        object_schema({
+            {"session_id", session},
+            {"since_cursor", integer_schema(0, std::numeric_limits<std::int64_t>::max())},
+            {"max_bytes", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_captured_output_bytes))}
+        }, {"session_id"}),
+        read_only_annotations()
     });
 
     tools.push_back(ToolDefinition{
@@ -556,6 +696,19 @@ std::vector<ToolDefinition> ToolCatalog::definitions() const {
     });
 
     tools.push_back(ToolDefinition{
+        "memory_debug.pdb_list_types",
+        "Enumerate native types available in the PDB matching a loaded module, so a type name does not need to be already known before calling memory_debug.pdb_type.",
+        object_schema({
+            {"session_id", session},
+            {"module", string_schema("Loaded module name or exact path returned by memory_debug.modules.")},
+            {"name_filter", string_schema("Optional case-insensitive substring filter on the type name.")},
+            {"kind_filter", enum_string_schema({"", "class", "struct", "enum", "union"})},
+            {"max_symbols", integer_schema(1, 65536)}
+        }, {"session_id", "module"}),
+        read_only_annotations()
+    });
+
+    tools.push_back(ToolDefinition{
         "memory_debug.read",
         "Read a bounded byte range from an authorized process and return lowercase hexadecimal bytes.",
         object_schema({
@@ -609,6 +762,95 @@ std::vector<ToolDefinition> ToolCatalog::definitions() const {
             {"end_address", address},
             {"writable_only", boolean_schema()}
         }, {"session_id", "pattern_hex"}),
+        read_only_annotations()
+    });
+
+    tools.push_back(ToolDefinition{
+        "memory_debug.scan_pointers_to",
+        "Search memory for pointers referencing a known target address, the inverse of following a pointer.",
+        object_schema({
+            {"session_id", session},
+            {"target_address", address},
+            {"pointer_size", enum_string_schema({"4", "8"})},
+            {"byte_budget", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_scan_bytes))},
+            {"result_limit", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_scan_results))},
+            {"start_address", address},
+            {"end_address", address},
+            {"writable_only", boolean_schema()}
+        }, {"session_id", "target_address"}),
+        read_only_annotations()
+    });
+
+    const auto value_type_schema = enum_string_schema({
+        "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64"
+    });
+    const auto hex_value_schema = string_schema("Bytes in hexadecimal form matching value_type size.");
+    const auto scan_id_schema = string_schema("Opaque scan_id returned by memory_debug.scan_first.");
+
+    tools.push_back(ToolDefinition{
+        "memory_debug.scan_first",
+        "Start an incremental (first scan / next scan) value-diff scan session to locate a dynamic field offset without a known value, PDB or RTTI.",
+        object_schema({
+            {"session_id", session},
+            {"value_type", value_type_schema},
+            {"comparison", enum_string_schema({"exact", "unknown", "in_range"})},
+            {"value", hex_value_schema},
+            {"range_low", hex_value_schema},
+            {"range_high", hex_value_schema},
+            {"byte_budget", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_scan_bytes))},
+            {"result_limit", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_scan_session_candidates))},
+            {"writable_only", boolean_schema()},
+            {"start_address", address},
+            {"end_address", address}
+        }, {"session_id", "value_type", "comparison"}),
+        stateful_annotations()
+    });
+
+    tools.push_back(ToolDefinition{
+        "memory_debug.scan_next",
+        "Re-read only the candidates from an active scan session and filter them by how their value changed, narrowing toward the real field offset.",
+        object_schema({
+            {"scan_id", scan_id_schema},
+            {"comparison", enum_string_schema({
+                "changed", "unchanged", "increased", "decreased", "increased_by", "decreased_by", "exact"
+            })},
+            {"value", hex_value_schema},
+            {"delta", hex_value_schema}
+        }, {"scan_id", "comparison"}),
+        stateful_annotations()
+    });
+
+    tools.push_back(ToolDefinition{
+        "memory_debug.scan_results",
+        "Page through the current candidate addresses of an active scan session.",
+        object_schema({
+            {"scan_id", scan_id_schema},
+            {"offset", integer_schema(0, std::numeric_limits<std::int64_t>::max())},
+            {"limit", integer_schema(1, 4096)}
+        }, {"scan_id"}),
+        read_only_annotations()
+    });
+
+    tools.push_back(ToolDefinition{
+        "memory_debug.scan_reset",
+        "Clear the candidates of an active scan session without a new attach/detach cycle.",
+        object_schema({{"scan_id", scan_id_schema}}, {"scan_id"}),
+        stateful_annotations()
+    });
+
+    tools.push_back(ToolDefinition{
+        "memory_debug.strings",
+        "Extract printable ASCII or UTF-16LE strings directly from process memory without downloading raw hex bytes.",
+        object_schema({
+            {"session_id", session},
+            {"start_address", address},
+            {"end_address", address},
+            {"min_length", integer_schema(1, 4096)},
+            {"encoding", enum_string_schema({"ascii", "utf16le"})},
+            {"byte_budget", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_scan_bytes))},
+            {"result_limit", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_scan_results))},
+            {"writable_only", boolean_schema()}
+        }, {"session_id"}),
         read_only_annotations()
     });
 
@@ -686,10 +928,62 @@ ToolCallResult ToolCatalog::invoke(
 
     if (name == "memory_debug.detach") {
         auto session = session_arg(arguments);
+        auto terminate = bool_arg(arguments, "terminate", false, false);
         if (!session) return input_error(session.error().message);
-        auto result = service_.detach(*session);
+        if (!terminate) return input_error(terminate.error().message);
+        auto result = service_.detach(*session, *terminate);
         if (!result) return domain_error(result.error());
         return success(Value::object({{"detached", true}}));
+    }
+
+    if (name == "memory_debug.launch") {
+        auto executable = string_arg(arguments, "executable", true);
+        auto working_directory = string_arg(arguments, "working_directory", false, "");
+        auto access_text = string_arg(arguments, "access", false, "read_only");
+        auto authorized = bool_arg(arguments, "authorized", true);
+        auto capture_output = bool_arg(arguments, "capture_output", false, true);
+        if (!executable) return input_error(executable.error().message);
+        if (!working_directory) return input_error(working_directory.error().message);
+        if (!access_text) return input_error(access_text.error().message);
+        if (!authorized) return input_error(authorized.error().message);
+        if (!capture_output) return input_error(capture_output.error().message);
+        domain::AccessMode access = domain::AccessMode::read_only;
+        if (*access_text == "read_write") access = domain::AccessMode::read_write;
+        else if (*access_text != "read_only") return input_error("access must be read_only or read_write");
+
+        std::vector<std::string> argument_list;
+        const Value* arguments_value = arguments.find("arguments");
+        if (arguments_value != nullptr) {
+            if (!arguments_value->is_array()) return input_error("arguments must be an array of strings");
+            argument_list.reserve(arguments_value->as_array().size());
+            for (const auto& item : arguments_value->as_array()) {
+                if (!item.is_string()) return input_error("every argument must be a string");
+                argument_list.push_back(item.as_string());
+            }
+        }
+
+        domain::LaunchSpec spec;
+        spec.executable = *executable;
+        spec.arguments = std::move(argument_list);
+        spec.working_directory = working_directory->empty()
+            ? std::nullopt : std::optional<std::string>{*working_directory};
+        spec.capture_output = *capture_output;
+
+        auto result = service_.launch(spec, access, *authorized);
+        if (!result) return domain_error(result.error());
+        return success(session_to_json(*result));
+    }
+
+    if (name == "memory_debug.read_output") {
+        auto session = session_arg(arguments);
+        auto since_cursor = unsigned_arg(arguments, "since_cursor", false, 0U);
+        auto max_bytes = unsigned_arg(arguments, "max_bytes", false, service_.policy().max_captured_output_bytes);
+        if (!session) return input_error(session.error().message);
+        if (!since_cursor) return input_error(since_cursor.error().message);
+        if (!max_bytes) return input_error(max_bytes.error().message);
+        auto result = service_.read_output(*session, *since_cursor, static_cast<std::size_t>(*max_bytes));
+        if (!result) return domain_error(result.error());
+        return success(output_chunk_to_json(*result));
     }
 
     if (name == "memory_debug.sessions") {
@@ -780,6 +1074,26 @@ ToolCallResult ToolCatalog::invoke(
         auto result = service_.unreal_reflection(*session, *module, static_cast<std::size_t>(*max_symbols));
         if (!result) return domain_error(result.error());
         return success(reflection_metadata_to_json(*result));
+    }
+
+    if (name == "memory_debug.pdb_list_types") {
+        auto session = session_arg(arguments);
+        auto module = string_arg(arguments, "module", true);
+        auto name_filter = string_arg(arguments, "name_filter", false, "");
+        auto kind_filter = string_arg(arguments, "kind_filter", false, "");
+        auto max_symbols = unsigned_arg(arguments, "max_symbols", false, 2048U);
+        if (!session) return input_error(session.error().message);
+        if (!module) return input_error(module.error().message);
+        if (!name_filter) return input_error(name_filter.error().message);
+        if (!kind_filter) return input_error(kind_filter.error().message);
+        if (!max_symbols || *max_symbols == 0U || *max_symbols > 65536U) {
+            return input_error("max_symbols must be between 1 and 65536");
+        }
+        auto result = service_.pdb_list_types(
+            *session, *module, *name_filter, *kind_filter, static_cast<std::size_t>(*max_symbols)
+        );
+        if (!result) return domain_error(result.error());
+        return success(type_catalog_to_json(*result));
     }
 
     if (name == "memory_debug.read") {
@@ -881,6 +1195,146 @@ ToolCallResult ToolCatalog::invoke(
             {"bytes_scanned", static_cast<std::int64_t>(result->bytes_scanned)},
             {"truncated", result->truncated}
         }));
+    }
+
+    if (name == "memory_debug.scan_first") {
+        auto session = session_arg(arguments);
+        auto value_type = value_type_arg(arguments);
+        auto comparison = comparison_arg(arguments);
+        auto value = optional_hex_arg(arguments, "value");
+        auto range_low = optional_hex_arg(arguments, "range_low");
+        auto range_high = optional_hex_arg(arguments, "range_high");
+        auto budget = unsigned_arg(arguments, "byte_budget", false, service_.policy().max_scan_bytes);
+        auto limit = unsigned_arg(
+            arguments, "result_limit", false, service_.policy().max_scan_session_candidates
+        );
+        auto writable_only = bool_arg(arguments, "writable_only", false, false);
+        auto start_address = optional_address_arg(arguments, "start_address");
+        auto end_address = optional_address_arg(arguments, "end_address");
+        if (!session) return input_error(session.error().message);
+        if (!value_type) return input_error(value_type.error().message);
+        if (!comparison) return input_error(comparison.error().message);
+        if (!value) return input_error(value.error().message);
+        if (!range_low) return input_error(range_low.error().message);
+        if (!range_high) return input_error(range_high.error().message);
+        if (!budget) return input_error(budget.error().message);
+        if (!limit) return input_error(limit.error().message);
+        if (!writable_only) return input_error(writable_only.error().message);
+        if (!start_address) return input_error(start_address.error().message);
+        if (!end_address) return input_error(end_address.error().message);
+        if (static_cast<bool>(*range_low) != static_cast<bool>(*range_high)) {
+            return input_error("range_low and range_high must be provided together");
+        }
+        std::optional<std::pair<std::vector<std::byte>, std::vector<std::byte>>> range;
+        if (*range_low && *range_high) {
+            range = std::pair<std::vector<std::byte>, std::vector<std::byte>>{**range_low, **range_high};
+        }
+        auto result = service_.scan_first(
+            *session, *value_type, *comparison, *value, range,
+            static_cast<std::size_t>(*budget), static_cast<std::size_t>(*limit), *writable_only,
+            *start_address, *end_address, cancellation
+        );
+        if (!result) return domain_error(result.error());
+        return success(scan_session_info_to_json(*result));
+    }
+
+    if (name == "memory_debug.scan_next") {
+        auto scan_id = scan_session_arg(arguments);
+        auto comparison = comparison_arg(arguments);
+        auto value = optional_hex_arg(arguments, "value");
+        auto delta = optional_hex_arg(arguments, "delta");
+        if (!scan_id) return input_error(scan_id.error().message);
+        if (!comparison) return input_error(comparison.error().message);
+        if (!value) return input_error(value.error().message);
+        if (!delta) return input_error(delta.error().message);
+        auto result = service_.scan_next(*scan_id, *comparison, *value, *delta, cancellation);
+        if (!result) return domain_error(result.error());
+        return success(scan_session_info_to_json(*result));
+    }
+
+    if (name == "memory_debug.scan_results") {
+        auto scan_id = scan_session_arg(arguments);
+        auto offset = unsigned_arg(arguments, "offset", false, 0U);
+        auto limit = unsigned_arg(arguments, "limit", false, 256U);
+        if (!scan_id) return input_error(scan_id.error().message);
+        if (!offset) return input_error(offset.error().message);
+        if (!limit || *limit == 0U || *limit > 4096U) return input_error("limit must be between 1 and 4096");
+        auto result = service_.scan_results(
+            *scan_id, static_cast<std::size_t>(*offset), static_cast<std::size_t>(*limit)
+        );
+        if (!result) return domain_error(result.error());
+        Value::Array matches;
+        matches.reserve(result->size());
+        for (const auto& match : *result) matches.push_back(hex_address(match.address));
+        return success(Value::object({{"matches", Value{std::move(matches)}}}));
+    }
+
+    if (name == "memory_debug.scan_reset") {
+        auto scan_id = scan_session_arg(arguments);
+        if (!scan_id) return input_error(scan_id.error().message);
+        auto result = service_.scan_reset(*scan_id);
+        if (!result) return domain_error(result.error());
+        return success(Value::object({}));
+    }
+
+    if (name == "memory_debug.scan_pointers_to") {
+        auto session = session_arg(arguments);
+        auto target = address_arg(arguments, "target_address");
+        auto pointer_size_text = string_arg(arguments, "pointer_size", false, sizeof(void*) == 8U ? "8" : "4");
+        auto budget = unsigned_arg(arguments, "byte_budget", false, service_.policy().max_scan_bytes);
+        auto limit = unsigned_arg(arguments, "result_limit", false, service_.policy().max_scan_results);
+        auto start_address = optional_address_arg(arguments, "start_address");
+        auto end_address = optional_address_arg(arguments, "end_address");
+        auto writable_only = bool_arg(arguments, "writable_only", false, false);
+        if (!session) return input_error(session.error().message);
+        if (!target) return input_error(target.error().message);
+        if (!pointer_size_text) return input_error(pointer_size_text.error().message);
+        if (!budget) return input_error(budget.error().message);
+        if (!limit) return input_error(limit.error().message);
+        if (!start_address) return input_error(start_address.error().message);
+        if (!end_address) return input_error(end_address.error().message);
+        if (!writable_only) return input_error(writable_only.error().message);
+        const std::size_t pointer_size = *pointer_size_text == "4" ? 4U : (*pointer_size_text == "8" ? 8U : 0U);
+        if (pointer_size == 0U) return input_error("pointer_size must be 4 or 8");
+        auto result = service_.scan_pointers_to(
+            *session, *target, pointer_size, static_cast<std::size_t>(*budget),
+            static_cast<std::size_t>(*limit), *writable_only, *start_address, *end_address, cancellation
+        );
+        if (!result) return domain_error(result.error());
+        Value::Array matches;
+        matches.reserve(result->matches.size());
+        for (const auto& match : result->matches) matches.push_back(hex_address(match.address));
+        return success(Value::object({
+            {"matches", Value{std::move(matches)}},
+            {"bytes_scanned", static_cast<std::int64_t>(result->bytes_scanned)},
+            {"truncated", result->truncated}
+        }));
+    }
+
+    if (name == "memory_debug.strings") {
+        auto session = session_arg(arguments);
+        auto start_address = optional_address_arg(arguments, "start_address");
+        auto end_address = optional_address_arg(arguments, "end_address");
+        auto min_length = unsigned_arg(arguments, "min_length", false, 4U);
+        auto encoding = string_arg(arguments, "encoding", false, "ascii");
+        auto budget = unsigned_arg(arguments, "byte_budget", false, service_.policy().max_scan_bytes);
+        auto limit = unsigned_arg(arguments, "result_limit", false, service_.policy().max_scan_results);
+        auto writable_only = bool_arg(arguments, "writable_only", false, false);
+        if (!session) return input_error(session.error().message);
+        if (!start_address) return input_error(start_address.error().message);
+        if (!end_address) return input_error(end_address.error().message);
+        if (!min_length) return input_error(min_length.error().message);
+        if (!encoding) return input_error(encoding.error().message);
+        if (!budget) return input_error(budget.error().message);
+        if (!limit) return input_error(limit.error().message);
+        if (!writable_only) return input_error(writable_only.error().message);
+        auto result = service_.extract_strings(
+            *session, static_cast<std::size_t>(*min_length), *encoding,
+            static_cast<std::size_t>(*budget), static_cast<std::size_t>(*limit), *writable_only,
+            *start_address, *end_address, cancellation
+        );
+        if (!result) return domain_error(result.error());
+        return success(string_scan_result_to_json(*result));
     }
 
     if (name == "memory_debug.resolve_pointer_chain") {

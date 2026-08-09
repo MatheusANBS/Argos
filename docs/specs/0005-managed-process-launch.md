@@ -1,6 +1,6 @@
 # Spec 0005 — Início gerenciado de processo (`memory_debug.launch`)
 
-Status: proposto · ADR: [0010](../adr/0010-managed-process-launch.md)
+Status: aceito · ADR: [0010](../adr/0010-managed-process-launch.md)
 
 ## Objetivo
 

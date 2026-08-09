@@ -1,6 +1,6 @@
 # Spec 0001 — `memory_debug.strings`
 
-Status: proposto · ADR: [0006](../adr/0006-memory-string-extraction.md)
+Status: aceito · ADR: [0006](../adr/0006-memory-string-extraction.md)
 
 ## Objetivo
 

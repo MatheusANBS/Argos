@@ -1,6 +1,6 @@
 # Spec 0002 — `memory_debug.scan_pointers_to`
 
-Status: proposto · ADR: [0007](../adr/0007-reverse-pointer-scan.md)
+Status: aceito · ADR: [0007](../adr/0007-reverse-pointer-scan.md)
 
 ## Objetivo
 

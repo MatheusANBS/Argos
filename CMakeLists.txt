@@ -26,6 +26,7 @@ argos_enable_static_analysis(argos_domain)
 add_library(argos_infrastructure
     src/infrastructure/native_process_memory.cpp
     src/infrastructure/pdb_type_metadata.cpp
+    src/infrastructure/output_ring_buffer.cpp
 )
 target_include_directories(argos_infrastructure PUBLIC include)
 target_link_libraries(argos_infrastructure PUBLIC argos_domain)
@@ -39,6 +40,7 @@ endif()
 
 add_library(argos_application
     src/application/session_manager.cpp
+    src/application/scan_session_manager.cpp
     src/application/memory_debug_service.cpp
     src/security/policy.cpp
 )

@@ -3,6 +3,7 @@
 #include "argos_mcp/domain/process_memory.hpp"
 #include "argos_mcp/domain/types.hpp"
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -26,6 +27,10 @@ public:
 
     [[nodiscard]] domain::Result<void> remove(const domain::SessionId& id);
     [[nodiscard]] std::vector<domain::SessionInfo> list() const;
+
+    [[nodiscard]] std::size_t count_if(
+        const std::function<bool(const domain::ProcessSession&)>& predicate
+    ) const;
 
 private:
     [[nodiscard]] std::string generate_id();

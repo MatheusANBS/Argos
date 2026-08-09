@@ -40,6 +40,19 @@ struct ReflectionMetadata {
     bool truncated{false};
 };
 
+struct TypeSummary {
+    std::string name;
+    std::string kind;
+    std::uint64_t size{};
+};
+
+struct TypeCatalog {
+    std::vector<TypeSummary> types;
+    std::string source;
+    std::string confidence;
+    bool truncated{false};
+};
+
 class TypeMetadataProvider {
 public:
     virtual ~TypeMetadataProvider() = default;
@@ -64,6 +77,13 @@ public:
 
     [[nodiscard]] virtual Result<ReflectionMetadata> inspect_unreal_reflection(
         std::string_view module_path,
+        std::size_t max_symbols
+    ) const = 0;
+
+    [[nodiscard]] virtual Result<TypeCatalog> list_pdb_types(
+        std::string_view module_path,
+        std::string_view name_filter,
+        std::string_view kind_filter,
         std::size_t max_symbols
     ) const = 0;
 };

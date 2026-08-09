@@ -31,6 +31,13 @@ public:
         std::size_t max_symbols
     ) const override;
 
+    [[nodiscard]] domain::Result<domain::TypeCatalog> list_pdb_types(
+        std::string_view module_path,
+        std::string_view name_filter,
+        std::string_view kind_filter,
+        std::size_t max_symbols
+    ) const override;
+
 private:
     // DbgHelp keeps symbol state per process and is not reentrant across
     // concurrent callers. The MCP currently serializes tools, but the port
