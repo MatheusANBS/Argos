@@ -17,12 +17,8 @@ Por padrão:
 
 ## Tools MCP
 
-`memory_debug.pdb_type` consulta o layout de um tipo no PDB correspondente ao
-modulo carregado, com origem e nivel de confianca explicitos.
-
-`memory_debug.unity_type` extrai tipos de `global-metadata.dat` IL2CPP e usa
-PDB para completar offsets. `memory_debug.unreal_type` e
-`memory_debug.unreal_reflection` extraem tipos e simbolos UHT do PDB nativo.
+Tipos e layouts vêm sempre com origem e nível de confiança explícitos; scans e
+assinaturas permanecem candidatos e não são promovidos a layout confirmado.
 
 | Tool | Função |
 |---|---|
@@ -34,6 +30,10 @@ PDB para completar offsets. `memory_debug.unreal_type` e
 | `memory_debug.address_space_summary` | Agrega tamanho e contagem do espaço de endereçamento por classe; dimensiona o alvo antes de varrer. |
 | `memory_debug.modules` | Lista módulos carregados/mapeamentos de arquivo. |
 | `memory_debug.pdb_list_types` | Enumera tipos disponíveis no PDB de um módulo carregado. |
+| `memory_debug.pdb_type` | Consulta o layout de um tipo no PDB correspondente ao módulo carregado. |
+| `memory_debug.unity_type` | Extrai tipos de `global-metadata.dat` IL2CPP e usa PDB para completar offsets. |
+| `memory_debug.unreal_type` | Extrai tipos UHT do PDB nativo. |
+| `memory_debug.unreal_reflection` | Extrai símbolos de reflexão UHT do PDB nativo. |
 | `memory_debug.read` | Lê bytes limitados e retorna hexadecimal. |
 | `memory_debug.read_batch` | Executa múltiplas leituras limitadas, coalescendo intervalos adjacentes/sobrepostos em uma única leitura nativa. |
 | `memory_debug.read_typed` | Decodifica inteiros, floats e UTF-8 little-endian. |
@@ -45,14 +45,26 @@ PDB para completar offsets. `memory_debug.unreal_type` e
 | `memory_debug.resolve_pointer_chain` | Resolve pointer chains de 32 ou 64 bits. |
 | `memory_debug.write` | Escreve bytes somente quando habilitado e confirmado. |
 | `memory_debug.launch` / `read_output` | Inicia um executável escolhido pelo operador e captura `stdout`/`stderr`. Desligado por padrão (`ARGOS_MCP_ALLOW_LAUNCH`). |
+| `memory_debug.scan_start` | Inicia `scan_exact`/`strings`/`scan_pointers_to`/`scan_pointer_chains`/`scan_first`/`scan_next` como job em background que sobrevive à chamada MCP ([Spec 0008](docs/specs/0008-async-scan-operations.md)). |
+| `memory_debug.job_status` | Consulta estado, progresso monotônico e motivo de término de um job em background. |
+| `memory_debug.job_results` | Pagina o resultado imutável de um job terminal. |
+| `memory_debug.job_cancel` | Pede cancelamento cooperativo de um job em fila ou em execução; idempotente após terminal. |
+| `memory_debug.job_release` | Libera resultados e estado retido de um job terminal. |
 
 ## Roadmap proposto
 
-O pacote de evolução documenta scans completos assíncronos, continuação com
-motivo explícito, importação/multipadrão, índice de pointer chains,
-`inspect_address` e reflexão Unreal em runtime sem PDB. Essas capacidades estão
-**propostas e ainda não fazem parte das tools acima**. Contratos, decisões,
-riscos, ordem de implementação e o protocolo de teste com valor mutável estão
+`docs/specs/` contém tanto specs já implementadas quanto propostas. As
+seguintes estão **especificadas mas não implementadas** — nenhuma tool acima as
+expõe:
+
+| Proposta | Spec | ADR |
+|---|---|---|
+| Composição de scan e multipadrão | [0009](docs/specs/0009-scan-composition-and-multi-pattern.md) | [0017](docs/adr/0017-scan-composition-and-multi-pattern.md) |
+| Índice persistente de ponteiros | [0010](docs/specs/0010-persistent-pointer-index.md) | [0018](docs/adr/0018-persistent-pointer-index.md) |
+| `inspect_address` e evidência derivada | [0011](docs/specs/0011-inspect-address.md) | [0013](docs/adr/0013-address-inspection-derived-evidence.md) |
+| Reflexão Unreal em runtime sem PDB | [0012](docs/specs/0012-unreal-runtime-reflection.md) | [0019](docs/adr/0019-unreal-runtime-reflection.md) |
+
+Riscos, ordem de implementação e o protocolo de teste com valor mutável estão
 no [roadmap de eficiência do agente](docs/specs/0007-roadmap-eficiencia-agente.md).
 
 ## Plataformas
@@ -175,11 +187,23 @@ Depois disso, o `attach` deve solicitar `access: "read_write"`, e cada chamada d
 | `ARGOS_MCP_LAUNCH_ALLOWED_DIRS` | (vazio = sem allowlist) | lista separada por `;` |
 | `ARGOS_MCP_MAX_LAUNCHED_PROCESSES` | 4 | 64 |
 | `ARGOS_MCP_MAX_CAPTURED_OUTPUT_BYTES` | 1 MiB | 64 MiB |
+| `ARGOS_MCP_MAX_ASYNC_JOBS_TOTAL` | 64 | 1.024 |
+| `ARGOS_MCP_MAX_ASYNC_JOBS_PER_SESSION` | 8 | 128 |
+| `ARGOS_MCP_MAX_ASYNC_QUEUE_DEPTH` | 32 | 512 |
+| `ARGOS_MCP_MAX_ASYNC_WORKERS` | 2 | 16 |
+| `ARGOS_MCP_MAX_ASYNC_JOB_BYTE_BUDGET` | 256 MiB | 4 GiB |
+| `ARGOS_MCP_MAX_ASYNC_JOB_DEADLINE_MS` | 600.000 (10 min) | 3.600.000 (1 h) |
+| `ARGOS_MCP_MAX_ASYNC_JOB_RESULT_ITEMS` | 4.096 | 65.536 |
+| `ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES` | 64 MiB | 1 GiB |
+| `ARGOS_MCP_ASYNC_RESULTS_TTL_MS` | 300.000 (5 min) | 3.600.000 (1 h) |
+| `ARGOS_MCP_ASYNC_TOMBSTONE_TTL_MS` | 60.000 (1 min) | 600.000 (10 min) |
 | `ARGOS_MCP_LOG_LEVEL` | `info` | `debug`, `info`, `warning`, `error` |
 
 `ARGOS_MCP_ALLOW_FOREIGN_USER=1` remove somente a validação interna de proprietário. Ele não contorna permissões do sistema operacional e deve ser usado apenas em ambientes de laboratório controlados.
 
 `ARGOS_MCP_ALLOW_LAUNCH=1` habilita `memory_debug.launch` (o servidor cria um processo em vez de apenas ler um já existente). Desligado por padrão; útil apenas para alvos de teste/desenvolvimento controlados pelo próprio operador, não para anexar a processos de terceiros já em execução. Ver o threat model para os controles completos.
+
+As variáveis `ARGOS_MCP_MAX_ASYNC_*` e `ARGOS_MCP_ASYNC_*` limitam `AnalysisJobManager` (jobs em background da Spec 0008): fila global/por sessão, pool de workers, orçamento de bytes e deadline por job, itens de resultado por página e TTL de resultado/tombstone. Nenhum valor pedido pelo cliente em `execution` ultrapassa esses limites — apenas reduz. `ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES` está reservado para um limite agregado explícito de bytes retidos entre todos os jobs; nesta versão a memória retida já é indiretamente limitada por `ARGOS_MCP_MAX_ASYNC_JOBS_TOTAL`/`_PER_SESSION` combinados com os limites de itens por operação (`ARGOS_MCP_MAX_SCAN_RESULTS`, `ARGOS_MCP_MAX_SCAN_SESSION_CANDIDATES`), mas a variável ainda não é somada e comparada ativamente — ver o relatório de implementação.
 
 ## Skills instaladas
 

@@ -90,6 +90,20 @@ SecurityPolicy SecurityPolicy::from_environment() {
     policy.max_captured_output_bytes = env_size(
         "ARGOS_MCP_MAX_CAPTURED_OUTPUT_BYTES", 1U * 1024U * 1024U, 64U * 1024U * 1024U
     );
+    policy.max_async_jobs_total = env_size("ARGOS_MCP_MAX_ASYNC_JOBS_TOTAL", 64U, 1024U);
+    policy.max_async_jobs_per_session = env_size("ARGOS_MCP_MAX_ASYNC_JOBS_PER_SESSION", 8U, 128U);
+    policy.max_async_queue_depth = env_size("ARGOS_MCP_MAX_ASYNC_QUEUE_DEPTH", 32U, 512U);
+    policy.max_async_workers = env_size("ARGOS_MCP_MAX_ASYNC_WORKERS", 2U, 16U);
+    policy.max_async_job_byte_budget = env_size(
+        "ARGOS_MCP_MAX_ASYNC_JOB_BYTE_BUDGET", 256U * 1024U * 1024U, 4U * 1024U * 1024U * 1024ULL
+    );
+    policy.max_async_job_deadline_ms = env_size("ARGOS_MCP_MAX_ASYNC_JOB_DEADLINE_MS", 600'000U, 3'600'000U);
+    policy.max_async_job_result_items = env_size("ARGOS_MCP_MAX_ASYNC_JOB_RESULT_ITEMS", 4096U, 65536U);
+    policy.max_async_results_retained_bytes = env_size(
+        "ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES", 64U * 1024U * 1024U, 1024U * 1024U * 1024ULL
+    );
+    policy.async_results_ttl_ms = env_size("ARGOS_MCP_ASYNC_RESULTS_TTL_MS", 300'000U, 3'600'000U);
+    policy.async_tombstone_ttl_ms = env_size("ARGOS_MCP_ASYNC_TOMBSTONE_TTL_MS", 60'000U, 600'000U);
     return policy;
 }
 
@@ -245,6 +259,24 @@ domain::Result<void> SecurityPolicy::authorize_launch(
         }
     }
     return {};
+}
+
+domain::Result<std::size_t> SecurityPolicy::clamp_async_byte_budget(
+    const std::optional<std::size_t> requested
+) const {
+    if (requested && *requested == 0U) {
+        return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "byte_budget must be positive"));
+    }
+    return std::min(requested.value_or(max_async_job_byte_budget), max_async_job_byte_budget);
+}
+
+domain::Result<std::size_t> SecurityPolicy::clamp_async_deadline_ms(
+    const std::optional<std::size_t> requested
+) const {
+    if (requested && *requested == 0U) {
+        return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "deadline_ms must be positive"));
+    }
+    return std::min(requested.value_or(max_async_job_deadline_ms), max_async_job_deadline_ms);
 }
 
 }  // namespace argos::security

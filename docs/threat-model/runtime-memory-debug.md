@@ -9,7 +9,8 @@
 - processo filho criado pelo MCP (`memory_debug.launch`) e sua saída capturada
   (`stdout`/`stderr`);
 - jobs de análise assíncronos (`AnalysisJobManager`) e os resultados/progresso
-  retidos em memória durante seu TTL (Spec 0008 — proposto);
+  retidos em memória durante seu TTL (Spec 0008 — **implementado**; jobs de
+  `pointer_index`/`unreal_runtime` das Specs 0010/0012 permanecem propostos);
 - candidatos de scan importados pelo cliente e sessões multipadrão
   materializadas (Spec 0009 — proposto);
 - índice invertido de ponteiros, em memória e, quando habilitado pelo
@@ -41,9 +42,14 @@
 8. servidor → filesystem de persistência (Spec 0010 — proposto, disco
    opt-in) — primeira vez que uma capacidade de scan grava artefato derivado
    em disco;
-9. job assíncrono → sessão de depuração (Spec 0008 — proposto) — trabalho em
-   background passa a existir fora do ciclo de vida de uma única chamada
-   MCP, com concorrência real entre sessões diferentes.
+9. job assíncrono → sessão de depuração (Spec 0008 — **implementado**) —
+   trabalho em background passa a existir fora do ciclo de vida de uma única
+   chamada MCP, com concorrência real entre sessões diferentes. Mitigado por
+   fila/pool limitados, TTL, cancelamento cooperativo e destruição
+   determinística em `detach`/shutdown; retomada por `resume_token` não é
+   implementada nesta versão (ver Spec 0008), o que remove a superfície de
+   ataque associada a fingerprint de região e admissão CAS até que seja
+   implementada.
 
 ## Ameaças e controles
 
@@ -109,13 +115,19 @@ operador controla (ver `docs/specs/0000-roadmap-introspeccao-runtime.md`).
 
 ## Ameaças e controles — capacidades propostas (Specs 0008–0012)
 
-Esta seção cobre exclusivamente capacidades **ainda não implementadas**,
-descritas em `docs/specs/0008` a `0012` e nos ADRs 0012, 0017, 0018, 0013 e
-0019. Nenhuma delas está exposta hoje como tool MCP nem consta na tabela do
-`README.md`. A análise é derivada dos contratos publicados nas specs, não de
-código — este é o gate textual exigido pela ADR-0012 ("O threat model deve
-ser atualizado antes da implementação"), pela ADR-0017, pela ADR-0018 e, em
-particular, pela ADR-0019 antes da Spec 0012.
+Esta seção foi escrita como gate textual pré-implementação (exigido pela
+ADR-0012 antes da Spec 0008, e pelas ADR-0017/0018/0019 antes das Specs
+0009–0012). **A Spec 0008 saiu desse estado: `AnalysisJobManager` e as cinco
+tools de job estão implementadas e expostas em `README.md`.** A análise da
+subseção "Spec 0008" abaixo permanece válida como descrição das mitigações
+reais (fila/pool limitados, quota por sessão, TTL, cancelamento cooperativo,
+destruição em `detach`/shutdown) — apenas deixou de ser hipotética. A exceção
+registrada é `resume_token`: não implementado nesta versão, então a
+superfície associada (fingerprint de região, admissão CAS, estado de overlap
+persistido) descrita nas subseções abaixo continua sendo apenas uma análise
+antecipada de um ponto de extensão futuro, não uma ameaça contra código
+existente. As Specs 0009–0012 continuam **integralmente não implementadas**;
+nenhuma delas está exposta como tool MCP nem consta na tabela do `README.md`.
 
 ### Exaustão de recursos por jobs concorrentes (Spec 0008)
 

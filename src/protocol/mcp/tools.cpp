@@ -1,5 +1,6 @@
 #include "argos_mcp/protocol/mcp/tools.hpp"
 
+#include "argos_mcp/application/analysis_job_manager.hpp"
 #include "argos_mcp/domain/types.hpp"
 
 #include <algorithm>
@@ -46,13 +47,17 @@ using InputResult = std::expected<T, InputError>;
 }
 
 [[nodiscard]] ToolCallResult domain_error(const domain::DebugError& error) {
+    Value error_value = Value::object({
+        {"code", std::string{domain::to_string(error.code)}},
+        {"message", error.safe_message}
+    });
+    if (!error.reason.empty()) {
+        error_value["reason"] = error.reason;
+    }
     return ToolCallResult{
         Value::object({
             {"ok", false},
-            {"error", Value::object({
-                {"code", std::string{domain::to_string(error.code)}},
-                {"message", error.safe_message}
-            })}
+            {"error", std::move(error_value)}
         }),
         true
     };
@@ -510,6 +515,69 @@ using InputResult = std::expected<T, InputError>;
         {"candidate_count", static_cast<std::int64_t>(info.candidate_count)},
         {"generation", static_cast<std::int64_t>(info.generation)}
     });
+}
+
+[[nodiscard]] InputResult<domain::AnalysisJobId> job_id_arg(const Value& arguments) {
+    auto text = string_arg(arguments, "job_id", true);
+    if (!text) {
+        return std::unexpected(text.error());
+    }
+    auto id = domain::AnalysisJobId::create(std::move(*text));
+    if (!id) {
+        return std::unexpected(InputError{id.error()});
+    }
+    return *id;
+}
+
+[[nodiscard]] Value scan_progress_to_json(const domain::ScanProgress& progress) {
+    return Value::object({
+        {"sequence", static_cast<std::int64_t>(progress.sequence)},
+        {"bytes_scanned", static_cast<std::int64_t>(progress.bytes_scanned)},
+        {"bytes_eligible", static_cast<std::int64_t>(progress.bytes_eligible)},
+        {"bytes_skipped", static_cast<std::int64_t>(progress.bytes_skipped)},
+        {"regions_scanned", static_cast<std::int64_t>(progress.regions_scanned)},
+        {"regions_eligible", static_cast<std::int64_t>(progress.regions_eligible)},
+        {"regions_skipped", static_cast<std::int64_t>(progress.regions_skipped)},
+        {"matches_found", static_cast<std::int64_t>(progress.matches_found)},
+        {"matches_retained", static_cast<std::int64_t>(progress.matches_retained)},
+        {"coverage_ratio", progress.coverage_ratio()}
+    });
+}
+
+[[nodiscard]] Value job_termination_to_json(const domain::AnalysisJobTermination& termination) {
+    Value::Array reasons;
+    reasons.reserve(termination.truncation_reasons.size());
+    for (const auto reason : termination.truncation_reasons) {
+        reasons.push_back(std::string{domain::to_string(reason)});
+    }
+    Value value = Value::object({
+        {"stop_reason", std::string{domain::to_string(termination.reason)}},
+        {"coverage_complete", termination.coverage_complete},
+        {"results_complete", termination.results_complete},
+        {"complete", termination.complete()},
+        {"truncated", termination.truncated},
+        {"truncation_reasons", Value{std::move(reasons)}},
+        {"read_error_count", static_cast<std::int64_t>(termination.read_error_count)}
+    });
+    value["next_start_address"] = termination.next_start_address
+        ? Value{hex_address(*termination.next_start_address)} : Value{nullptr};
+    value["resume_token"] = termination.resume_token ? Value{termination.resume_token->value()} : Value{nullptr};
+    return value;
+}
+
+[[nodiscard]] Value job_info_to_json(const domain::AnalysisJobInfo& info) {
+    Value value = Value::object({
+        {"job_id", info.id.value()},
+        {"job_kind", std::string{domain::to_string(info.kind)}},
+        {"operation", std::string{domain::to_string(info.operation)}},
+        {"state", std::string{domain::to_string(info.state)}},
+        {"cancel_requested", info.cancel_requested},
+        {"progress", scan_progress_to_json(info.progress)},
+        {"results_available", info.results_available},
+        {"results_expired", info.results_expired}
+    });
+    value["termination"] = info.termination ? job_termination_to_json(*info.termination) : Value{nullptr};
+    return value;
 }
 
 [[nodiscard]] Value scan_coverage_to_json(const domain::ScanCoverage& coverage) {
@@ -1048,6 +1116,93 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
             {"confirmation", enum_string_schema({"AUTHORIZED_DEBUG_WRITE"})}
         }, {"session_id", "address", "bytes_hex", "confirmation"}),
         destructive_annotations()
+    });
+
+    // Spec 0008 -- async scan operations. scan_start is operation-specific;
+    // the other four are generic job-control tools reused unchanged if a
+    // future job kind (pointer_index, unreal_runtime) is added.
+    const auto job_id_schema = string_schema("Opaque job_id returned by memory_debug.scan_start.");
+    const auto execution_schema = Value::object({
+        {"type", "object"},
+        {"properties", Value::object({
+            {"byte_budget", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_async_job_byte_budget))},
+            {"deadline_ms", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_async_job_deadline_ms))}
+        })},
+        {"additionalProperties", false}
+    });
+
+    tools.push_back(ToolDefinition{
+        "memory_debug.scan_start",
+        "Start scan_exact, strings, scan_pointers_to, scan_pointer_chains, scan_first or scan_next as a background job "
+        "that keeps running past this call. Poll progress with job_status, page terminal results with job_results, "
+        "and stop it with job_cancel/job_release. Reuses the exact same scan engine and limits as the synchronous "
+        "tools of the same name; only one long scan (sync or async) may run per session at a time.",
+        Value::object({
+            {"oneOf", Value::array({
+                object_schema({
+                    {"session_id", session},
+                    {"operation", enum_string_schema({
+                        "scan_exact", "strings", "scan_pointers_to", "scan_pointer_chains", "scan_first", "scan_next"
+                    })},
+                    {"request", Value::object({
+                        {"type", "object"},
+                        {"description",
+                            "Arguments for the chosen operation, matching the equivalent synchronous tool's input: "
+                            "pattern_hex/alignment for scan_exact; min_length/encoding for strings; "
+                            "target_address/pointer_size for scan_pointers_to; those plus max_depth/max_fanout for "
+                            "scan_pointer_chains; value_type/comparison/value(_decimal)/range_low/range_high for "
+                            "scan_first; scan_id/comparison/value(_decimal)/delta(_decimal) for scan_next. All "
+                            "operations except scan_next also accept start_address/end_address/writable_only."},
+                        {"additionalProperties", true}
+                    })},
+                    {"execution", execution_schema}
+                }, {"session_id", "operation", "request"}),
+                object_schema({
+                    {"session_id", session},
+                    {"resume_token", string_schema(
+                        "Opaque continuation cursor from a previous job's termination. Not implemented in this "
+                        "version: always answers unsupported/resume_not_supported (see docs/specs/0008)."
+                    )},
+                    {"execution", execution_schema}
+                }, {"session_id", "resume_token"})
+            })}
+        }),
+        stateful_annotations()
+    });
+
+    tools.push_back(ToolDefinition{
+        "memory_debug.job_status",
+        "Poll the state, progress and (once terminal) completion/truncation details of a background analysis job.",
+        object_schema({{"session_id", session}, {"job_id", job_id_schema}}, {"session_id", "job_id"}),
+        read_only_annotations()
+    });
+
+    tools.push_back(ToolDefinition{
+        "memory_debug.job_results",
+        "Page through the immutable terminal results of a background analysis job. Only available once the job "
+        "reached a terminal state and before its result retention TTL expires.",
+        object_schema({
+            {"session_id", session},
+            {"job_id", job_id_schema},
+            {"offset", integer_schema(0, std::numeric_limits<std::int64_t>::max())},
+            {"limit", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_async_job_result_items))}
+        }, {"session_id", "job_id"}),
+        read_only_annotations()
+    });
+
+    tools.push_back(ToolDefinition{
+        "memory_debug.job_cancel",
+        "Request cooperative cancellation of a queued or running background analysis job. Idempotent once terminal.",
+        object_schema({{"session_id", session}, {"job_id", job_id_schema}}, {"session_id", "job_id"}),
+        stateful_annotations()
+    });
+
+    tools.push_back(ToolDefinition{
+        "memory_debug.job_release",
+        "Release a terminal background analysis job, freeing its retained results and continuation state. A queued "
+        "or running job must be cancelled first.",
+        object_schema({{"session_id", session}, {"job_id", job_id_schema}}, {"session_id", "job_id"}),
+        stateful_annotations()
     });
 
     return tools;
@@ -1643,6 +1798,355 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(Value::object({
             {"address", hex_address(*address)},
             {"bytes_written", static_cast<std::int64_t>(*result)}
+        }));
+    }
+
+    if (name == "memory_debug.scan_start") {
+        auto session = session_arg(arguments);
+        if (!session) return input_error(session.error().message);
+
+        const Value* resume_token_value = arguments.find("resume_token");
+        const Value* operation_value = arguments.find("operation");
+        if ((resume_token_value != nullptr) == (operation_value != nullptr)) {
+            return input_error("scan_start requires either resume_token or operation+request, not both");
+        }
+
+        std::optional<std::uint64_t> requested_byte_budget;
+        std::optional<std::uint64_t> requested_deadline_ms;
+        const Value* execution = arguments.find("execution");
+        if (execution != nullptr) {
+            if (!execution->is_object()) return input_error("execution must be an object");
+            auto budget = optional_unsigned_arg(*execution, "byte_budget");
+            auto deadline = optional_unsigned_arg(*execution, "deadline_ms");
+            if (!budget) return input_error(budget.error().message);
+            if (!deadline) return input_error(deadline.error().message);
+            requested_byte_budget = *budget;
+            requested_deadline_ms = *deadline;
+        }
+        auto clamped_budget = service_.policy().clamp_async_byte_budget(
+            requested_byte_budget ? std::optional<std::size_t>{static_cast<std::size_t>(*requested_byte_budget)}
+                                   : std::nullopt
+        );
+        if (!clamped_budget) return domain_error(clamped_budget.error());
+        auto clamped_deadline = service_.policy().clamp_async_deadline_ms(
+            requested_deadline_ms ? std::optional<std::size_t>{static_cast<std::size_t>(*requested_deadline_ms)}
+                                   : std::nullopt
+        );
+        if (!clamped_deadline) return domain_error(clamped_deadline.error());
+        const application::AnalysisJobManager::ExecutionLimits limits{*clamped_budget, *clamped_deadline};
+
+        if (resume_token_value != nullptr) {
+            if (!resume_token_value->is_string()) return input_error("resume_token must be a string");
+            auto token = domain::ScanResumeToken::create(resume_token_value->as_string());
+            if (!token) return input_error(token.error());
+            auto result = service_.async_jobs().submit_resume(*session, *token, limits);
+            if (!result) return domain_error(result.error());
+            return success(job_info_to_json(*result));
+        }
+
+        if (!operation_value->is_string()) return input_error("operation must be a string");
+        const auto operation = domain::async_scan_operation_from_string(operation_value->as_string());
+        if (!operation) {
+            return input_error(
+                "operation must be one of scan_exact, strings, scan_pointers_to, scan_pointer_chains, "
+                "scan_first, scan_next"
+            );
+        }
+        const Value* request_value = arguments.find("request");
+        if (request_value == nullptr || !request_value->is_object()) {
+            return input_error("request must be an object matching the chosen operation");
+        }
+        const Value& req = *request_value;
+
+        application::AnalysisJobManager::Request typed_request;
+        switch (*operation) {
+        case domain::AsyncScanOperation::scan_exact: {
+            auto pattern_text = string_arg(req, "pattern_hex", true);
+            auto alignment = unsigned_arg(req, "alignment", false, 1U);
+            auto limit = unsigned_arg(req, "result_limit", false, service_.policy().max_scan_results);
+            auto start_address = optional_address_arg(req, "start_address");
+            auto end_address = optional_address_arg(req, "end_address");
+            auto writable_only = bool_arg(req, "writable_only", false, false);
+            if (!pattern_text) return input_error(pattern_text.error().message);
+            if (!alignment) return input_error(alignment.error().message);
+            if (!limit) return input_error(limit.error().message);
+            if (!start_address) return input_error(start_address.error().message);
+            if (!end_address) return input_error(end_address.error().message);
+            if (!writable_only) return input_error(writable_only.error().message);
+            auto pattern = parse_hex(*pattern_text);
+            if (!pattern) return input_error(pattern.error().message);
+            application::AnalysisJobManager::ExactScanRequest typed;
+            typed.pattern = std::move(*pattern);
+            typed.alignment = static_cast<std::size_t>(*alignment);
+            typed.result_limit = static_cast<std::size_t>(*limit);
+            typed.writable_only = *writable_only;
+            typed.start_address = *start_address;
+            typed.end_address = *end_address;
+            typed_request = std::move(typed);
+            break;
+        }
+        case domain::AsyncScanOperation::strings: {
+            auto min_length = unsigned_arg(req, "min_length", false, 4U);
+            auto encoding = string_arg(req, "encoding", false, "ascii");
+            auto limit = unsigned_arg(req, "result_limit", false, service_.policy().max_scan_results);
+            auto start_address = optional_address_arg(req, "start_address");
+            auto end_address = optional_address_arg(req, "end_address");
+            auto writable_only = bool_arg(req, "writable_only", false, false);
+            if (!min_length) return input_error(min_length.error().message);
+            if (!encoding) return input_error(encoding.error().message);
+            if (!limit) return input_error(limit.error().message);
+            if (!start_address) return input_error(start_address.error().message);
+            if (!end_address) return input_error(end_address.error().message);
+            if (!writable_only) return input_error(writable_only.error().message);
+            application::AnalysisJobManager::StringScanRequest typed;
+            typed.min_length = static_cast<std::size_t>(*min_length);
+            typed.encoding = *encoding;
+            typed.result_limit = static_cast<std::size_t>(*limit);
+            typed.writable_only = *writable_only;
+            typed.start_address = *start_address;
+            typed.end_address = *end_address;
+            typed_request = std::move(typed);
+            break;
+        }
+        case domain::AsyncScanOperation::scan_pointers_to: {
+            auto target = address_arg(req, "target_address");
+            auto pointer_size_text = string_arg(req, "pointer_size", false, sizeof(void*) == 8U ? "8" : "4");
+            auto limit = unsigned_arg(req, "result_limit", false, service_.policy().max_scan_results);
+            auto start_address = optional_address_arg(req, "start_address");
+            auto end_address = optional_address_arg(req, "end_address");
+            auto writable_only = bool_arg(req, "writable_only", false, false);
+            if (!target) return input_error(target.error().message);
+            if (!pointer_size_text) return input_error(pointer_size_text.error().message);
+            if (!limit) return input_error(limit.error().message);
+            if (!start_address) return input_error(start_address.error().message);
+            if (!end_address) return input_error(end_address.error().message);
+            if (!writable_only) return input_error(writable_only.error().message);
+            const std::size_t pointer_size = *pointer_size_text == "4" ? 4U : (*pointer_size_text == "8" ? 8U : 0U);
+            if (pointer_size == 0U) return input_error("pointer_size must be 4 or 8");
+            application::AnalysisJobManager::PointerScanRequest typed;
+            typed.target = *target;
+            typed.pointer_size = pointer_size;
+            typed.result_limit = static_cast<std::size_t>(*limit);
+            typed.writable_only = *writable_only;
+            typed.start_address = *start_address;
+            typed.end_address = *end_address;
+            typed_request = std::move(typed);
+            break;
+        }
+        case domain::AsyncScanOperation::scan_pointer_chains: {
+            auto target = address_arg(req, "target_address");
+            auto pointer_size_text = string_arg(req, "pointer_size", false, sizeof(void*) == 8U ? "8" : "4");
+            auto max_depth = unsigned_arg(req, "max_depth", false, service_.policy().max_pointer_chain_depth);
+            auto max_fanout = unsigned_arg(req, "max_fanout", false, service_.policy().max_pointer_chain_fanout);
+            auto limit = unsigned_arg(req, "result_limit", false, service_.policy().max_scan_results);
+            auto start_address = optional_address_arg(req, "start_address");
+            auto end_address = optional_address_arg(req, "end_address");
+            auto writable_only = bool_arg(req, "writable_only", false, false);
+            if (!target) return input_error(target.error().message);
+            if (!pointer_size_text) return input_error(pointer_size_text.error().message);
+            if (!max_depth) return input_error(max_depth.error().message);
+            if (!max_fanout) return input_error(max_fanout.error().message);
+            if (!limit) return input_error(limit.error().message);
+            if (!start_address) return input_error(start_address.error().message);
+            if (!end_address) return input_error(end_address.error().message);
+            if (!writable_only) return input_error(writable_only.error().message);
+            const std::size_t pointer_size = *pointer_size_text == "4" ? 4U : (*pointer_size_text == "8" ? 8U : 0U);
+            if (pointer_size == 0U) return input_error("pointer_size must be 4 or 8");
+            application::AnalysisJobManager::PointerChainScanRequest typed;
+            typed.target = *target;
+            typed.pointer_size = pointer_size;
+            typed.max_depth = static_cast<std::size_t>(*max_depth);
+            typed.max_fanout = static_cast<std::size_t>(*max_fanout);
+            typed.result_limit = static_cast<std::size_t>(*limit);
+            typed.writable_only = *writable_only;
+            typed.start_address = *start_address;
+            typed.end_address = *end_address;
+            typed_request = std::move(typed);
+            break;
+        }
+        case domain::AsyncScanOperation::scan_first: {
+            auto value_type = value_type_arg(req);
+            if (!value_type) return input_error(value_type.error().message);
+            auto comparison = comparison_arg(req);
+            auto value = scan_value_arg(req, "value", *value_type);
+            auto range_low = scan_value_arg(req, "range_low", *value_type);
+            auto range_high = scan_value_arg(req, "range_high", *value_type);
+            auto limit = unsigned_arg(req, "result_limit", false, service_.policy().max_scan_session_candidates);
+            auto start_address = optional_address_arg(req, "start_address");
+            auto end_address = optional_address_arg(req, "end_address");
+            auto writable_only = bool_arg(req, "writable_only", false, false);
+            if (!comparison) return input_error(comparison.error().message);
+            if (!value) return input_error(value.error().message);
+            if (!range_low) return input_error(range_low.error().message);
+            if (!range_high) return input_error(range_high.error().message);
+            if (!limit) return input_error(limit.error().message);
+            if (!start_address) return input_error(start_address.error().message);
+            if (!end_address) return input_error(end_address.error().message);
+            if (!writable_only) return input_error(writable_only.error().message);
+            if (static_cast<bool>(*range_low) != static_cast<bool>(*range_high)) {
+                return input_error("range_low and range_high must be provided together");
+            }
+            application::AnalysisJobManager::FirstScanRequest typed;
+            typed.value_type = *value_type;
+            typed.comparison = *comparison;
+            typed.value = *value;
+            if (*range_low && *range_high) {
+                typed.range = std::pair<std::vector<std::byte>, std::vector<std::byte>>{**range_low, **range_high};
+            }
+            typed.result_limit = static_cast<std::size_t>(*limit);
+            typed.writable_only = *writable_only;
+            typed.start_address = *start_address;
+            typed.end_address = *end_address;
+            typed_request = std::move(typed);
+            break;
+        }
+        case domain::AsyncScanOperation::scan_next: {
+            auto scan_id = scan_session_arg(req);
+            auto comparison = comparison_arg(req);
+            if (!scan_id) return input_error(scan_id.error().message);
+            if (!comparison) return input_error(comparison.error().message);
+            auto value_type = service_.scan_value_type(*scan_id);
+            if (!value_type) return domain_error(value_type.error());
+            auto value = scan_value_arg(req, "value", *value_type);
+            auto delta = scan_value_arg(req, "delta", *value_type);
+            if (!value) return input_error(value.error().message);
+            if (!delta) return input_error(delta.error().message);
+            application::AnalysisJobManager::NextScanRequest typed{*scan_id};
+            typed.comparison = *comparison;
+            typed.value = *value;
+            typed.delta = *delta;
+            typed_request = std::move(typed);
+            break;
+        }
+        }
+
+        auto result = service_.async_jobs().submit(*session, *operation, std::move(typed_request), limits);
+        if (!result) return domain_error(result.error());
+        return success(job_info_to_json(*result));
+    }
+
+    if (name == "memory_debug.job_status") {
+        auto session = session_arg(arguments);
+        auto job_id = job_id_arg(arguments);
+        if (!session) return input_error(session.error().message);
+        if (!job_id) return input_error(job_id.error().message);
+        auto result = service_.async_jobs().status(*session, *job_id);
+        if (!result) return domain_error(result.error());
+        return success(job_info_to_json(*result));
+    }
+
+    if (name == "memory_debug.job_results") {
+        auto session = session_arg(arguments);
+        auto job_id = job_id_arg(arguments);
+        auto offset = unsigned_arg(arguments, "offset", false, 0U);
+        auto limit = unsigned_arg(arguments, "limit", false, 256U);
+        if (!session) return input_error(session.error().message);
+        if (!job_id) return input_error(job_id.error().message);
+        if (!offset) return input_error(offset.error().message);
+        if (!limit || *limit == 0U) return input_error("limit must be positive");
+        auto result = service_.async_jobs().results(
+            *session, *job_id, static_cast<std::size_t>(*offset), static_cast<std::size_t>(*limit)
+        );
+        if (!result) return domain_error(result.error());
+
+        Value::Array items;
+        switch (result->info.operation) {
+        case domain::AsyncScanOperation::scan_exact:
+        case domain::AsyncScanOperation::scan_pointers_to:
+            items.reserve(result->address_matches.size());
+            for (const auto& match : result->address_matches) {
+                items.push_back(Value::object({{"address", hex_address(match.address)}}));
+            }
+            break;
+        case domain::AsyncScanOperation::strings:
+            items.reserve(result->string_matches.size());
+            for (const auto& match : result->string_matches) {
+                items.push_back(Value::object({
+                    {"address", hex_address(match.address)},
+                    {"text", match.text},
+                    {"encoding", match.encoding}
+                }));
+            }
+            break;
+        case domain::AsyncScanOperation::scan_pointer_chains:
+            items.reserve(result->pointer_chains.size());
+            for (const auto& candidate : result->pointer_chains) {
+                Value::Array offsets;
+                offsets.reserve(candidate.hop_offsets.size());
+                for (const auto hop : candidate.hop_offsets) offsets.push_back(static_cast<std::int64_t>(hop));
+                items.push_back(Value::object({
+                    {"module", candidate.module_name},
+                    {"module_base", hex_address(candidate.module_base)},
+                    {"hop_offsets", Value{std::move(offsets)}},
+                    {"resolved_address", hex_address(candidate.resolved_address)}
+                }));
+            }
+            break;
+        case domain::AsyncScanOperation::scan_first:
+        case domain::AsyncScanOperation::scan_next:
+            items.reserve(result->value_matches.size());
+            for (const auto& match : result->value_matches) {
+                items.push_back(Value::object({{"address", hex_address(match.address)}}));
+            }
+            break;
+        }
+        const auto returned = items.size();
+
+        Value payload = Value::object({
+            {"job_id", result->info.id.value()},
+            {"job_kind", std::string{domain::to_string(result->info.kind)}},
+            {"operation", std::string{domain::to_string(result->info.operation)}},
+            {"items", Value{std::move(items)}},
+            {"page", Value::object({
+                {"offset", static_cast<std::int64_t>(result->offset)},
+                {"returned", static_cast<std::int64_t>(returned)},
+                {"total", static_cast<std::int64_t>(result->total)},
+                {"has_more", result->has_more}
+            })}
+        });
+        if (result->info.operation == domain::AsyncScanOperation::scan_first ||
+            result->info.operation == domain::AsyncScanOperation::scan_next) {
+            if (result->published_session) {
+                payload["scan_id"] = result->published_session->id.value();
+                payload["generation"] = static_cast<std::int64_t>(result->published_session->generation);
+                payload["candidate_count"] = static_cast<std::int64_t>(result->published_session->candidate_count);
+            } else {
+                payload["scan_id"] = Value{nullptr};
+                payload["generation"] = Value{nullptr};
+                payload["candidate_count"] = Value{nullptr};
+            }
+            payload["draft_retained_for_resume"] = false;
+        }
+        payload["termination"] = result->info.termination ? job_termination_to_json(*result->info.termination) : Value{nullptr};
+        return success(std::move(payload));
+    }
+
+    if (name == "memory_debug.job_cancel") {
+        auto session = session_arg(arguments);
+        auto job_id = job_id_arg(arguments);
+        if (!session) return input_error(session.error().message);
+        if (!job_id) return input_error(job_id.error().message);
+        auto result = service_.async_jobs().cancel(*session, *job_id);
+        if (!result) return domain_error(result.error());
+        return success(Value::object({
+            {"job_id", result->id.value()},
+            {"job_kind", std::string{domain::to_string(result->kind)}},
+            {"state", std::string{domain::to_string(result->state)}},
+            {"cancel_requested", result->cancel_requested}
+        }));
+    }
+
+    if (name == "memory_debug.job_release") {
+        auto session = session_arg(arguments);
+        auto job_id = job_id_arg(arguments);
+        if (!session) return input_error(session.error().message);
+        if (!job_id) return input_error(job_id.error().message);
+        auto result = service_.async_jobs().release(*session, *job_id);
+        if (!result) return domain_error(result.error());
+        return success(Value::object({
+            {"job_id", job_id->value()},
+            {"job_kind", "scan"},
+            {"released", true}
         }));
     }
 

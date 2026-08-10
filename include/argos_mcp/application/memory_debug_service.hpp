@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -19,10 +20,23 @@
 
 namespace argos::application {
 
+// Periodic, best-effort telemetry hook consumed by AnalysisJobManager
+// (Spec 0008) to publish ScanProgress snapshots while a sweep runs in the
+// background. Every synchronous scan_* method below defaults this to an
+// empty std::function, which every existing call site relies on -- passing
+// one never changes what a sweep reads or what matches it finds, only how
+// often it reports where it is.
+using ScanProgressSink = std::function<void(const domain::ScanProgress&)>;
+
 struct ScanResult {
     std::vector<domain::ScanMatch> matches;
     std::size_t bytes_scanned{};
     bool truncated{false};
+    // Best-effort, diagnostic-only cursor captured when truncated is true.
+    // Never sufficient to resume correctly by itself (see Spec 0008 "Retomada
+    // correta" -- a real resume needs pattern overlap/carry state this field
+    // does not carry).
+    std::optional<domain::Address> stopped_at;
 };
 
 struct StringMatch {
@@ -35,6 +49,7 @@ struct StringScanResult {
     std::vector<StringMatch> matches;
     std::size_t bytes_scanned{};
     bool truncated{false};
+    std::optional<domain::Address> stopped_at;
 };
 
 struct BatchReadItem {
@@ -69,6 +84,13 @@ struct PointerChainScanResult {
     bool truncated{false};
 };
 
+// Forward-declared only: AnalysisJobManager's header includes this one fully
+// (it needs ScanResult/StringMatch/etc. and calls MemoryDebugService's scan_*
+// methods), so this header must not include analysis_job_manager.hpp back --
+// a std::unique_ptr to an incomplete type keeps the dependency
+// one-directional. See memory_debug_service.cpp for the complete type.
+class AnalysisJobManager;
+
 class MemoryDebugService final {
 public:
     MemoryDebugService(
@@ -76,6 +98,16 @@ public:
         security::SecurityPolicy policy,
         std::unique_ptr<domain::TypeMetadataProvider> metadata_provider = nullptr
     );
+    ~MemoryDebugService();
+
+    MemoryDebugService(const MemoryDebugService&) = delete;
+    MemoryDebugService& operator=(const MemoryDebugService&) = delete;
+
+    // Entry point for the five Spec 0008 job-control tools (scan_start,
+    // job_status, job_results, job_cancel, job_release). Owned by this
+    // service so its synchronous scan_* methods below can enforce "at most
+    // one long scan running per session" against the same registry.
+    [[nodiscard]] AnalysisJobManager& async_jobs() noexcept { return *analysis_jobs_; }
 
     [[nodiscard]] const security::SecurityPolicy& policy() const noexcept { return policy_; }
 
@@ -188,7 +220,14 @@ public:
         bool writable_only,
         std::optional<domain::Address> start_address = std::nullopt,
         std::optional<domain::Address> end_address = std::nullopt,
-        std::stop_token cancellation = {}
+        std::stop_token cancellation = {},
+        ScanProgressSink progress_sink = {},
+        // Internal use only: AnalysisJobManager's worker sets this so it can
+        // call the same engine it is itself running as an async job without
+        // rejecting itself as "another long scan already active" (Spec 0008
+        // -- see MemoryDebugService::reject_if_analysis_job_active). Every
+        // protocol-layer (synchronous tool) call site leaves this false.
+        bool bypass_active_job_guard = false
     ) const;
 
     [[nodiscard]] domain::Result<domain::Address> resolve_pointer_chain(
@@ -207,7 +246,14 @@ public:
         bool writable_only,
         std::optional<domain::Address> start_address = std::nullopt,
         std::optional<domain::Address> end_address = std::nullopt,
-        std::stop_token cancellation = {}
+        std::stop_token cancellation = {},
+        ScanProgressSink progress_sink = {},
+        // Internal use only: AnalysisJobManager's worker sets this so it can
+        // call the same engine it is itself running as an async job without
+        // rejecting itself as "another long scan already active" (Spec 0008
+        // -- see MemoryDebugService::reject_if_analysis_job_active). Every
+        // protocol-layer (synchronous tool) call site leaves this false.
+        bool bypass_active_job_guard = false
     ) const;
 
     [[nodiscard]] domain::Result<ScanResult> scan_pointers_to(
@@ -219,7 +265,14 @@ public:
         bool writable_only,
         std::optional<domain::Address> start_address = std::nullopt,
         std::optional<domain::Address> end_address = std::nullopt,
-        std::stop_token cancellation = {}
+        std::stop_token cancellation = {},
+        ScanProgressSink progress_sink = {},
+        // Internal use only: AnalysisJobManager's worker sets this so it can
+        // call the same engine it is itself running as an async job without
+        // rejecting itself as "another long scan already active" (Spec 0008
+        // -- see MemoryDebugService::reject_if_analysis_job_active). Every
+        // protocol-layer (synchronous tool) call site leaves this false.
+        bool bypass_active_job_guard = false
     ) const;
 
     [[nodiscard]] domain::Result<PointerChainScanResult> scan_pointer_chains(
@@ -233,7 +286,14 @@ public:
         bool writable_only,
         std::optional<domain::Address> start_address = std::nullopt,
         std::optional<domain::Address> end_address = std::nullopt,
-        std::stop_token cancellation = {}
+        std::stop_token cancellation = {},
+        ScanProgressSink progress_sink = {},
+        // Internal use only: AnalysisJobManager's worker sets this so it can
+        // call the same engine it is itself running as an async job without
+        // rejecting itself as "another long scan already active" (Spec 0008
+        // -- see MemoryDebugService::reject_if_analysis_job_active). Every
+        // protocol-layer (synchronous tool) call site leaves this false.
+        bool bypass_active_job_guard = false
     ) const;
 
     // scan_first reports coverage alongside the session because an empty
@@ -256,7 +316,14 @@ public:
         bool writable_only,
         std::optional<domain::Address> start_address = std::nullopt,
         std::optional<domain::Address> end_address = std::nullopt,
-        std::stop_token cancellation = {}
+        std::stop_token cancellation = {},
+        ScanProgressSink progress_sink = {},
+        // Internal use only: AnalysisJobManager's worker sets this so it can
+        // call the same engine it is itself running as an async job without
+        // rejecting itself as "another long scan already active" (Spec 0008
+        // -- see MemoryDebugService::reject_if_analysis_job_active). Every
+        // protocol-layer (synchronous tool) call site leaves this false.
+        bool bypass_active_job_guard = false
     ) const;
 
     [[nodiscard]] domain::Result<domain::ScanSessionInfo> scan_next(
@@ -264,7 +331,14 @@ public:
         domain::ScanComparison comparison,
         std::optional<std::vector<std::byte>> value,
         std::optional<std::vector<std::byte>> delta,
-        std::stop_token cancellation = {}
+        std::stop_token cancellation = {},
+        ScanProgressSink progress_sink = {},
+        // Internal use only: AnalysisJobManager's worker sets this so it can
+        // call the same engine it is itself running as an async job without
+        // rejecting itself as "another long scan already active" (Spec 0008
+        // -- see MemoryDebugService::reject_if_analysis_job_active). Every
+        // protocol-layer (synchronous tool) call site leaves this false.
+        bool bypass_active_job_guard = false
     ) const;
 
     [[nodiscard]] domain::Result<domain::ScanValueType> scan_value_type(
@@ -300,14 +374,25 @@ private:
         bool writable_only,
         std::optional<domain::Address> start_address,
         std::optional<domain::Address> end_address,
-        std::stop_token cancellation
+        std::stop_token cancellation,
+        const ScanProgressSink& progress_sink,
+        bool bypass_active_job_guard
     ) const;
+
+    // Rejected with invalid_state/analysis_job_active when a background job
+    // already owns the one-long-scan-per-session slot (Spec 0008,
+    // "Compatibilidade com tools síncronas e eras MCP").
+    [[nodiscard]] domain::Result<void> reject_if_analysis_job_active(const domain::SessionId& id) const;
 
     std::unique_ptr<domain::ProcessMemoryProvider> provider_;
     std::unique_ptr<domain::TypeMetadataProvider> metadata_provider_;
     security::SecurityPolicy policy_;
     SessionManager sessions_;
     mutable ScanSessionManager scan_sessions_;
+    // Constructed last so it observes fully-initialized sessions_/scan_sessions_/
+    // policy_ before any worker thread can touch them (workers only run once a
+    // job is submitted, strictly after this constructor returns).
+    std::unique_ptr<AnalysisJobManager> analysis_jobs_;
 };
 
 }  // namespace argos::application

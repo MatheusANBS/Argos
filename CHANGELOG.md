@@ -2,6 +2,18 @@
 
 ## Não lançado
 
+- `memory_debug.scan_start`/`job_status`/`job_results`/`job_cancel`/
+  `job_release` (Spec [0008](docs/specs/0008-async-scan-operations.md), ADR
+  [0012](docs/adr/0012-async-scan-progress-resumption.md)): `scan_exact`,
+  `strings`, `scan_pointers_to`, `scan_pointer_chains`, `scan_first` e
+  `scan_next` agora podem rodar como job em background (`AnalysisJobManager`),
+  com progresso monotônico, cancelamento cooperativo, fila e workers
+  limitados, TTL de resultado/tombstone e paginação imutável, reusando o
+  mesmo motor de scan das tools síncronas. No máximo um scan longo roda por
+  sessão por vez (síncrono ou assíncrono). Novos limites `ARGOS_MCP_MAX_ASYNC_*`
+  e `ARGOS_MCP_ASYNC_*`. Retomada por `resume_token` é um ponto de extensão
+  documentado e ainda não implementado: `scan_start` responde
+  `unsupported`/`resume_not_supported` para essa forma;
 - compatibilidade dual-era MCP: protocolo moderno `2026-07-28` via
   `server/discover` e `_meta` por request, mantendo clientes legados
   `2025-11-25`/`2025-06-18`;

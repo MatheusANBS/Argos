@@ -137,6 +137,28 @@ std::expected<ScanSessionId, std::string> ScanSessionId::create(std::string valu
     return ScanSessionId{std::move(value)};
 }
 
+std::expected<AnalysisJobId, std::string> AnalysisJobId::create(std::string value) {
+    const auto valid = !value.empty() && value.size() <= 128U &&
+        std::ranges::all_of(value, [](const unsigned char ch) {
+            return std::isalnum(ch) != 0 || ch == '-' || ch == '_';
+        });
+    if (!valid) {
+        return std::unexpected("invalid analysis job id");
+    }
+    return AnalysisJobId{std::move(value)};
+}
+
+std::expected<ScanResumeToken, std::string> ScanResumeToken::create(std::string value) {
+    const auto valid = !value.empty() && value.size() <= 256U &&
+        std::ranges::all_of(value, [](const unsigned char ch) {
+            return std::isalnum(ch) != 0 || ch == '-' || ch == '_';
+        });
+    if (!valid) {
+        return std::unexpected("invalid resume token");
+    }
+    return ScanResumeToken{std::move(value)};
+}
+
 std::string_view to_string(const AccessMode mode) noexcept {
     switch (mode) {
         case AccessMode::read_only: return "read_only";
@@ -159,6 +181,111 @@ std::string_view to_string(const DebugErrorCode code) noexcept {
         case DebugErrorCode::parse_error: return "parse_error";
     }
     return "unknown";
+}
+
+std::string_view to_string(const AsyncScanOperation operation) noexcept {
+    switch (operation) {
+        case AsyncScanOperation::scan_exact: return "scan_exact";
+        case AsyncScanOperation::strings: return "strings";
+        case AsyncScanOperation::scan_pointers_to: return "scan_pointers_to";
+        case AsyncScanOperation::scan_pointer_chains: return "scan_pointer_chains";
+        case AsyncScanOperation::scan_first: return "scan_first";
+        case AsyncScanOperation::scan_next: return "scan_next";
+    }
+    return "unknown";
+}
+
+std::string_view to_string(const AnalysisJobKind kind) noexcept {
+    switch (kind) {
+        case AnalysisJobKind::scan: return "scan";
+        case AnalysisJobKind::pointer_index: return "pointer_index";
+        case AnalysisJobKind::unreal_runtime: return "unreal_runtime";
+    }
+    return "unknown";
+}
+
+std::string_view to_string(const AnalysisJobState state) noexcept {
+    switch (state) {
+        case AnalysisJobState::queued: return "queued";
+        case AnalysisJobState::running: return "running";
+        case AnalysisJobState::completed: return "completed";
+        case AnalysisJobState::cancelled: return "cancelled";
+        case AnalysisJobState::failed: return "failed";
+    }
+    return "unknown";
+}
+
+std::string_view to_string(const AnalysisStopReason reason) noexcept {
+    switch (reason) {
+        case AnalysisStopReason::operation_completed: return "operation_completed";
+        case AnalysisStopReason::range_exhausted: return "range_exhausted";
+        case AnalysisStopReason::byte_budget: return "byte_budget";
+        case AnalysisStopReason::result_limit: return "result_limit";
+        case AnalysisStopReason::deadline: return "deadline";
+        case AnalysisStopReason::max_depth: return "max_depth";
+        case AnalysisStopReason::max_fanout: return "max_fanout";
+        case AnalysisStopReason::client_cancelled: return "client_cancelled";
+        case AnalysisStopReason::session_detached: return "session_detached";
+        case AnalysisStopReason::server_shutdown: return "server_shutdown";
+        case AnalysisStopReason::target_exited: return "target_exited";
+        case AnalysisStopReason::read_error: return "read_error";
+        case AnalysisStopReason::stale_snapshot: return "stale_snapshot";
+        case AnalysisStopReason::unstable_snapshot: return "unstable_snapshot";
+        case AnalysisStopReason::internal_error: return "internal_error";
+    }
+    return "unknown";
+}
+
+std::string_view to_string(const AnalysisTruncationReason reason) noexcept {
+    switch (reason) {
+        case AnalysisTruncationReason::byte_budget: return "byte_budget";
+        case AnalysisTruncationReason::result_limit: return "result_limit";
+        case AnalysisTruncationReason::deadline: return "deadline";
+        case AnalysisTruncationReason::max_depth: return "max_depth";
+        case AnalysisTruncationReason::max_fanout: return "max_fanout";
+    }
+    return "unknown";
+}
+
+std::optional<AsyncScanOperation> async_scan_operation_from_string(const std::string_view text) noexcept {
+    if (text == "scan_exact") return AsyncScanOperation::scan_exact;
+    if (text == "strings") return AsyncScanOperation::strings;
+    if (text == "scan_pointers_to") return AsyncScanOperation::scan_pointers_to;
+    if (text == "scan_pointer_chains") return AsyncScanOperation::scan_pointer_chains;
+    if (text == "scan_first") return AsyncScanOperation::scan_first;
+    if (text == "scan_next") return AsyncScanOperation::scan_next;
+    return std::nullopt;
+}
+
+bool is_stop_reason_valid_for_operation(
+    const AsyncScanOperation operation,
+    const AnalysisStopReason reason
+) noexcept {
+    // Reasons every scan operation may reach.
+    switch (reason) {
+        case AnalysisStopReason::operation_completed:
+        case AnalysisStopReason::range_exhausted:
+        case AnalysisStopReason::byte_budget:
+        case AnalysisStopReason::result_limit:
+        case AnalysisStopReason::deadline:
+        case AnalysisStopReason::client_cancelled:
+        case AnalysisStopReason::session_detached:
+        case AnalysisStopReason::server_shutdown:
+        case AnalysisStopReason::target_exited:
+        case AnalysisStopReason::read_error:
+        case AnalysisStopReason::internal_error:
+            return true;
+        case AnalysisStopReason::max_depth:
+        case AnalysisStopReason::max_fanout:
+            // Only the BFS reverse-pointer-chain operation has depth/fanout.
+            return operation == AsyncScanOperation::scan_pointer_chains;
+        case AnalysisStopReason::stale_snapshot:
+        case AnalysisStopReason::unstable_snapshot:
+            // Reserved for pointer_index/unreal_runtime jobs (Specs 0010/0012);
+            // no scan operation ever produces these.
+            return false;
+    }
+    return false;
 }
 
 std::string_view to_string(const ScanValueType type) noexcept {
