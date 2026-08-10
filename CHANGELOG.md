@@ -2,6 +2,16 @@
 
 ## Não lançado
 
+- `ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES` (Spec 0008) agora é imposto de
+  fato: `AnalysisJobManager` mantém um agregado de bytes retidos somado sobre
+  todos os jobs simultaneamente (não por job), contabilizando o conteúdo
+  alocado no heap de cada match (texto de `strings`, offsets de
+  `scan_pointer_chains`), não só `size() * sizeof(T)`. Um job cujo resultado
+  estouraria o orçamento agregado mantém o maior prefixo que couber e sinaliza
+  a perda com `termination.truncated: true`, `results_complete: false` e
+  `"retained_bytes_budget"` em `truncation_reasons` — nunca descarte
+  silencioso. `job_release`, a expiração do TTL de resultados e
+  `detach_session` devolvem os bytes ao orçamento;
 - `memory_debug.scan_start`/`job_status`/`job_results`/`job_cancel`/
   `job_release` (Spec [0008](docs/specs/0008-async-scan-operations.md), ADR
   [0012](docs/adr/0012-async-scan-progress-resumption.md)): `scan_exact`,

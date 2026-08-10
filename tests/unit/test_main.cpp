@@ -2615,6 +2615,110 @@ void test_memory_debug_service_rejects_sync_scan_while_job_running() {
     check(sync_after.has_value(), "the sync scan path recovers once no job is running for the session");
 }
 
+void test_analysis_job_manager_retained_bytes_budget() {
+    using namespace argos;
+    security::SecurityPolicy policy{};
+    // Only enough room, globally, for 6 ScanMatch entries. One job's worth
+    // (4 matches) fits; a second identical job cannot fit its own 4 on top,
+    // proving the cap is a single aggregate summed across every retained
+    // job, not a per-job allowance -- ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES
+    // was declared and clamped by SecurityPolicy but never enforced before
+    // this test (it would pass trivially either way otherwise).
+    policy.max_async_results_retained_bytes = 6U * sizeof(domain::ScanMatch);
+
+    // 4 KiB of zero bytes with the same 4-byte pattern planted at 4
+    // non-overlapping, 4-byte-aligned offsets: scan_exact (alignment 4)
+    // finds exactly 4 matches -- an untruncated, range_exhausted sweep from
+    // the scan engine's own point of view, so any truncation observed below
+    // comes only from the new retained-bytes accounting.
+    auto memory = std::make_shared<std::vector<std::byte>>(4U * 1024U, std::byte{0x00});
+    const std::array<std::byte, 4> pattern{std::byte{0xDE}, std::byte{0xAD}, std::byte{0xBE}, std::byte{0xEF}};
+    const std::array<std::size_t, 4> offsets{0U, 1024U, 2048U, 3072U};
+    for (const auto offset : offsets) {
+        std::copy(pattern.begin(), pattern.end(), memory->begin() + static_cast<std::ptrdiff_t>(offset));
+    }
+
+    auto gate = std::make_shared<ReadGate>();
+    gate->open_gate();  // No blocking needed for this test.
+
+    auto provider = std::make_unique<SingleSessionFakeProvider>(
+        [memory, gate]() -> std::unique_ptr<domain::ProcessSession> {
+            return std::make_unique<GatedFakeSession>(memory, gate);
+        }
+    );
+    application::MemoryDebugService service{std::move(provider), policy};
+    auto session = service.attach(42U, domain::AccessMode::read_only, true);
+    check(session.has_value(), "retained-bytes test attaches");
+    if (!session) return;
+
+    application::AnalysisJobManager manager{service, policy};
+
+    application::AnalysisJobManager::ExactScanRequest request;
+    request.pattern.assign(pattern.begin(), pattern.end());
+    request.alignment = 4U;
+    request.result_limit = 16U;
+    const application::AnalysisJobManager::ExecutionLimits limits{memory->size() + 4096U, 60'000U};
+
+    // job1: budget has room for all 4 matches (4 * sizeof <= 6 * sizeof).
+    auto job1 = manager.submit(session->id, domain::AsyncScanOperation::scan_exact, request, limits);
+    check(job1.has_value(), "job1 is accepted");
+    if (!job1) return;
+    const auto status1 = poll_until_terminal(manager, session->id, job1->id);
+    check(status1.state == domain::AnalysisJobState::completed, "job1 completes");
+    if (status1.termination) {
+        check(!status1.termination->truncated, "job1 fits the retained-bytes budget untruncated");
+        check(status1.termination->coverage_complete && status1.termination->results_complete,
+              "job1's scan and retention both report complete");
+    }
+    auto page1 = manager.results(session->id, job1->id, 0U, 10U);
+    check(page1.has_value() && page1->total == 4U, "job1 retains all 4 matches it found");
+
+    // job2: identical request, but only 2 * sizeof(ScanMatch) of budget
+    // remains globally (6 already spent, 4 held by job1). This is only
+    // possible to observe if the cap is a global aggregate, not per job --
+    // with a per-job cap job2 would fit exactly like job1 did.
+    auto job2 = manager.submit(session->id, domain::AsyncScanOperation::scan_exact, request, limits);
+    check(job2.has_value(), "job2 is accepted");
+    if (!job2) return;
+    const auto status2 = poll_until_terminal(manager, session->id, job2->id);
+    check(status2.state == domain::AnalysisJobState::completed,
+          "job2's scan completes even though retention is short on room");
+    if (status2.termination) {
+        check(status2.termination->coverage_complete,
+              "job2 still swept every eligible byte -- scan coverage is independent of result retention");
+        check(!status2.termination->results_complete,
+              "job2 could not retain every match it found, so results_complete is false");
+        check(status2.termination->truncated, "job2's termination is marked truncated, never silently dropped");
+        const auto& reasons = status2.termination->truncation_reasons;
+        check(std::ranges::find(reasons, domain::AnalysisTruncationReason::retained_bytes_budget) != reasons.end(),
+              "retained_bytes_budget names the global retained-bytes cap as the truncation cause");
+    }
+    auto page2 = manager.results(session->id, job2->id, 0U, 10U);
+    check(page2.has_value() && page2->total == 2U,
+          "job2 keeps only as many matches as the remaining global budget allows (2 of the 4 it found)");
+
+    // Releasing job1 gives its 4 * sizeof(ScanMatch) share back to the
+    // global budget. A third, identical job should now fit fully again --
+    // proving release() (not just TTL expiry) frees the aggregate correctly.
+    auto release1 = manager.release(session->id, job1->id);
+    check(release1.has_value(), "job1 releases cleanly");
+
+    auto job3 = manager.submit(session->id, domain::AsyncScanOperation::scan_exact, request, limits);
+    check(job3.has_value(), "job3 is accepted");
+    if (!job3) return;
+    const auto status3 = poll_until_terminal(manager, session->id, job3->id);
+    check(status3.state == domain::AnalysisJobState::completed, "job3 completes");
+    if (status3.termination) {
+        check(!status3.termination->truncated,
+              "job3 fits fully once releasing job1 restored the global retained-bytes budget");
+    }
+    auto page3 = manager.results(session->id, job3->id, 0U, 10U);
+    check(page3.has_value() && page3->total == 4U, "job3 retains all 4 matches after budget was freed by release");
+
+    (void)manager.release(session->id, job2->id);
+    (void)manager.release(session->id, job3->id);
+}
+
 int main() {
     test_json();
     test_policy();
@@ -2641,6 +2745,7 @@ int main() {
     test_analysis_job_manager_queued_cancel_and_backpressure();
     test_analysis_job_manager_ttl_and_tombstone();
     test_analysis_job_manager_detach_session();
+    test_analysis_job_manager_retained_bytes_budget();
     test_memory_debug_service_rejects_sync_scan_while_job_running();
     if (failures == 0) {
         std::cout << "All unit tests passed\n";

@@ -230,6 +230,8 @@ Scan sessions morrem junto com o `detach` da sessão de depuração dona. Limite
 4. `memory_debug.job_cancel` pede parada cooperativa; em `queued` o job termina imediatamente, em `running` fica `cancel_requested: true` até o próximo checkpoint. Chamar de novo após terminal é idempotente.
 5. `memory_debug.job_release` remove um job terminal e seus resultados retidos; `queued`/`running` respondem `invalid_state`/`job_not_terminal` — cancele primeiro.
 
+`ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES` limita, de forma agregada sobre todos os jobs retidos ao mesmo tempo (não por job), quantos bytes de resultado o servidor mantém em memória. Um job pode terminar com o scan totalmente coberto (`coverage_complete: true`) e ainda assim não conseguir reter todos os matches encontrados porque outros jobs já ocupam a maior parte do orçamento agregado; nesse caso o servidor mantém o maior prefixo de resultados que couber e sinaliza a perda como qualquer outra truncagem: `truncated: true`, `results_complete: false` e `"retained_bytes_budget"` em `truncation_reasons`. `job_release`, a expiração do TTL de resultados e `detach_session` devolvem os bytes liberados ao orçamento agregado, disponíveis para os próximos jobs.
+
 ```json
 {
   "name": "memory_debug.scan_start",

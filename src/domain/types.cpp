@@ -243,6 +243,7 @@ std::string_view to_string(const AnalysisTruncationReason reason) noexcept {
         case AnalysisTruncationReason::deadline: return "deadline";
         case AnalysisTruncationReason::max_depth: return "max_depth";
         case AnalysisTruncationReason::max_fanout: return "max_fanout";
+        case AnalysisTruncationReason::retained_bytes_budget: return "retained_bytes_budget";
     }
     return "unknown";
 }

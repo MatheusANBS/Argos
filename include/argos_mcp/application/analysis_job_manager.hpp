@@ -239,6 +239,15 @@ private:
     // their TTL, which erases from the registry -- a cache-eviction side
     // effect, not an observable state change to any caller.
     mutable std::unordered_map<std::string, std::shared_ptr<JobRecord>> jobs_;
+    // Global aggregate of heap bytes attributable to every retained Items
+    // block currently sitting in jobs_ (JobRecord::retained_bytes summed).
+    // Enforces SecurityPolicy::max_async_results_retained_bytes across ALL
+    // jobs, not per job -- guarded by mutex_ like the rest of the registry,
+    // never a second mutex (would risk inverting lock order against
+    // JobRecord::mutex). mutable for the same reason jobs_ is: status()/
+    // results() release a job's share of the budget as an opportunistic
+    // side effect of TTL expiry while otherwise behaving as const polls.
+    mutable std::size_t retained_bytes_{0U};
     std::vector<std::string> pending_;              // FIFO of queued job ids
     std::unordered_set<std::string> running_owners_;  // session ids with a running job
     std::unordered_set<std::string> closing_owners_;  // sessions mid-detach: reject new submissions

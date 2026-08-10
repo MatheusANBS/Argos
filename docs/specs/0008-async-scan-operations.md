@@ -159,6 +159,16 @@ mas o sweep continuou para os demais. Gaps de leitura são expostos por
 `read_error_count` e por uma lista bounded de intervalos/erros seguros; não são
 silenciosamente convertidos em ausência de match.
 
+`truncation_reasons` também inclui `retained_bytes_budget` quando
+`AnalysisJobManager` não consegue reter todos os matches encontrados dentro de
+`ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES` — um orçamento agregado somado
+sobre os resultados retidos de todos os jobs, não por job. Diferente dos
+demais motivos, esse corte acontece depois que o sweep já terminou: um job
+pode chegar com `coverage_complete: true` (o scan cobriu tudo) e ainda assim
+`results_complete: false` porque o excedente de resultados foi descartado
+para caber no orçamento agregado. `job_release`, a expiração do TTL de
+resultados e `detach_session` devolvem os bytes ao orçamento.
+
 Falhas não fatais de leitura continuam registradas em `regions_skipped` e
 `bytes_skipped`. Assim, um job pode chegar a `range_exhausted` com
 `complete: false`; essa diferença deve permanecer visível em vez de promover
@@ -209,7 +219,8 @@ enum class AnalysisTruncationReason {
     result_limit,
     deadline,
     max_depth,
-    max_fanout
+    max_fanout,
+    retained_bytes_budget  // ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES, aggregate across all retained jobs.
 };
 
 struct ScanProgress {

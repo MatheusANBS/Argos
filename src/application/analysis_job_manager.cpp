@@ -73,6 +73,87 @@ struct CancelledOutcome {
     return domain::AnalysisStopReason::internal_error;
 }
 
+// ---------------------------------------------------------------------------
+// Retained-results byte accounting (fixes ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES
+// being declared/clamped by SecurityPolicy but never applied). size() *
+// sizeof(T) alone would undercount: StringMatch's `text`/`encoding` and
+// PointerChainCandidate's `hop_offsets`/`module_name` own separate heap
+// allocations the outer vector's own storage does not include. capacity()
+// (not size()) is used throughout so the count reflects bytes actually
+// reserved; callers shrink_to_fit() first so capacity() == size() for
+// anything that survives, keeping the accounted total honest about real
+// process memory rather than just "logical" content.
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] std::size_t element_heap_bytes(const domain::ScanMatch&) noexcept { return 0U; }
+
+[[nodiscard]] std::size_t element_heap_bytes(const StringMatch& match) noexcept {
+    return match.text.capacity() + match.encoding.capacity();
+}
+
+[[nodiscard]] std::size_t element_heap_bytes(const PointerChainCandidate& candidate) noexcept {
+    return candidate.module_name.capacity() + candidate.hop_offsets.capacity() * sizeof(std::int64_t);
+}
+
+[[nodiscard]] std::size_t session_info_bytes(const domain::ScanSessionInfo& info) noexcept {
+    return sizeof(domain::ScanSessionInfo) + info.id.value().capacity() + info.owner.value().capacity();
+}
+
+template <class T>
+[[nodiscard]] std::size_t vector_retained_bytes(const std::vector<T>& values) noexcept {
+    std::size_t total = values.capacity() * sizeof(T);
+    for (const auto& value : values) {
+        total += element_heap_bytes(value);
+    }
+    return total;
+}
+
+[[nodiscard]] std::size_t items_retained_bytes(const AnalysisJobManager::Items& items) noexcept {
+    std::size_t total = vector_retained_bytes(items.address_matches) + vector_retained_bytes(items.string_matches) +
+        vector_retained_bytes(items.pointer_chains) + vector_retained_bytes(items.value_matches);
+    if (items.published_session) {
+        total += session_info_bytes(*items.published_session);
+    }
+    return total;
+}
+
+// Drops each vector's unused reserved capacity so vector_retained_bytes'
+// capacity()-based count matches what the process actually holds onto --
+// without this, a vector grown by repeated push_back during the sweep could
+// retain more memory than the accounting believes it does.
+void shrink_items(AnalysisJobManager::Items& items) {
+    items.address_matches.shrink_to_fit();
+    items.string_matches.shrink_to_fit();
+    items.pointer_chains.shrink_to_fit();
+    items.value_matches.shrink_to_fit();
+}
+
+// Trims `values` to the longest prefix whose accounted bytes (each kept
+// element's own storage plus its heap content) fit inside `budget`,
+// returning exactly how many bytes that prefix accounts for. Only ever
+// called on the one vector a given operation actually populates -- see
+// Items' comment ("Exactly one field is populated, selected by the job's
+// operation").
+template <class T>
+[[nodiscard]] std::size_t truncate_to_budget(std::vector<T>& values, const std::size_t budget) {
+    std::size_t kept_bytes = 0U;
+    std::size_t kept_count = 0U;
+    for (; kept_count < values.size(); ++kept_count) {
+        const std::size_t next = kept_bytes + sizeof(T) + element_heap_bytes(values[kept_count]);
+        if (next > budget) break;
+        kept_bytes = next;
+    }
+    if (kept_count < values.size()) {
+        std::vector<T> trimmed(
+            std::make_move_iterator(values.begin()),
+            std::make_move_iterator(values.begin() + static_cast<std::ptrdiff_t>(kept_count))
+        );
+        values = std::move(trimmed);
+    }
+    values.shrink_to_fit();
+    return kept_bytes;
+}
+
 }  // namespace
 
 struct AnalysisJobManager::JobRecord {
@@ -95,6 +176,13 @@ struct AnalysisJobManager::JobRecord {
     bool results_expired{false};
     Clock::time_point created_at{};
     std::optional<Clock::time_point> terminal_at;
+    // This job's current share of AnalysisJobManager::retained_bytes_ (0
+    // until a terminal state publishes `result`). Recorded per job so
+    // whichever code path frees the job -- TTL expiry, release(), or
+    // detach_session() -- can give back exactly what it reserved, never more
+    // or less. Written under `mutex` together with `retained_bytes_`, which
+    // is always taken first (registry lock outer, job lock inner).
+    std::size_t retained_bytes{0U};
 };
 
 namespace {
@@ -302,12 +390,19 @@ domain::Result<domain::AnalysisJobInfo> AnalysisJobManager::status(
         job = it->second;
     }
     reap_expired_locked();
+    // Registry lock outer, job lock inner (see retained_bytes_'s declaration
+    // comment): expiring results here gives back this job's share of the
+    // global retained-bytes budget, so touching retained_bytes_ needs the
+    // same nesting run_job()/release()/detach_session() use.
+    std::scoped_lock lock(mutex_);
     std::scoped_lock job_lock(job->mutex);
     if (job->terminal_at && !job->results_expired) {
         const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(clock_() - *job->terminal_at).count();
         if (age >= static_cast<std::int64_t>(policy_.async_results_ttl_ms)) {
             job->results_expired = true;
             job->result.reset();
+            retained_bytes_ -= job->retained_bytes;
+            job->retained_bytes = 0U;
         }
     }
     return snapshot_locked(*job);
@@ -336,6 +431,10 @@ domain::Result<AnalysisJobManager::ResultsPage> AnalysisJobManager::results(
     std::shared_ptr<const Items> items;
     bool expired = false;
     {
+        // Registry lock outer, job lock inner (see retained_bytes_'s
+        // declaration comment): expiring results here gives back this job's
+        // share of the global retained-bytes budget.
+        std::scoped_lock lock(mutex_);
         std::scoped_lock job_lock(job->mutex);
         if (job->state == domain::AnalysisJobState::queued || job->state == domain::AnalysisJobState::running) {
             return std::unexpected(error(
@@ -348,6 +447,8 @@ domain::Result<AnalysisJobManager::ResultsPage> AnalysisJobManager::results(
             if (age >= static_cast<std::int64_t>(policy_.async_results_ttl_ms)) {
                 job->results_expired = true;
                 job->result.reset();
+                retained_bytes_ -= job->retained_bytes;
+                job->retained_bytes = 0U;
             }
         }
         expired = job->results_expired;
@@ -441,6 +542,10 @@ domain::Result<void> AnalysisJobManager::release(
                 "job_not_terminal"
             ));
         }
+        // Give back this job's share of the global retained-bytes budget --
+        // a no-op if results already expired (TTL expiry already zeroed it).
+        retained_bytes_ -= it->second->retained_bytes;
+        it->second->retained_bytes = 0U;
     }
     jobs_.erase(it);
     return {};
@@ -500,8 +605,18 @@ void AnalysisJobManager::detach_session(const domain::SessionId& owner) {
         return true;
     });
     for (auto it = jobs_.begin(); it != jobs_.end();) {
-        if (it->second->owner == owner) it = jobs_.erase(it);
-        else ++it;
+        if (it->second->owner == owner) {
+            // Give back this job's share of the global retained-bytes
+            // budget -- a no-op if results already expired.
+            {
+                std::scoped_lock job_lock(it->second->mutex);
+                retained_bytes_ -= it->second->retained_bytes;
+                it->second->retained_bytes = 0U;
+            }
+            it = jobs_.erase(it);
+        } else {
+            ++it;
+        }
     }
     running_owners_.erase(owner.value());
     closing_owners_.erase(owner.value());
@@ -729,8 +844,57 @@ void AnalysisJobManager::run_job(const std::shared_ptr<JobRecord>& job) {
         }
     }, job->request);
 
+    shrink_items(*items);
+    const std::size_t requested_bytes = items_retained_bytes(*items);
     const auto now = clock_();
-    std::scoped_lock lock(job->mutex);
+
+    // Registry lock outer, job lock inner -- the same nesting order
+    // detach_session()/release()/the destructor already use, never reversed
+    // (see retained_bytes_'s declaration comment in the header). Needed here
+    // because reserving from the global retained-bytes budget has to be
+    // atomic with publishing this job's own result.
+    std::scoped_lock lock(mutex_);
+    std::scoped_lock job_lock(job->mutex);
+
+    std::size_t reserved_bytes = requested_bytes;
+    const std::size_t available = retained_bytes_ < policy_.max_async_results_retained_bytes
+        ? policy_.max_async_results_retained_bytes - retained_bytes_
+        : 0U;
+    if (requested_bytes > available) {
+        // The global cap (summed across every retained job, not per job --
+        // see SecurityPolicy::max_async_results_retained_bytes) does not have
+        // room for everything this job found. Keep as large a prefix as
+        // fits and mark the loss the same way any other partial retention is
+        // marked, reusing AnalysisJobTermination's existing truncated /
+        // truncation_reasons vocabulary rather than inventing a separate
+        // rejection state. published_session's own small, fixed cost is
+        // reserved first and never trimmed away -- dropping it would orphan
+        // an already-created scan session that scan_next could otherwise
+        // still reach, so in the extreme case where even that fixed cost
+        // does not fit, the budget is allowed a bounded, sizeof(ScanSessionInfo)
+        // -- not scan-size-dependent -- overshoot rather than losing the
+        // session's continuation handle.
+        const std::size_t session_cost =
+            items->published_session ? session_info_bytes(*items->published_session) : 0U;
+        const std::size_t budget_for_matches = available > session_cost ? available - session_cost : 0U;
+        std::size_t matches_bytes = 0U;
+        if (!items->address_matches.empty()) {
+            matches_bytes = truncate_to_budget(items->address_matches, budget_for_matches);
+        } else if (!items->string_matches.empty()) {
+            matches_bytes = truncate_to_budget(items->string_matches, budget_for_matches);
+        } else if (!items->pointer_chains.empty()) {
+            matches_bytes = truncate_to_budget(items->pointer_chains, budget_for_matches);
+        } else if (!items->value_matches.empty()) {
+            matches_bytes = truncate_to_budget(items->value_matches, budget_for_matches);
+        }
+        reserved_bytes = matches_bytes + session_cost;
+        termination.truncated = true;
+        termination.results_complete = false;
+        termination.truncation_reasons.push_back(domain::AnalysisTruncationReason::retained_bytes_budget);
+    }
+
+    retained_bytes_ += reserved_bytes;
+    job->retained_bytes = reserved_bytes;
     job->state = state;
     job->termination = termination;
     job->result = std::move(items);

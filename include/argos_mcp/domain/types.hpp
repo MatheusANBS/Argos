@@ -251,6 +251,14 @@ enum class AnalysisTruncationReason {
     deadline,
     max_depth,
     max_fanout,
+    // The scan itself may have finished cleanly (coverage_complete can still
+    // be true), but AnalysisJobManager could not retain every match within
+    // SecurityPolicy::max_async_results_retained_bytes -- a global cap summed
+    // across every retained job, not a per-job one. Independent of the other
+    // reasons above: a sweep can be untruncated by byte_budget/result_limit
+    // and still lose trailing matches here purely because other jobs already
+    // hold most of the retained-bytes budget.
+    retained_bytes_budget,
 };
 
 // A job never produces a stop reason outside the closed subset its own
