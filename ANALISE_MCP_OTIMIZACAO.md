@@ -1,5 +1,11 @@
 # 🔍 Análise e Otimização - Argos Runtime Memory Debug MCP
 
+> **Documento histórico (2026-08-07).** Os problemas de logger, JSON escaping e
+> geração de IDs descritos abaixo **já foram corrigidos** — ver
+> [`CHECKLIST_FINAL.md`](CHECKLIST_FINAL.md). Os trechos "antes" servem de
+> registro, não descrevem o código atual. Análise corrente em
+> [`docs/review/2026-08-09-efficiency-review.md`](docs/review/2026-08-09-efficiency-review.md).
+
 ## Resumo Executivo
 
 O projeto é um **servidor MCP (Model Context Protocol) em C++23** para depuração autorizada de memória em runtime. A arquitetura está bem estruturada, com separação clara de responsabilidades (Domain → Application → Infrastructure → Protocol). 

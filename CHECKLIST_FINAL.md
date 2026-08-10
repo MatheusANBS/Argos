@@ -1,4 +1,8 @@
-# ✅ Checklist Final - Implementação & Instalação
+# Checklist — otimizações Phase 1 (2026-08-07)
+
+> **Documento histórico.** As três otimizações abaixo estão no código. O
+> registro do servidor no cliente MCP **não foi concluído**. Estado corrente em
+> [`CHANGELOG.md`](CHANGELOG.md).
 
 ## 🎯 Otimizações (Phase 1)
 
@@ -53,13 +57,13 @@
 
 ## 🚀 Instalação no Claude
 
-- [x] Config criada em `%APPDATA%\Claude\claude_desktop_config.json`
-- [x] Path absoluto do MCP registrado
-- [x] Variáveis de ambiente configuradas:
+- [ ] Adicionar `mcpServers` em `%APPDATA%\Claude\claude_desktop_config.json`
+      (o arquivo existe, mas não contém a chave)
+- [ ] Path absoluto do MCP registrado
+- [ ] Variáveis de ambiente configuradas:
   - `ARGOS_MCP_LOG_LEVEL=info`
   - `ARGOS_MCP_ALLOW_WRITE=0`
   - `ARGOS_MCP_ALLOW_FOREIGN_USER=0`
-- [x] Validação JSON: OK ✅
 
 ---
 
@@ -122,11 +126,10 @@
 
 ```
 ┌─────────────────────────────────────────────┐
-│ ✅ IMPLEMENTAÇÃO COMPLETA                   │
-│ ✅ COMPILAÇÃO SUCESSO                       │
-│ ✅ TESTES PASSARAM                          │
-│ ✅ MCP INSTALADO NO CLAUDE                  │
-│ ✅ PRONTO PARA USO                          │
+│ ✅ OTIMIZAÇÕES PHASE 1 NO CÓDIGO            │
+│ ✅ COMPILAÇÃO SUCESSO (2026-08-07)          │
+│ ✅ TESTES PASSARAM (2026-08-07)             │
+│ ⬜ MCP NÃO REGISTRADO NO CLIENTE            │
 └─────────────────────────────────────────────┘
 ```
 
@@ -147,10 +150,8 @@
 ```
 
 ### Verificar Conexão
-```bash
-# Terminal (após instalar)
-echo '{"jsonrpc":"2.0","method":"tools/list","id":1}' | \
-  C:\Users\matheuss\Desktop\Sistemas\Yggdrasil\build\dev\Release\argos_runtime_memory_mcp.exe
+```powershell
+echo '{"jsonrpc":"2.0","method":"tools/list","id":1}' | .\build\dev\Release\argos_runtime_memory_mcp.exe
 ```
 
 ---
@@ -173,7 +174,6 @@ echo '{"jsonrpc":"2.0","method":"tools/list","id":1}' | \
 - ✅ 3 otimizações críticas implementadas
 - ✅ Compilado com sucesso
 - ✅ Testes validaram mudanças
-- ✅ MCP instalado no Claude Desktop
 
 **Ganhos esperados:**
 - ✅ 100x mais rápido em ID generation
@@ -181,10 +181,9 @@ echo '{"jsonrpc":"2.0","method":"tools/list","id":1}' | \
 - ✅ 4x mais rápido em JSON escaping
 
 **Próximo passo:**
-- ⏳ Reiniciar Claude e validar com `/mcp list`
+- ⬜ Registrar o servidor no cliente MCP e validar com `/mcp list`
 
 ---
 
 **Data:** 2026-08-07  
-**Tempo:** ~2 horas (análise + implementação + testes + instalação)  
-**Status:** ✅ PRONTO PARA PRODUÇÃO
+**Tempo:** ~2 horas (análise + implementação + testes)

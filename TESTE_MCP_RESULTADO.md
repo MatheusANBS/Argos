@@ -1,7 +1,11 @@
-# ✅ Teste do MCP Server - Resultado
+# Teste do MCP Server — resultado de 2026-08-07
 
-**Data:** 2026-08-07  
-**Status:** ✅ **TOTALMENTE OPERACIONAL**
+**Data:** 2026-08-07
+
+> **Documento histórico.** Registra um smoke test manual do binário em
+> 2026-08-07. O catálogo cresceu desde então (16 → 27 tools) e o servidor
+> **não está registrado** em nenhum cliente MCP neste ambiente. Para o estado
+> corrente das tools, use a tabela do [`README.md`](README.md#tools-mcp).
 
 ---
 
@@ -12,11 +16,11 @@
 ✅ PASSOU
    - Requisição: {"jsonrpc":"2.0","method":"tools/list","id":1}
    - Resposta: JSON-RPC com lista de tools
-   - Tools descobertas: 16
+   - Tools descobertas: 16 (naquela data; hoje o catálogo tem 27)
    - Tempo resposta: < 100ms
 ```
 
-**Tools disponíveis:**
+**Tools descobertas naquela execução:**
 1. ✅ `memory_debug.process_list` - Listar processos
 2. ✅ `memory_debug.attach` - Abrir sessão de debug
 3. ✅ `memory_debug.detach` - Fechar sessão
@@ -33,6 +37,11 @@
 14. ✅ `memory_debug.scan_exact` - Buscar padrão de bytes
 15. ✅ `memory_debug.resolve_pointer_chain` - Resolver pointers
 16. ✅ `memory_debug.write` - Escrever bytes (se habilitado)
+
+Acrescentadas depois desta execução e ausentes do teste acima:
+`address_space_summary`, `pdb_list_types`, `strings`, `scan_pointers_to`,
+`scan_pointer_chains`, `scan_first`, `scan_next`, `scan_results`, `scan_reset`,
+`launch` e `read_output`.
 
 ---
 
@@ -105,13 +114,16 @@ Status: ✅ OK
 
 ---
 
-## 🚀 Configuração Verificada
+## 🚀 Configuração de referência
+
+⚠️ Esta config **não está aplicada**: o `claude_desktop_config.json` deste
+ambiente não contém `mcpServers`. Ver [`GUIA_CADASTRO_CLAUDE.md`](GUIA_CADASTRO_CLAUDE.md).
 
 ```json
 {
   "mcpServers": {
     "argos-memory": {
-      "command": "C:\\Users\\matheuss\\Desktop\\Sistemas\\Yggdrasil\\build\\dev\\Release\\argos_runtime_memory_mcp.exe",
+      "command": "C:\\Users\\matheuss\\Desktop\\Sistemas\\Argos\\build\\dev\\Release\\argos_runtime_memory_mcp.exe",
       "args": [],
       "env": {
         "ARGOS_MCP_LOG_LEVEL": "info",
@@ -123,8 +135,8 @@ Status: ✅ OK
 }
 ```
 
-**Localização:** `C:\AppData\Roaming\Claude\claude_desktop_config.json`  
-**Status:** ✅ Ativa
+**Localização:** `%APPDATA%\Claude\claude_desktop_config.json`  
+**Status:** ⚠️ Não aplicada
 
 ---
 
@@ -142,10 +154,10 @@ As 3 otimizações implementadas estão funcionando:
 
 ```
 ╔════════════════════════════════════════╗
-║  MCP SERVER: TOTALMENTE OPERACIONAL    ║
-║  Status: ✅ PRONTO PARA PRODUÇÃO      ║
-║  Tools: 16/16 respondendo              ║
-║  Latência: Excelente (< 150ms)        ║
+║  Smoke test de 2026-08-07              ║
+║  Binário: respondeu a tools/list       ║
+║  Tools naquela data: 16/16             ║
+║  Latência: < 150ms                     ║
 ║  Erros: 0                              ║
 ╚════════════════════════════════════════╝
 ```
@@ -154,11 +166,12 @@ As 3 otimizações implementadas estão funcionando:
 
 ## 🎯 Próximas Ações
 
-1. ✅ Use `/mcp list` no Claude para confirmar visualmente
-2. ✅ Chame `memory_debug.process_list` em uma conversa
-3. ✅ Teste com processos reais se necessário (use attach/detach)
-4. ✅ Monitore performance em uso real
+1. ⬜ Registrar o servidor no cliente MCP (ainda não feito)
+2. ⬜ Use `/mcp list` no Claude para confirmar visualmente
+3. ⬜ Chame `memory_debug.process_list` em uma conversa
+4. ⬜ Refazer este smoke test cobrindo as 27 tools atuais
 
 ---
 
-**Conclusão:** O MCP está totalmente funcional e otimizado. Pronto para uso em produção.
+**Conclusão:** o binário respondeu corretamente ao protocolo em 2026-08-07.
+Isso não cobre o catálogo atual nem equivale a um servidor registrado.

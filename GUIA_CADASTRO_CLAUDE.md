@@ -25,7 +25,7 @@ echo '{"jsonrpc":"2.0","method":"tools/list","id":1}' | .\build\dev\argos_runtim
 
 ```powershell
 # PowerShell (Admin não obrigatório)
-cd C:\Users\matheuss\Desktop\Sistemas\Yggdrasil
+cd C:\Users\matheuss\Desktop\Sistemas\Argos
 
 # Build em modo desenvolvimento
 cmake --preset dev
@@ -83,7 +83,7 @@ notepad $ConfigPath
 
 ```powershell
 $ConfigPath = "$env:APPDATA\Claude\claude_desktop_config.json"
-$MCPPath = "C:\Users\matheuss\Desktop\Sistemas\Yggdrasil\build\dev\argos_runtime_memory_mcp.exe"
+$MCPPath = "C:\Users\matheuss\Desktop\Sistemas\Argos\build\dev\argos_runtime_memory_mcp.exe"
 
 # Ler config existente (ou criar vazia)
 $config = if (Test-Path $ConfigPath) {
@@ -117,7 +117,7 @@ Write-Host "✅ MCP registrado com sucesso!" -ForegroundColor Green
 {
   "mcpServers": {
     "argos-memory": {
-      "command": "C:\\Users\\matheuss\\Desktop\\Sistemas\\Yggdrasil\\build\\dev\\argos_runtime_memory_mcp.exe",
+      "command": "C:\\Users\\matheuss\\Desktop\\Sistemas\\Argos\\build\\dev\\argos_runtime_memory_mcp.exe",
       "args": [],
       "env": {
         "ARGOS_MCP_LOG_LEVEL": "info",
@@ -170,7 +170,7 @@ argos-memory
 ### Passo 1-2: Compilar e Testar
 
 ```bash
-cd ~/Yggdrasil
+cd ~/argos
 
 # Build
 cmake --preset dev
@@ -199,7 +199,7 @@ cat > ~/.config/Claude/claude_desktop_config.json << 'EOF'
 {
   "mcpServers": {
     "argos-memory": {
-      "command": "/home/matheuss/Yggdrasil/build/dev/argos_runtime_memory_mcp",
+      "command": "/home/matheuss/argos/build/dev/argos_runtime_memory_mcp",
       "args": [],
       "env": {
         "ARGOS_MCP_LOG_LEVEL": "info",
@@ -229,13 +229,16 @@ pkill -f claude  # Se usando CLI
 
 Editar o `env` na config para ajustar comportamento:
 
+As mais usadas ao registrar o servidor:
+
 | Variável | Padrão | Descrição |
 |----------|--------|-----------|
 | `ARGOS_MCP_LOG_LEVEL` | `info` | `debug`, `info`, `warning`, `error` |
 | `ARGOS_MCP_ALLOW_WRITE` | `0` | Habilitar escrita em memória (1 ou 0) |
 | `ARGOS_MCP_ALLOW_FOREIGN_USER` | `0` | Permitir outros usuários (1 ou 0) |
-| `ARGOS_MCP_MAX_READ_BYTES` | 65536 | Máximo de bytes por leitura |
-| `ARGOS_MCP_MAX_SCAN_BYTES` | 33554432 | Máximo de bytes para scan (32MB) |
+
+A lista completa, com todos os limites rígidos, está em
+[`README.md`](README.md#variáveis-de-ambiente) — esta tabela é só um recorte.
 
 ### Exemplo: Ativar Escrita
 
@@ -278,7 +281,7 @@ Esperado: **ALL TESTS PASSED ✓**
 
 ```powershell
 # Windows: Verificar path absoluto
-$exe = "C:\Users\matheuss\Desktop\Sistemas\Yggdrasil\build\dev\argos_runtime_memory_mcp.exe"
+$exe = "C:\Users\matheuss\Desktop\Sistemas\Argos\build\dev\argos_runtime_memory_mcp.exe"
 Test-Path $exe
 dir $exe  # Deve listar arquivo
 ```
@@ -306,7 +309,7 @@ Esperado! É segurança. Quando usar, passar `authorized: true`:
 # Python example
 response = call_tool("memory_debug.attach", {
     "pid": 12345,
-    "access": "read",
+    "access": "read_only",   # ou "read_write"; "read" é inválido
     "authorized": True
 })
 ```

@@ -1,6 +1,11 @@
-# ✅ Status: Implementação Completa e MCP Instalado
+# Registro de sessão — otimizações Phase 1
 
-**Data:** 2026-08-07 | **Status:** ✅ SUCESSO
+**Data:** 2026-08-07 | **Escopo:** três otimizações de performance
+
+> **Documento histórico.** Registra o que foi feito na sessão de 2026-08-07.
+> Não descreve o estado atual do projeto: a
+> [revisão de eficiência de 2026-08-09](docs/review/2026-08-09-efficiency-review.md)
+> é posterior e mais abrangente. O `CHANGELOG.md` é a fonte corrente.
 
 ---
 
@@ -47,28 +52,31 @@
 ⚠️  Warnings: 3x getenv C4996 (deprecation - inofensivo)
 ```
 
-**Executável final:** 
+**Executável gerado:**
 ```
-C:\Users\matheuss\Desktop\Sistemas\Yggdrasil\build\dev\Release\argos_runtime_memory_mcp.exe
+build\dev\Release\argos_runtime_memory_mcp.exe
 ```
 
 ---
 
-## 🎯 MCP Cadastrado no Claude
+## 🎯 Registro no cliente MCP
 
-✅ **Status:** ATIVO E PRONTO PARA USO
+⚠️ **Status: não registrado.** O `claude_desktop_config.json` deste ambiente não
+contém a chave `mcpServers`. O passo a passo está em
+[`GUIA_CADASTRO_CLAUDE.md`](GUIA_CADASTRO_CLAUDE.md); os modelos versionados
+estão em `examples/`.
 
-**Localização da Config:**
+**Localização da config (Windows):**
 ```
-C:\AppData\Roaming\Claude\claude_desktop_config.json
+%APPDATA%\Claude\claude_desktop_config.json
 ```
 
-**Configuração Instalada:**
+**Configuração a aplicar** (ajuste o caminho absoluto para o seu build):
 ```json
 {
   "mcpServers": {
     "argos-memory": {
-      "command": "C:\\Users\\matheuss\\Desktop\\Sistemas\\Yggdrasil\\build\\dev\\Release\\argos_runtime_memory_mcp.exe",
+      "command": "C:\\Users\\matheuss\\Desktop\\Sistemas\\Argos\\build\\dev\\Release\\argos_runtime_memory_mcp.exe",
       "args": [],
       "env": {
         "ARGOS_MCP_LOG_LEVEL": "info",
@@ -94,12 +102,8 @@ C:\AppData\Roaming\Claude\claude_desktop_config.json
    memory_debug.process_list(filter: "", limit: 10)
    ```
 
-3. **Variáveis de Ambiente Disponíveis:**
-   - `ARGOS_MCP_LOG_LEVEL`: `info` | `debug` | `warning` | `error`
-   - `ARGOS_MCP_ALLOW_WRITE`: `0` (leitura) ou `1` (leitura+escrita)
-   - `ARGOS_MCP_ALLOW_FOREIGN_USER`: `0` (restrito) ou `1` (permissivo)
-   - `ARGOS_MCP_MAX_READ_BYTES`: Limite de bytes por leitura
-   - `ARGOS_MCP_MAX_SCAN_BYTES`: Limite de scan (32MB padrão)
+3. **Variáveis de ambiente:** tabela completa, com padrões e limites rígidos,
+   em [`README.md`](README.md#variáveis-de-ambiente).
 
 ---
 
@@ -155,13 +159,13 @@ Referência: `IMPLEMENTACAO_OTIMIZACOES.md` seções 3-5
 
 ## 📞 Próximos Passos
 
-1. **Reiniciar Claude Desktop** (necessário para carregar nova config)
-2. **Validar:** Execute `/mcp list` no Claude
-3. **Testar:** Chamar `memory_debug.process_list` para confirmar funcionamento
-4. **Monitorar:** Acompanhar performance em produção
+1. **Registrar o MCP:** aplicar a config acima (ainda não foi feito)
+2. **Reiniciar Claude Desktop** (necessário para carregar a config)
+3. **Validar:** Execute `/mcp list` no Claude
+4. **Testar:** Chamar `memory_debug.process_list` para confirmar funcionamento
 
 ---
 
-**Versão:** Argos Runtime Memory Debug MCP v0.1.0 (otimizado)  
+**Versão:** Argos Runtime Memory Debug MCP v0.1.0 + otimizações não lançadas  
 **Compilador:** MSVC 19.44 (C++23)  
 **Plataforma:** Windows 11 + Linux (via CI/CD)

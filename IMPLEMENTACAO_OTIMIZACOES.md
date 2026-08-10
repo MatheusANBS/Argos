@@ -1,6 +1,12 @@
 # 💻 Implementação de Otimizações - Código Pronto
 
 > Exemplos prontos para copiar/colar nas otimizações identificadas
+>
+> ⚠️ **Seções 1 e 2 (logger buffering e geração de IDs) já foram aplicadas** —
+> ver `src/observability/logger.cpp` e `src/application/session_manager.cpp`.
+> O código real divergiu destes trechos (por exemplo, o logger também dá flush
+> imediato em `warning`/`error`). Trate as seções 1–2 como registro histórico e
+> as seções 3–5 como propostas ainda abertas.
 
 ---
 
