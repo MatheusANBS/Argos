@@ -143,3 +143,10 @@ descobertos — apenas o registro genérico de invocação da tool.
   fanout, depth);
 - custo limitado a `O(max_depth)` chamadas de scan, independentemente da
   largura efetiva da fronteira.
+
+## Extensão proposta
+
+A [Spec 0010](0010-persistent-pointer-index.md) propõe um índice invertido
+reutilizável, offsets não zero por hop, build assíncrono e persistência em
+disco opt-in. O comportamento aceito desta spec continua sendo o scan direto
+sem índice.

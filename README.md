@@ -46,6 +46,15 @@ PDB para completar offsets. `memory_debug.unreal_type` e
 | `memory_debug.write` | Escreve bytes somente quando habilitado e confirmado. |
 | `memory_debug.launch` / `read_output` | Inicia um executável escolhido pelo operador e captura `stdout`/`stderr`. Desligado por padrão (`ARGOS_MCP_ALLOW_LAUNCH`). |
 
+## Roadmap proposto
+
+O pacote de evolução documenta scans completos assíncronos, continuação com
+motivo explícito, importação/multipadrão, índice de pointer chains,
+`inspect_address` e reflexão Unreal em runtime sem PDB. Essas capacidades estão
+**propostas e ainda não fazem parte das tools acima**. Contratos, decisões,
+riscos, ordem de implementação e o protocolo de teste com valor mutável estão
+no [roadmap de eficiência do agente](docs/specs/0007-roadmap-eficiencia-agente.md).
+
 ## Plataformas
 
 - Windows: `Toolhelp32Snapshot`, `OpenProcess`, `VirtualQueryEx`, `ReadProcessMemory` e `WriteProcessMemory`.
@@ -213,6 +222,11 @@ recomendado e os limites oficiais estao em
 [`docs/engines/unity-unreal-pdb.md`](docs/engines/unity-unreal-pdb.md).
 Scans e assinaturas continuam sendo candidatos e nao sao promovidos a layout
 confirmado.
+
+Uma extensão somente-leitura por perfis de runtime (`GUObjectArray`,
+`FNamePool`, classes e `FProperty`) está documentada como proposta na
+[Spec 0012](docs/specs/0012-unreal-runtime-reflection.md). Ela não está
+implementada e não altera a proveniência das tools PDB atuais.
 
 ## Licença
 

@@ -15,10 +15,29 @@ reutilizados em scans, uma passagem multi-alvo por profundidade nas cadeias de
 ponteiro, JSON limitado/iterativo e catálogo MCP cacheado. IPO/LTO foi medido,
 mas permanece opt-in porque perdeu throughput no hot path MCP avaliado.
 
-Continuam planejadas as Fases 2–5: retomada automática/deadline, classificação
-e clustering, dimensão temporal, merge/import e busca multi-tipo. Portanto, os
-ganhos desta rodada são grandes e mensuráveis, mas não encerram honestamente o
-roadmap inteiro.
+Continuam planejadas as Fases 2–9: continuação e jobs assíncronos, composição
+multipadrão, classificação/inspeção, dimensão temporal, pointer index e
+metadata Unreal runtime/savegame. Portanto, os ganhos desta rodada são grandes
+e mensuráveis, mas não encerram honestamente o roadmap inteiro.
+
+## Pacote de propostas formalizado em 2026-08-09
+
+Uma auditoria posterior da implementação e do contrato MCP transformou sete
+melhorias prioritárias em specs e ADRs próprios. Todos os itens desta tabela
+estão **propostos, não implementados**; README e `docs/api/tools.md` só devem
+anunciá-los como disponíveis depois da entrega de código e testes.
+
+| Capacidade | Spec | Decisão | Dependência principal |
+|---|---|---|---|
+| Scan completo assíncrono, progresso, cancelamento, continuação e motivo de término | [Spec 0008](0008-async-scan-operations.md) | [ADR-0012](../adr/0012-async-scan-progress-resumption.md) | contrato de cobertura |
+| Importação arbitrária de candidatos e multipadrão em uma passagem | [Spec 0009](0009-scan-composition-and-multi-pattern.md) | [ADR-0017](../adr/0017-scan-composition-and-multi-pattern.md) | jobs assíncronos |
+| Índice reutilizável/persistente para pointer chains | [Spec 0010](0010-persistent-pointer-index.md) | [ADR-0018](../adr/0018-persistent-pointer-index.md) | jobs e identidade do processo |
+| Inspeção derivada de endereço, vtable provável e referências | [Spec 0011](0011-inspect-address.md) | [ADR-0013](../adr/0013-address-inspection-derived-evidence.md) | cobertura e pointer index |
+| Reflexão Unreal em runtime sem PDB | [Spec 0012](0012-unreal-runtime-reflection.md) | [ADR-0019](../adr/0019-unreal-runtime-reflection.md) | jobs, multipadrão e perfis |
+
+O contrato de jobs é deliberadamente genérico: scans, construção do índice e
+enumerações Unreal compartilham lifecycle, backpressure, progresso, paginação,
+cancelamento e expiração, sem duplicar pools de workers.
 
 ## Motivação
 
@@ -52,6 +71,21 @@ I/O. Este roadmap ataca especificamente isso.
 | 9 | Valor de entrada só em bytes hex little-endian | `91293908` → `d4087105` convertido na mão | Risco de erro silencioso |
 | 10 | É preciso escolher o `value_type` antes de varrer | Acertei `i32` no primeiro palpite; se fosse `f32` seria tudo de novo | Potencial 6× do trabalho |
 
+### Lacunas confirmadas pela auditoria posterior
+
+- o transporte mantém uma única tool ativa; cancelamento existe por request,
+  mas status/progresso concorrentes recebem `Server busy` e o resultado parcial
+  é perdido;
+- `scan_exact` reduz orçamento, limite e gaps de leitura a um único
+  `truncated`, sem cursor; até o caso “budget exatamente igual ao fim” pode ser
+  marcado como truncado;
+- `scan_first` já expõe parte da cobertura, mas não há token de continuação nem
+  composição dos candidatos de várias janelas;
+- pointer chains releem o mapa a cada profundidade e aceitam somente ponteiro
+  exatamente igual ao alvo, produzindo offsets intermediários zero;
+- as tools Unreal atuais são exclusivamente PDB e a porta de metadata recebe
+  caminho de módulo, não uma visão de memória viva.
+
 ### Métrica-alvo
 
 Reexecutar a mesma tarefa (mesmo alvo, mesmo valor) medindo:
@@ -66,25 +100,57 @@ Reexecutar a mesma tarefa (mesmo alvo, mesmo valor) medindo:
 Conforme `cpp-performance`, nenhuma otimização entra sem baseline registrado
 neste formato.
 
+Para as novas fases, cada benchmark/ensaio também registra:
+
+- cobertura (`eligible/scanned/skipped`) e motivo de término, nunca só um
+  booleano;
+- tempo total, latência de polling/cancelamento e pico de memória retida;
+- chamadas e bytes de leitura nativa por sweep — N padrões devem manter
+  amplificação de I/O próxima de 1×;
+- tempo de build, tamanho e taxa de reuso/revalidação do pointer index;
+- itens encontrados/armazenados/retornados e bytes de resposta;
+- candidatos de inspeção/Unreal por nível de confiança e invariantes falhas.
+
 ## Eixos
 
 ### A — Cobertura e orçamento de scan (atritos 1, 2)
 
-- **A1. Auto-janelamento com `resume_token`.** O serviço itera as regiões
-  internamente até esgotar o alvo. Quando o orçamento da chamada acaba, devolve
-  `resume_token` (cursor de endereço opaco) em vez de simplesmente truncar. O
-  cliente repete a chamada com o token; não calcula mais janela nenhuma.
+- **A1. Continuação segura com `resume_token`.** O serviço ordena as regiões e
+  itera internamente. Se não concluir, devolve um token opaco vinculado a
+  sessão, mapa, filtros, padrões e carry. O token é o cursor autoritativo:
+  endereço isolado não preserva overlap nem gaps de leitura.
+- **A1b. `next_start_address` auditável.** Também devolver o primeiro endereço
+  lógico alinhado ainda não examinado como hex ou `null`. Ele serve para
+  progresso e diagnóstico, não substitui o token. Retomadas preservam
+  `max_pattern_size - 1` bytes e deduplicam `{pattern_id,address}` para não
+  perder matches em fronteiras.
 - **A2. Orçamento por deadline, não por teto de bytes.** O teto de 256 MiB
   protege contra DoS do servidor, mas mede a grandeza errada: o scan já roda em
   chunks com buffer reutilizado, então o consumo de memória é O(chunk), não
   O(byte_budget). Introduzir `deadline_ms` (com `stop_token`, que o motor já
   suporta) como limite primário e manter `max_scan_bytes` apenas como teto
   defensivo elevado. Sem isto, A1 continua exigindo dezenas de continuações.
-- **A3. `ScanSessionInfo` expõe cobertura.** Adicionar `bytes_scanned`,
-  `regions_scanned`, `truncated`, `coverage_ratio` e `resume_token`. O dado já
-  existe: `scan_pattern_over_regions` calcula `result.truncated` em
-  `memory_debug_service.cpp:243` e simplesmente não sobe para o protocolo.
-  Elimina de vez o zero-resultado ambíguo.
+- **A3a. Cobertura de `scan_first` (implementado).** Expõe bytes/regiões e
+  flags de truncagem suficientes para remover o zero-resultado ambíguo nessa
+  tool.
+- **A3b. Cobertura e término canônicos (proposto).** Generalizar para
+  `scan_exact`, multipadrão, referências e pointer chains. Separar
+  `coverage_complete` de `results_complete` e expor
+  `bytes/regions eligible/scanned`, `matches_found/stored`, gaps e uma lista
+  fechada de motivos comuns (`operation_completed`, `range_exhausted`,
+  `byte_budget`, `result_limit`, `deadline`, cancelamentos e falhas) estendida
+  por variante de operação (`max_depth`, `max_fanout`, `stale_snapshot`,
+  `unstable_snapshot`). Estado terminal e motivo não são o mesmo campo;
+  `truncated` permanece derivado por compatibilidade.
+- **A4. Scan completo assíncrono.** `memory_debug.scan_start` devolve `job_id`
+  antes de concluir I/O. Auto-janelamento interno cobre todo o snapshot
+  elegível; `memory_debug.job_status`, `job_results`, `job_cancel` e
+  `job_release` permanecem responsivos enquanto o worker roda.
+- **A5. Lifecycle e backpressure.** Estados monotônicos
+  `queued → running → completed|cancelled|failed`, terminais imutáveis,
+  progresso monotônico, cancel idempotente, filas/retention bounded, expiração
+  de resultado sem reescrever o terminal, workers possuídos e join em
+  `detach`/shutdown. Tools síncronas atuais continuam compatíveis.
 
 ### B — Consulta de espaço de endereçamento (atrito 4)
 
@@ -98,22 +164,36 @@ neste formato.
 ### C — Composição de scan sessions (atrito 3)
 
 - **C1.** Com A1, `scan_first` passa a devolver **um único `scan_id`** cobrindo
-  todo o alvo. Resolve a causa do atrito.
-- **C2. `memory_debug.scan_merge`.** União de candidatos de vários `scan_id`,
-  para sessões já existentes e para unir varreduras de tipos diferentes.
+  todo o alvo, publicado somente após cobertura e resultados completos.
+  Resolve a causa do atrito sem transformar janela parcial em sessão global.
+- **C2. `memory_debug.scan_merge` (deferido).** União de scan sessions continua
+  útil, mas não entra neste pacote: compatibilidade de tipo, owner, coverage e
+  geração ainda exigem contrato próprio. C3 resolve primeiro o caso necessário
+  ao importar a união explícita de endereços.
 - **C3. `memory_debug.scan_import`.** Cria scan session a partir de uma lista
-  explícita de endereços. Permite retomar trabalho entre reinícios do cliente e
-  alimentar o pipeline com endereços vindos de outra fonte.
+  explícita de endereços. O servidor valida overflow, ordena, deduplica e lê o
+  baseline atual; bytes fornecidos pelo cliente nunca viram baseline.
+  `reject_all` é transacional por padrão e `skip_unreadable` é opt-in, com
+  contagens bounded de rejeições. Ownership, geração COW, quotas e teardown são
+  os mesmos de uma scan session normal. Endereços só valem para a identidade
+  viva da sessão; import não promete portabilidade após restart/PID reuse.
+- **C4. `memory_debug.scan_start` / `multi_pattern`.** Aceita IDs estáveis e
+  uma lista limitada de valores tipados/padrões binários. Cada chunk do alvo é
+  lido uma vez, independentemente da quantidade de padrões; o resultado é
+  `{pattern_id,address}` com limites globais e por item. Entradas tipadas podem
+  materializar scan sessions-filhas num commit transacional, apenas quando
+  cobertura/resultados forem completos; padrões crus retornam só matches.
 
 ### D — Classificação de candidatos no servidor (atritos 5, 6) — maior alavancagem
 
 - **D1. `scan_results` com `annotate: true`.** Por candidato, metadados
   **derivados no servidor**, sem trafegar bytes crus:
   - `region`: classe da região e módulo dono, quando houver;
-  - `vtable`: primeiro qword alinhado nos N bytes anteriores que caia no range
-    executável de um módulo carregado, como `{module, rva, distance}` — é
-    literalmente a heurística que reimplementei em PowerShell, e foi ela que
-    revelou os grupos de objetos com o valor em `+0x1C8` e `+0x1F8`;
+  - `vtable`: primeiro qword alinhado nos N bytes anteriores que aponte para
+    região legível/não gravável de módulo e cuja tabela tenha K entradas para
+    regiões executáveis, como `{module, rva, distance, evidence}`. É a versão
+    fortalecida da heurística que revelou os grupos de objetos com o valor em
+    `+0x1C8` e `+0x1F8`;
   - `neighbors`: k dwords antes/depois já decodificados como `i32`/`f32`, com
     marcação de quais formam ponteiro válido para heap ou módulo;
   - `float_echo`: sinaliza quando algum `f32` vizinho está a menos de X% do
@@ -132,6 +212,19 @@ neste formato.
   Por `cpp-architecture`, o classificador é função pura sobre um `span<const
   std::byte>` mais o mapa de módulos, no domínio, sem depender de handle de OS
   nem de JSON. Isso o torna unit-testável sem processo vivo (`cpp-testing`).
+
+- **D3. `memory_debug.inspect_address`.** Consolida evidência sobre um endereço:
+  região/proteções; módulo dono + RVA; bases de objeto e vtables **prováveis**;
+  e referências. A heurística não afirma “vtable” apenas porque um qword aponta
+  para código: procura uma base alinhada num lookbehind limitado, exige que o
+  primeiro ponteiro caia numa região legível/não gravável de módulo e que K
+  entradas da tabela apontem para regiões executáveis. Retorna candidatos
+  rankeados, `field_offset`, confiança, evidências e proveniência.
+
+  Referências declaram `source: index|live_scan`, pointer size e cobertura. Sem
+  índice, scan ao vivo só ocorre com budget explícito — nunca há full scan
+  oculto. Ausência é `null`/array vazio, não hipótese inventada; payload,
+  vizinhança e referências são bounded.
 
 ### E — Dimensão temporal (atritos 7, 8)
 
@@ -154,6 +247,10 @@ neste formato.
   `i64`, `u64`, `f32` e `f64` numa passada só, devolvendo o tipo que casou. O
   custo marginal é próximo de zero porque o gargalo é leitura de memória, não
   comparação (`cpp-performance`).
+- **F3. Padrões heterogêneos.** Generaliza F2 para valores e padrões de
+  larguras/alinhamentos diferentes, com IDs estáveis, overlaps e carry correto.
+  Limites de quantidade, bytes totais e CPU impedem custo
+  `O(memória × entrada hostil)` sem controle.
 
 ### G — Correlação com metadados de engine (menor prioridade)
 
@@ -163,36 +260,68 @@ neste formato.
   Fica por último: introduz I/O de arquivo, que é superfície nova, e exige ADR
   e gate próprios (`cpp-security`).
 
+- **G2. Reflexão Unreal em runtime sem PDB.** Uma porta separada do provider de
+  PDB lê `GUObjectArray`, `FNamePool`, `UObject`/`UClass`/`UStruct` e
+  `FField`/`FProperty` por perfis versionados. Faz somente leitura, nenhuma
+  chamada de função no alvo, injeção ou remote thread. Counts, chunks, nomes,
+  ponteiros, herança, offsets e listas encadeadas passam por bounds, aritmética
+  checked e cycle detection. Perfil desconhecido retorna `unsupported`;
+  candidato heurístico nunca vira layout confirmado. ADR-0019 estende, mas não
+  enfraquece, ADR-0005.
+
+### H — Índice para pointer chains
+
+- **H1. Build assíncrono de índice invertido.** Uma passagem registra pares
+  `pointee_value → source_address` e metadados mínimos. Queries usam range
+  `[target - max_offset,target]`, permitindo offsets não zero em cada hop, em
+  vez de reler toda a memória por profundidade.
+- **H2. Snapshot COW e revalidação.** Build publica atomicamente uma geração;
+  query concorrente lê snapshot imutável. Toda cadeia retornada é revalidada ao
+  vivo; divergências são omitidas e contabilizadas. Falha/cancelamento preserva
+  a última geração válida.
+- **H3. Persistência opt-in.** Memória é o default. Disco exige gate,
+  diretório controlado pelo servidor, ACL do owner, quota/TTL, formato
+  versionado, checksum e publicação temp→rename. Identidade inclui PID + tempo
+  de criação, pointer size/endianness, fingerprint de módulos e mapa. Índice de
+  heap nunca é considerado válido após restart/ASLR; chains normalizadas só
+  podem ser reutilizadas após revalidação.
+
 ## Ordem de implementação
 
 | Fase | Itens | Risco | Novo gate? | Efeito na métrica-alvo |
 |---|---|---|---|---|
-| 1 | A3, B1, B2, F1 | baixo | não | Elimina o zero-resultado ambíguo e os 2 offloads de `regions`; remove conversão hex manual |
-| 2 | A1, A2 | médio | não | 15 chamadas de scan → 1; elimina o cálculo de janelas |
-| 3 | D1, D2 | médio | não | Elimina os 84 KB de hex e os 3 scripts de classificação |
-| 4 | E1, E2 | médio | não | Elimina a rodada manual de reamostragem |
-| 5 | C2, C3, F2 | baixo | não | Composição e busca multi-tipo |
-| 6 | G1 | alto | sim | Correlação com nome de propriedade |
+| 1 | A3a, B1, B2, F1 | baixo | não | Elimina o zero-resultado ambíguo e os 2 offloads de `regions`; remove conversão hex manual |
+| 2 | A1, A1b, A3b | médio | não | Continuação sem lacuna e término inequívoco |
+| 3 | A2, A4, A5 | alto | quotas | 15 chamadas de scan → 1 job; progresso/cancelamento reais |
+| 4 | C3, C4, F2, F3 | médio | quotas | Une candidatos e evita N passagens para N representações |
+| 5 | D1, D2, D3 | médio | budget de refs | Elimina bytes crus/scripts e entrega grupos/evidências |
+| 6 | E1, E2 | médio | não | Elimina a rodada manual de reamostragem |
+| 7 | H1, H2, H3 | alto | disco opt-in | Reaproveita pointer sweep e produz hops com offsets úteis |
+| 8 | G2 | alto | perfis/auto opt-in | Classes e `FProperty` sem depender de PDB |
+| 9 | G1 | alto | arquivo opt-in | Correlação com nome de propriedade persistida |
 
-Fases 1 a 5 são aditivas e somente-leitura, reaproveitam `authorize_scan` e não
-alteram a superfície de autorização. A fase 2 é a única que mexe em limite de
-recurso e por isso precisa de ADR próprio. A fase 6 muda a classe de capacidade
-do servidor (de "ler processos" para "ler arquivos indicados") e deve nascer
-desligada.
+Fases 1–6 são aditivas e somente-leitura, mas jobs mudam o modelo de
+concorrência/recursos e exigem quotas próprias. H3 muda a classe de persistência
+do servidor e nasce desligado. G2 permanece somente-leitura, porém expõe um
+catálogo maior de metadata e exige perfis explicitamente habilitados. G1 muda a
+classe de capacidade para leitura de arquivos indicados e também nasce
+desligado.
 
 ## ADRs necessários
 
 | ADR | Assunto | Fase |
 |---|---|---|
-| 0012 | Orçamento de scan por deadline e retomada via `resume_token` | 2 |
-| 0013 | Anotação e clusterização de candidatos no servidor | 3 |
-| 0014 | Amostragem temporal de candidatos | 4 |
-| 0015 | Leitura de metadados de savegame (se a fase 6 for adiante) | 6 |
+| [0012](../adr/0012-async-scan-progress-resumption.md) | Jobs, deadline, progresso, cancelamento e retomada | 2–3 |
+| [0013](../adr/0013-address-inspection-derived-evidence.md) | Inspeção derivada e evidência provável | 5 |
+| 0014 | Amostragem temporal de candidatos | 6 |
+| 0015 | Leitura de metadados de savegame (se a fase 9 for adiante) | 9 |
+| [0017](../adr/0017-scan-composition-and-multi-pattern.md) | Importação e composição multipadrão | 4 |
+| [0018](../adr/0018-persistent-pointer-index.md) | Índice persistente para pointer chains | 7 |
+| [0019](../adr/0019-unreal-runtime-reflection.md) | Reflexão Unreal em runtime sem PDB | 8 |
 
-A3, B1, B2, C2, C3, F1 e F2 são extensões de contrato dentro de decisões já
-registradas (ADR-0007, ADR-0009, ADR-0011) e não exigem ADR novo — apenas
-atualização de `docs/api/tools.md` e do threat model quando mudarem o que
-trafega.
+A3a, B1, B2 e F1 permanecem extensões de contratos existentes. Specs/ADRs
+propostos não alteram `docs/api/tools.md`; essa documentação e o threat model
+só descrevem comportamento implementado depois de cada entrega.
 
 ## Skills aplicáveis
 
@@ -206,7 +335,8 @@ As dez obrigatórias do `AGENTS.md` valem para todas as fases. Além delas:
 | D | `cpp-data-structures`, `cpp-performance`, `cpp-interop` | Hash de assinatura e agrupamento; evitar releitura redundante; range de módulo vem de API nativa |
 | E | `cpp-concurrency`, `cpp-observability` | Amostragem temporizada com shutdown limpo; carimbo temporal e correlação |
 | F | `cpp-api-design`, `cpp-memory-safety` | Conversão decimal→bytes é ponto clássico de misuse; largura e sinal precisam ser à prova de erro |
-| G | `cpp-security`, `cpp-dependency-management` | Superfície de I/O nova; avaliar parser antes de adicionar dependência |
+| G | `cpp-security`, `cpp-dependency-management`, `cpp-interop` | Parser de memória hostil, perfis de engine e eventual superfície de I/O/dependência |
+| H | `cpp-data-structures`, `cpp-concurrency`, `cpp-performance`, `cpp-security` | Índice invertido, publicação COW, build cancelável, persistência sensível e benchmark |
 
 ## Impacto no threat model
 
@@ -214,13 +344,55 @@ Duas mudanças **reduzem** exposição e devem ser registradas como tal: D1 e D2
 substituem o tráfego de bytes crus de memória por metadados derivados, e E1
 substitui releituras completas por contadores agregados.
 
-Uma mudança **aumenta** risco de recurso: A2 eleva o teto de trabalho por
-chamada. Mitigações obrigatórias — `deadline_ms` com teto configurável,
-cancelamento cooperativo já existente, e backpressure por número de scans
-concorrentes (`max_scan_sessions_per_session`).
+Jobs e A2 **aumentam** risco de recurso: trabalho continua depois da resposta
+de start e pode reter resultados. Mitigações obrigatórias: workers/jobs globais
+e por sessão, deadline e byte budget, cancelamento cooperativo, resultados
+bounded/paginados, TTL/release, detach/shutdown com cancel+join e progresso que
+não inclui conteúdo.
+
+H3 cria persistência local de metadados sensíveis do layout. Deve ser opt-in,
+usar path controlado pelo servidor, ACL do owner, quota/retention, formato
+versionado/checksum, publicação atômica e invalidação forte. Nunca persiste
+bytes vizinhos. G2 expõe nomes/classes/properties: paginação, filtros, perfis,
+proveniência e logs somente com contagens são obrigatórios.
 
 Por `cpp-observability`, nenhuma das novas tools registra conteúdo de memória
 em log: `stderr` recebe apenas contagens, durações e identificadores.
+
+## Protocolo de revalidação com valor mutável
+
+O próximo teste do dinheiro será cego, somente-leitura e feito em alvo próprio
+ou explicitamente autorizado, preferencialmente offline/solo. O endereço
+absoluto da sessão anterior não entra como pista.
+
+1. Anexar `read_only`, registrar PID/identidade, módulos e resumo do espaço.
+2. Verificar antes do baseline se a policy comporta todas as janelas
+   simultâneas. Para ~3,4 GiB e teto de 256 MiB são cerca de 14 scan sessions;
+   o default de 4 não basta. A configuração local de teste usa 64, sem elevar
+   o hard cap de 64 nem o limite de candidatos além da policy.
+3. O operador estabiliza a UI e informa `V0`; não altera o saldo até a
+   confirmação “baseline concluído”.
+4. Com o MCP atual, dividir todas as regiões readable+writable (priorizando
+   private) em faixas de no máximo 256 MiB elegíveis e executar
+   `scan_first(exact,u32,V0)` em cada faixa, exigindo cobertura completa e
+   motivo conhecido. Para o saldo positivo testado, `u32` e `i32` têm os
+   mesmos quatro bytes; não é necessário reler o alvo para distinguir sinal.
+5. Só então o operador faz uma transação legítima no jogo, espera estabilizar
+   e informa `V1` e a direção. Rodar `scan_next(exact,V1)` em todos os scans.
+6. Repetir com `V2`, idealmente delta diferente e direção oposta. Três
+   snapshots reduzem caches, animações e coincidências de UI.
+7. Paginar sobreviventes, confirmar com `read_typed` e analisar contexto e
+   referências. Calcular base/field offset a partir de evidência; não assumir
+   previamente `+0x590`.
+8. Fazer detach. Para provar estabilidade, reiniciar a mesma build e repetir:
+   endereço absoluto deve poder mudar; offset de campo/cadeia deve se manter e
+   ser revalidado. Mudança de build invalida a conclusão.
+
+Depois das propostas, o passo 4 vira um único job completo, hits podem convergir
+por `scan_import` e o passo 7 usa `inspect_address`. Registrar por rodada:
+chamadas, tempo, bytes/regions eligible/scanned, leituras nativas, candidatos
+por geração, cobertura/motivo e bytes de resposta. Não chamar `write`,
+`launch`, `terminate` nem tentar contornar proteção/anticheat.
 
 ## Fora de escopo
 

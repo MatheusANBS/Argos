@@ -178,3 +178,10 @@ de `data`.
   (campo único conhecido variando de forma exclusiva) em até 3 rounds de
   `scan_next`;
 - nenhuma sessão de scan sobrevive ao `detach` da sessão de depuração dona.
+
+## Extensão proposta
+
+A [Spec 0009](0009-scan-composition-and-multi-pattern.md) propõe importar uma
+lista arbitrária de endereços com baseline amostrado no servidor,
+`scan_close` e materialização transacional de resultados multipadrão. Nada
+dessa extensão está implementado no contrato aceito acima.

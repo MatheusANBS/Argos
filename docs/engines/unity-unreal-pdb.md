@@ -121,6 +121,13 @@ PDB compativel, retorna `not_found`/`unsupported`. A implementacao atual extrai
 metadados e layouts comprovados; ela nao injeta codigo nem resolve objetos por
 varredura cega.
 
+Uma extensão futura, ainda não implementada, está especificada em
+[Reflexão Unreal em runtime sem PDB](../specs/0012-unreal-runtime-reflection.md)
+e decidida de forma proposta em
+[ADR-0019](../adr/0019-unreal-runtime-reflection.md). Ela usa perfis explícitos,
+validação estrutural, proveniência e confiança; não transforma signatures em
+layout confirmado nem modifica o comportamento descrito nesta página.
+
 ## Nivel de confianca
 
 | Fonte | Resultado | Confianca |
