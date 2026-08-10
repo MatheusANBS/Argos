@@ -32,7 +32,8 @@ private:
     [[nodiscard]] static json::Value rpc_error(
         const json::Value& id,
         std::int64_t code,
-        std::string message
+        std::string message,
+        std::optional<json::Value> data = std::nullopt
     );
 
     ToolCatalog& tools_;

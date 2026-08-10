@@ -1,4 +1,5 @@
 #include "argos_mcp/application/memory_debug_service.hpp"
+#include "argos_mcp/application/scan_session_manager.hpp"
 #include "argos_mcp/domain/process_memory.hpp"
 #include "argos_mcp/infrastructure/output_ring_buffer.hpp"
 #include "argos_mcp/infrastructure/pdb_type_metadata.hpp"
@@ -7,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -14,10 +16,14 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <random>
 #include <string>
 #include <stop_token>
+#include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -39,9 +45,15 @@ public:
             std::byte{0xDE}, std::byte{0xAD}, std::byte{0xBE}, std::byte{0xEF},
             std::byte{0x11}, std::byte{0x22}, std::byte{0x33}, std::byte{0x44}
         };
+        modules_ = {argos::domain::ModuleInfo{"fake.dll", "C:\\fake.dll", 0x140000000U, 0x1000U}};
     }
 
-    explicit FakeSession(std::vector<std::byte> memory) : memory_(std::move(memory)) {}
+    explicit FakeSession(std::vector<std::byte> memory)
+        : memory_(std::move(memory)),
+          modules_{argos::domain::ModuleInfo{"fake.dll", "C:\\fake.dll", 0x140000000U, 0x1000U}} {}
+
+    FakeSession(std::vector<std::byte> memory, std::vector<argos::domain::ModuleInfo> modules)
+        : memory_(std::move(memory)), modules_(std::move(modules)) {}
 
     [[nodiscard]] argos::domain::ProcessId pid() const noexcept override { return 42U; }
     [[nodiscard]] std::string_view process_name() const noexcept override { return "fake-target"; }
@@ -85,13 +97,12 @@ public:
     }
 
     [[nodiscard]] argos::domain::Result<std::vector<argos::domain::ModuleInfo>> modules() const override {
-        return std::vector<argos::domain::ModuleInfo>{argos::domain::ModuleInfo{
-            "fake.dll", "C:\\fake.dll", 0x140000000U, 0x1000U
-        }};
+        return modules_;
     }
 
 private:
     std::vector<std::byte> memory_{};
+    std::vector<argos::domain::ModuleInfo> modules_{};
 };
 
 class FakeProvider final : public argos::domain::ProcessMemoryProvider {
@@ -127,9 +138,20 @@ public:
     }
 };
 
+struct MutableReadProbe {
+    std::atomic<std::size_t> calls{0U};
+    std::atomic<bool> short_batch_reads{false};
+    std::atomic<bool> oversized_reads{false};
+    std::atomic<std::size_t> cancel_after_calls{0U};
+    std::stop_source cancellation;
+};
+
 class MutableFakeSession final : public argos::domain::ProcessSession {
 public:
-    explicit MutableFakeSession(std::shared_ptr<std::vector<std::byte>> memory) : memory_(std::move(memory)) {}
+    explicit MutableFakeSession(
+        std::shared_ptr<std::vector<std::byte>> memory,
+        std::shared_ptr<MutableReadProbe> probe = nullptr
+    ) : memory_(std::move(memory)), probe_(std::move(probe)) {}
 
     [[nodiscard]] argos::domain::ProcessId pid() const noexcept override { return 42U; }
     [[nodiscard]] std::string_view process_name() const noexcept override { return "fake-mutable-target"; }
@@ -141,6 +163,13 @@ public:
         argos::domain::Address address,
         std::span<std::byte> output
     ) const override {
+        if (probe_) {
+            const auto call_count = probe_->calls.fetch_add(1U, std::memory_order_relaxed) + 1U;
+            const auto cancel_after = probe_->cancel_after_calls.load(std::memory_order_relaxed);
+            if (cancel_after != 0U && call_count >= cancel_after) {
+                probe_->cancellation.request_stop();
+            }
+        }
         constexpr argos::domain::Address base = 0x1000U;
         if (address < base) {
             return std::unexpected(argos::domain::DebugError{
@@ -148,13 +177,20 @@ public:
             });
         }
         const auto offset = static_cast<std::size_t>(address - base);
-        if (offset > memory_->size() || output.size() > memory_->size() - offset) {
+        const std::size_t read_size = probe_ && probe_->short_batch_reads.load(std::memory_order_relaxed) &&
+                output.size() > sizeof(std::int32_t)
+            ? sizeof(std::int32_t)
+            : output.size();
+        if (probe_ && probe_->oversized_reads.load(std::memory_order_relaxed)) {
+            return output.size() + 1U;
+        }
+        if (offset > memory_->size() || read_size > memory_->size() - offset) {
             return std::unexpected(argos::domain::DebugError{
                 argos::domain::DebugErrorCode::io_error, "read outside fake region"
             });
         }
-        std::copy_n(memory_->begin() + static_cast<std::ptrdiff_t>(offset), output.size(), output.begin());
-        return output.size();
+        std::copy_n(memory_->begin() + static_cast<std::ptrdiff_t>(offset), read_size, output.begin());
+        return read_size;
     }
 
     [[nodiscard]] argos::domain::Result<std::size_t> write(
@@ -178,15 +214,23 @@ public:
 
 private:
     std::shared_ptr<std::vector<std::byte>> memory_;
+    std::shared_ptr<MutableReadProbe> probe_;
 };
 
-[[nodiscard]] std::vector<std::byte> encode_i32(std::int32_t value) {
-    std::vector<std::byte> bytes(4U);
-    const auto unsigned_value = static_cast<std::uint32_t>(value);
-    for (std::size_t index = 0; index < 4U; ++index) {
+template <typename Signed>
+[[nodiscard]] std::vector<std::byte> encode_signed(Signed value) {
+    static_assert(std::is_integral_v<Signed> && std::is_signed_v<Signed>);
+    using Unsigned = std::make_unsigned_t<Signed>;
+    std::vector<std::byte> bytes(sizeof(Signed));
+    const auto unsigned_value = static_cast<Unsigned>(value);
+    for (std::size_t index = 0; index < bytes.size(); ++index) {
         bytes[index] = static_cast<std::byte>((unsigned_value >> (index * 8U)) & 0xFFU);
     }
     return bytes;
+}
+
+[[nodiscard]] std::vector<std::byte> encode_i32(const std::int32_t value) {
+    return encode_signed(value);
 }
 
 class SingleSessionFakeProvider final : public argos::domain::ProcessMemoryProvider {
@@ -393,6 +437,8 @@ public:
 };
 
 void test_json() {
+    namespace json = argos::protocol::json;
+
     auto parsed = argos::protocol::json::parse(
         R"({"jsonrpc":"2.0","id":1,"params":{"ok":true,"values":[1,2,3]}})"
     );
@@ -403,6 +449,57 @@ void test_json() {
     auto round_trip = argos::protocol::json::parse(dumped);
     check(round_trip.has_value(), "JSON round trip succeeds");
     check(!argos::protocol::json::parse("{bad").has_value(), "JSON parser rejects malformed input");
+
+    std::string maximum_input(json::max_parse_input_bytes, ' ');
+    maximum_input.back() = '0';
+    check(json::parse(maximum_input).has_value(), "JSON parser accepts input at the size limit");
+    maximum_input.push_back(' ');
+    const auto oversized = json::parse(maximum_input);
+    check(!oversized.has_value(), "JSON parser rejects input above the 8 MiB limit");
+    if (!oversized) {
+        check(oversized.error().offset <= maximum_input.size() && !oversized.error().message.empty(),
+              "oversized JSON returns a bounded, non-empty ParseError");
+    }
+
+    const auto nested_json = [](const std::size_t depth) {
+        std::string text(depth, '[');
+        text.push_back('0');
+        text.append(depth, ']');
+        return text;
+    };
+    check(json::parse(nested_json(json::max_parse_nesting_depth)).has_value(),
+          "JSON parser accepts nesting at the depth limit");
+    const auto too_deep = json::parse(nested_json(json::max_parse_nesting_depth + 1U));
+    check(!too_deep.has_value(), "JSON parser rejects nesting above 128 levels");
+    if (!too_deep) {
+        check(too_deep.error().message == "maximum nesting depth exceeded",
+              "excessive JSON nesting returns a safe ParseError");
+    }
+
+    std::string maximum_nodes{"["};
+    maximum_nodes.reserve(json::max_parse_nodes * 5U);
+    for (std::size_t index = 1U; index < json::max_parse_nodes; ++index) {
+        if (index > 1U) maximum_nodes.push_back(',');
+        maximum_nodes.append("null");
+    }
+    maximum_nodes.push_back(']');
+    check(json::parse(maximum_nodes).has_value(), "JSON parser accepts the bounded maximum node count");
+    maximum_nodes.insert(maximum_nodes.size() - 1U, ",null");
+    const auto too_many_nodes = json::parse(maximum_nodes);
+    check(!too_many_nodes.has_value() &&
+              too_many_nodes.error().message == "maximum JSON node count exceeded",
+          "JSON parser rejects flat containers that amplify beyond the DOM node budget");
+
+    const json::Value nonfinite = json::Value::array({
+        std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity()
+    });
+    const std::string nonfinite_dump = nonfinite.dump();
+    check(nonfinite_dump == "[null,null,null]",
+          "JSON dump serializes NaN and infinities as null");
+    check(json::parse(nonfinite_dump).has_value(),
+          "JSON dump containing non-finite source values remains valid JSON");
 }
 
 void test_policy() {
@@ -580,6 +677,333 @@ void test_scan_pointers_to() {
     }
 }
 
+void test_scan_pointer_chains() {
+    namespace domain = argos::domain;
+    namespace application = argos::application;
+
+    argos::security::SecurityPolicy policy;
+
+    const auto put_ptr64 = [](std::vector<std::byte>& m, std::uint64_t v) {
+        for (std::size_t i = 0; i < 8; ++i) {
+            m.push_back(static_cast<std::byte>((v >> (i * 8U)) & 0xFFU));
+        }
+    };
+    const auto put_ptr32 = [](std::vector<std::byte>& m, std::uint32_t v) {
+        for (std::size_t i = 0; i < 4; ++i) {
+            m.push_back(static_cast<std::byte>((v >> (i * 8U)) & 0xFFU));
+        }
+    };
+
+    constexpr std::uint64_t target8 = 0xAABBCCDDEEFF0011ULL;
+
+    const auto make_service = [](
+        std::vector<std::byte> memory,
+        std::vector<domain::ModuleInfo> modules,
+        argos::security::SecurityPolicy pol
+    ) {
+        auto provider = std::make_unique<SingleSessionFakeProvider>(
+            [memory, modules]() -> std::unique_ptr<domain::ProcessSession> {
+                return std::make_unique<FakeSession>(memory, modules);
+            }
+        );
+        return application::MemoryDebugService{std::move(provider), pol};
+    };
+
+    // Case A: two-hop chain (8-byte).
+    {
+        std::vector<std::byte> memory;
+        for (std::size_t i = 0; i < 8U; ++i) memory.push_back(std::byte{0x00});  // filler at 0x1000
+        put_ptr64(memory, 0x1010U);   // X_2 slot at 0x1008 -> 0x1010
+        put_ptr64(memory, target8);   // X_1 slot at 0x1010 -> target
+
+        std::vector<domain::ModuleInfo> modules{
+            domain::ModuleInfo{"game.exe", "C:\\game.exe", 0x1000U, 0x10U}
+        };
+
+        auto service = make_service(memory, modules, policy);
+        auto attached = service.attach(42U, domain::AccessMode::read_only, true);
+        check(attached.has_value(), "scan_pointer_chains case A attaches fake process");
+        if (attached) {
+            auto result = service.scan_pointer_chains(
+                attached->id, target8, 8U, 8U, 16U, 4096U, 32U, false
+            );
+            check(result.has_value(), "case A: scan_pointer_chains succeeds");
+            if (result) {
+                check(result->candidates.size() == 1U, "case A: exactly one candidate found");
+                if (result->candidates.size() == 1U) {
+                    const auto& candidate = result->candidates[0];
+                    check(candidate.hop_offsets == std::vector<std::int64_t>{8, 0},
+                          "case A: hop_offsets == {8, 0}");
+                    check(candidate.module_base == 0x1000U, "case A: module_base == 0x1000");
+                    check(candidate.module_name == "game.exe", "case A: module_name == game.exe");
+                    check(candidate.resolved_address == 0x1010U, "case A: resolved_address == 0x1010");
+                }
+                check(!result->truncated, "case A: not truncated");
+            }
+
+            std::array<std::int64_t, 2> offsets{8, 0};
+            auto resolved = service.resolve_pointer_chain(attached->id, 0x1000U, offsets, 8U);
+            check(resolved.has_value() && *resolved == 0x1010U,
+                  "case A: resolve_pointer_chain reproduces level-1 finding");
+        }
+    }
+
+    // Case B: one-hop degenerate (8-byte).
+    {
+        std::vector<std::byte> memory;
+        for (std::size_t i = 0; i < 8U; ++i) memory.push_back(std::byte{0x00});  // filler at 0x1000
+        put_ptr64(memory, target8);  // X_1 slot at 0x1008 -> target
+
+        std::vector<domain::ModuleInfo> modules{
+            domain::ModuleInfo{"game.exe", "C:\\game.exe", 0x1000U, 0x10U}
+        };
+
+        auto service = make_service(memory, modules, policy);
+        auto attached = service.attach(42U, domain::AccessMode::read_only, true);
+        check(attached.has_value(), "scan_pointer_chains case B attaches fake process");
+        if (attached) {
+            auto result = service.scan_pointer_chains(
+                attached->id, target8, 8U, 8U, 16U, 4096U, 32U, false
+            );
+            check(result.has_value(), "case B: scan_pointer_chains succeeds");
+            if (result) {
+                check(result->candidates.size() == 1U, "case B: exactly one candidate found");
+                if (result->candidates.size() == 1U) {
+                    const auto& candidate = result->candidates[0];
+                    check(candidate.hop_offsets == std::vector<std::int64_t>{8},
+                          "case B: hop_offsets == {8}");
+                    check(candidate.resolved_address == 0x1008U, "case B: resolved_address == 0x1008");
+                }
+                check(!result->truncated, "case B: not truncated");
+            }
+        }
+    }
+
+    // Case C: target already inside a module (short-circuit).
+    {
+        std::vector<std::byte> memory(16U, std::byte{0x00});
+        std::vector<domain::ModuleInfo> modules{
+            domain::ModuleInfo{"game.exe", "C:\\game.exe", 0x1000U, 0x10U}
+        };
+
+        auto service = make_service(memory, modules, policy);
+        auto attached = service.attach(42U, domain::AccessMode::read_only, true);
+        check(attached.has_value(), "scan_pointer_chains case C attaches fake process");
+        if (attached) {
+            auto result = service.scan_pointer_chains(
+                attached->id, 0x1008U, 8U, 8U, 16U, 4096U, 32U, false
+            );
+            check(result.has_value(), "case C: scan_pointer_chains succeeds");
+            if (result) {
+                check(result->candidates.empty(), "case C: no candidates when target already in module");
+                check(result->bytes_scanned == 0U, "case C: bytes_scanned == 0");
+                check(!result->truncated, "case C: not truncated");
+            }
+        }
+    }
+
+    // Case D: invalid pointer_size.
+    {
+        std::vector<std::byte> memory(16U, std::byte{0x00});
+        std::vector<domain::ModuleInfo> modules{
+            domain::ModuleInfo{"game.exe", "C:\\game.exe", 0x1000U, 0x10U}
+        };
+        auto service = make_service(memory, modules, policy);
+        auto attached = service.attach(42U, domain::AccessMode::read_only, true);
+        check(attached.has_value(), "scan_pointer_chains case D attaches fake process");
+        if (attached) {
+            auto result = service.scan_pointer_chains(
+                attached->id, target8, 6U, 8U, 16U, 4096U, 32U, false
+            );
+            check(!result.has_value() && result.error().code == domain::DebugErrorCode::invalid_argument,
+                  "case D: invalid pointer_size rejected");
+        }
+    }
+
+    // Case E: zero target.
+    {
+        std::vector<std::byte> memory(16U, std::byte{0x00});
+        std::vector<domain::ModuleInfo> modules{
+            domain::ModuleInfo{"game.exe", "C:\\game.exe", 0x1000U, 0x10U}
+        };
+        auto service = make_service(memory, modules, policy);
+        auto attached = service.attach(42U, domain::AccessMode::read_only, true);
+        check(attached.has_value(), "scan_pointer_chains case E attaches fake process");
+        if (attached) {
+            auto result = service.scan_pointer_chains(
+                attached->id, 0U, 8U, 8U, 16U, 4096U, 32U, false
+            );
+            check(!result.has_value() && result.error().code == domain::DebugErrorCode::invalid_argument,
+                  "case E: zero target rejected");
+        }
+    }
+
+    // Case F: limit rejections (depth cap 8, fanout cap 16) using the case A fixture.
+    {
+        std::vector<std::byte> memory;
+        for (std::size_t i = 0; i < 8U; ++i) memory.push_back(std::byte{0x00});
+        put_ptr64(memory, 0x1010U);
+        put_ptr64(memory, target8);
+
+        std::vector<domain::ModuleInfo> modules{
+            domain::ModuleInfo{"game.exe", "C:\\game.exe", 0x1000U, 0x10U}
+        };
+
+        auto service = make_service(memory, modules, policy);
+        auto attached = service.attach(42U, domain::AccessMode::read_only, true);
+        check(attached.has_value(), "scan_pointer_chains case F attaches fake process");
+        if (attached) {
+            auto zero_depth = service.scan_pointer_chains(
+                attached->id, target8, 8U, 0U, 16U, 4096U, 32U, false
+            );
+            check(!zero_depth.has_value() && zero_depth.error().code == domain::DebugErrorCode::limit_exceeded,
+                  "case F: max_depth == 0 rejected");
+
+            auto too_deep = service.scan_pointer_chains(
+                attached->id, target8, 8U, 9U, 16U, 4096U, 32U, false
+            );
+            check(!too_deep.has_value() && too_deep.error().code == domain::DebugErrorCode::limit_exceeded,
+                  "case F: max_depth above cap rejected");
+
+            auto zero_fanout = service.scan_pointer_chains(
+                attached->id, target8, 8U, 8U, 0U, 4096U, 32U, false
+            );
+            check(!zero_fanout.has_value() && zero_fanout.error().code == domain::DebugErrorCode::limit_exceeded,
+                  "case F: max_fanout == 0 rejected");
+
+            auto too_wide = service.scan_pointer_chains(
+                attached->id, target8, 8U, 8U, 17U, 4096U, 32U, false
+            );
+            check(!too_wide.has_value() && too_wide.error().code == domain::DebugErrorCode::limit_exceeded,
+                  "case F: max_fanout above cap rejected");
+        }
+    }
+
+    // Case G: max_depth too shallow -> empty candidates, truncated == true.
+    {
+        std::vector<std::byte> memory;
+        for (std::size_t i = 0; i < 8U; ++i) memory.push_back(std::byte{0x00});
+        put_ptr64(memory, 0x1010U);
+        put_ptr64(memory, target8);
+
+        std::vector<domain::ModuleInfo> modules{
+            domain::ModuleInfo{"game.exe", "C:\\game.exe", 0x1000U, 0x10U}
+        };
+
+        auto service = make_service(memory, modules, policy);
+        auto attached = service.attach(42U, domain::AccessMode::read_only, true);
+        check(attached.has_value(), "scan_pointer_chains case G attaches fake process");
+        if (attached) {
+            auto result = service.scan_pointer_chains(
+                attached->id, target8, 8U, 1U, 16U, 4096U, 32U, false
+            );
+            check(result.has_value(), "case G: scan_pointer_chains succeeds");
+            if (result) {
+                check(result->candidates.empty(), "case G: no candidates when depth exhausted too shallow");
+                check(result->truncated, "case G: truncated == true when depth exhausted");
+            }
+        }
+    }
+
+    // Case H: tiny byte_budget -> truncated mid-BFS.
+    {
+        std::vector<std::byte> memory;
+        for (std::size_t i = 0; i < 8U; ++i) memory.push_back(std::byte{0x00});
+        put_ptr64(memory, 0x1010U);
+        put_ptr64(memory, target8);
+
+        std::vector<domain::ModuleInfo> modules{
+            domain::ModuleInfo{"game.exe", "C:\\game.exe", 0x1000U, 0x10U}
+        };
+
+        auto service = make_service(memory, modules, policy);
+        auto attached = service.attach(42U, domain::AccessMode::read_only, true);
+        check(attached.has_value(), "scan_pointer_chains case H attaches fake process");
+        if (attached) {
+            auto result = service.scan_pointer_chains(
+                attached->id, target8, 8U, 8U, 16U, 1U, 32U, false
+            );
+            check(result.has_value(), "case H: scan_pointer_chains succeeds");
+            if (result) {
+                check(result->candidates.empty(), "case H: no candidates with tiny byte_budget");
+                check(result->truncated, "case H: truncated == true with tiny byte_budget");
+                check(result->bytes_scanned <= 1U, "case H: bytes_scanned bounded by byte_budget");
+            }
+        }
+    }
+
+    // Case I: four-byte pointer variant.
+    {
+        std::vector<std::byte> memory;
+        for (std::size_t i = 0; i < 4U; ++i) memory.push_back(std::byte{0x00});  // filler at 0x1000
+        put_ptr32(memory, 0x1008U);         // X_2 slot at 0x1004 -> 0x1008
+        put_ptr32(memory, 0xCAFEBABEU);     // X_1 slot at 0x1008 -> target
+
+        std::vector<domain::ModuleInfo> modules{
+            domain::ModuleInfo{"game.exe", "C:\\game.exe", 0x1000U, 0x8U}
+        };
+
+        auto service = make_service(memory, modules, policy);
+        auto attached = service.attach(42U, domain::AccessMode::read_only, true);
+        check(attached.has_value(), "scan_pointer_chains case I attaches fake process");
+        if (attached) {
+            auto result = service.scan_pointer_chains(
+                attached->id, 0xCAFEBABEULL, 4U, 8U, 16U, 4096U, 32U, false
+            );
+            check(result.has_value(), "case I: scan_pointer_chains succeeds");
+            if (result) {
+                check(result->candidates.size() == 1U, "case I: exactly one candidate found");
+                if (result->candidates.size() == 1U) {
+                    const auto& candidate = result->candidates[0];
+                    check(candidate.hop_offsets == std::vector<std::int64_t>{4, 0},
+                          "case I: hop_offsets == {4, 0}");
+                    check(candidate.resolved_address == 0x1008U, "case I: resolved_address == 0x1008");
+                    check(candidate.module_base == 0x1000U, "case I: module_base == 0x1000");
+                }
+            }
+            auto too_wide_target = service.scan_pointer_chains(
+                attached->id, 0x1'0000'0000ULL, 4U, 8U, 16U, 4096U, 32U, false
+            );
+            check(!too_wide_target.has_value() &&
+                      too_wide_target.error().code == domain::DebugErrorCode::invalid_argument,
+                  "case I: a target wider than a 32-bit pointer is rejected");
+        }
+    }
+
+    // Case J: a branching frontier is scanned once per depth, not once per
+    // frontier item. Two heap slots point to the target; two module slots point
+    // to those heap slots. A 48-byte region therefore costs exactly two sweeps.
+    {
+        std::vector<std::byte> memory;
+        put_ptr64(memory, 0x1020U);  // module + 0x0 -> heap slot A
+        put_ptr64(memory, 0x1028U);  // module + 0x8 -> heap slot B
+        put_ptr64(memory, 0U);
+        put_ptr64(memory, 0U);
+        put_ptr64(memory, target8);  // heap slot A -> target
+        put_ptr64(memory, target8);  // heap slot B -> target
+
+        std::vector<domain::ModuleInfo> modules{
+            domain::ModuleInfo{"game.exe", "C:\\game.exe", 0x1000U, 0x10U}
+        };
+        auto service = make_service(memory, modules, policy);
+        auto attached = service.attach(42U, domain::AccessMode::read_only, true);
+        check(attached.has_value(), "scan_pointer_chains case J attaches fake process");
+        if (attached) {
+            auto result = service.scan_pointer_chains(
+                attached->id, target8, 8U, 8U, 16U, 4096U, 32U, false
+            );
+            check(result.has_value(), "case J: branching pointer-chain scan succeeds");
+            if (result) {
+                check(result->candidates.size() == 2U,
+                      "case J: both stable module anchors are returned");
+                check(result->bytes_scanned == 96U,
+                      "case J: the 48-byte address space is read once for each of two depths");
+                check(!result->truncated, "case J: a fully covered branching scan is not truncated");
+            }
+        }
+    }
+}
+
 void test_scan_sessions() {
     namespace domain = argos::domain;
     namespace application = argos::application;
@@ -617,7 +1041,7 @@ void test_scan_sessions() {
             attached->id, domain::ScanValueType::i32, domain::ScanComparison::unknown,
             std::nullopt, std::nullopt, 4096U, 256U, false
         );
-        check(first.has_value() && first->candidate_count == 4U, "scan_first(unknown) captures all aligned candidates");
+        check(first.has_value() && first->info.candidate_count == 4U, "scan_first(unknown) captures all aligned candidates");
         if (!first) return;
 
         (*memory)[0] = encode_i32(90)[0]; (*memory)[1] = encode_i32(90)[1];
@@ -627,21 +1051,21 @@ void test_scan_sessions() {
         auto slot3_new = encode_i32(250);
         std::copy(slot3_new.begin(), slot3_new.end(), memory->begin() + 12);
 
-        auto decreased = service.scan_next(first->id, domain::ScanComparison::decreased, std::nullopt, std::nullopt);
+        auto decreased = service.scan_next(first->info.id, domain::ScanComparison::decreased, std::nullopt, std::nullopt);
         check(decreased.has_value() && decreased->candidate_count == 2U,
               "scan_next(decreased) keeps only candidates whose value went down");
 
-        auto results = service.scan_results(first->id, 0U, 50U);
+        auto results = service.scan_results(first->info.id, 0U, 50U);
         check(results.has_value() && results->size() == 2U, "scan_results returns the surviving candidates");
 
-        auto reset = service.scan_reset(first->id);
+        auto reset = service.scan_reset(first->info.id);
         check(reset.has_value(), "scan_reset succeeds");
-        auto after_reset = service.scan_results(first->id, 0U, 50U);
+        auto after_reset = service.scan_results(first->info.id, 0U, 50U);
         check(after_reset.has_value() && after_reset->empty(), "scan_reset clears candidates");
 
         auto detach_result = service.detach(attached->id);
         check(detach_result.has_value(), "debug session detaches");
-        auto after_detach = service.scan_results(first->id, 0U, 50U);
+        auto after_detach = service.scan_results(first->info.id, 0U, 50U);
         check(!after_detach.has_value() && after_detach.error().code == domain::DebugErrorCode::not_found,
               "scan sessions do not survive detach of the owning session");
     }
@@ -657,17 +1081,17 @@ void test_scan_sessions() {
             attached->id, domain::ScanValueType::i32, domain::ScanComparison::exact,
             encode_i32(200), std::nullopt, 4096U, 256U, false
         );
-        check(exact.has_value() && exact->candidate_count == 1U, "scan_first(exact) finds the single matching candidate");
+        check(exact.has_value() && exact->info.candidate_count == 1U, "scan_first(exact) finds the single matching candidate");
 
         auto in_range = service.scan_first(
             attached->id, domain::ScanValueType::i32, domain::ScanComparison::in_range,
             std::nullopt, std::pair{encode_i32(60), encode_i32(250)}, 4096U, 256U, false
         );
-        check(in_range.has_value() && in_range->candidate_count == 2U,
+        check(in_range.has_value() && in_range->info.candidate_count == 2U,
               "scan_first(in_range) keeps only candidates within [low, high]");
         if (in_range) {
             auto unsupported_in_range_next = service.scan_next(
-                in_range->id, domain::ScanComparison::in_range, std::nullopt, std::nullopt
+                in_range->info.id, domain::ScanComparison::in_range, std::nullopt, std::nullopt
             );
             check(!unsupported_in_range_next.has_value() &&
                       unsupported_in_range_next.error().code == domain::DebugErrorCode::invalid_argument,
@@ -681,6 +1105,32 @@ void test_scan_sessions() {
         check(!missing_value.has_value() &&
                   missing_value.error().code == domain::DebugErrorCode::invalid_argument,
               "scan_first(exact) requires a value");
+    }
+    {
+        // Start one byte into the region so a naturally aligned i32 straddles
+        // the reusable 64 KiB chunk boundary. This guards the optimized
+        // aligned-step loop and its cross-chunk carry handling.
+        constexpr std::size_t chunk_size = 64U * 1024U;
+        auto memory = std::make_shared<std::vector<std::byte>>(chunk_size + 16U, std::byte{0});
+        const auto needle = encode_i32(0x12345678);
+        std::copy(needle.begin(), needle.end(), memory->begin() + static_cast<std::ptrdiff_t>(chunk_size));
+
+        argos::security::SecurityPolicy policy;
+        auto service = make_service(memory, policy);
+        auto attached = service.attach(42U, domain::AccessMode::read_only, true);
+        check(attached.has_value(), "cross-chunk scan fixture attaches fake process");
+        if (!attached) return;
+
+        auto exact = service.scan_first(
+            attached->id, domain::ScanValueType::i32, domain::ScanComparison::exact,
+            needle, std::nullopt, memory->size() - 1U, 256U, false,
+            domain::Address{0x1001U}
+        );
+        check(exact.has_value() && exact->info.candidate_count == 1U,
+              "scan_first preserves a naturally aligned match spanning two reused chunks");
+        if (exact) {
+            check(exact->coverage.complete(), "cross-chunk scan reports complete coverage");
+        }
     }
     {
         auto memory = make_memory();
@@ -701,10 +1151,78 @@ void test_scan_sessions() {
         std::copy(slot2_new.begin(), slot2_new.end(), memory->begin() + 8);
 
         auto increased_by = service.scan_next(
-            first->id, domain::ScanComparison::increased_by, std::nullopt, encode_i32(30)
+            first->info.id, domain::ScanComparison::increased_by, std::nullopt, encode_i32(30)
         );
         check(increased_by.has_value() && increased_by->candidate_count == 1U,
               "scan_next(increased_by) matches only the candidate that increased by exactly delta");
+    }
+    {
+        const auto exercise_signed_wrap = [&make_service](
+            const domain::ScanValueType value_type,
+            const std::vector<std::byte>& maximum,
+            const std::vector<std::byte>& minimum,
+            const std::vector<std::byte>& one
+        ) -> std::pair<bool, bool> {
+            auto memory = std::make_shared<std::vector<std::byte>>(maximum);
+            argos::security::SecurityPolicy policy;
+            auto service = make_service(memory, policy);
+            auto attached = service.attach(42U, domain::AccessMode::read_only, true);
+            if (!attached) return {false, false};
+
+            auto first = service.scan_first(
+                attached->id, value_type, domain::ScanComparison::unknown,
+                std::nullopt, std::nullopt, 4096U, 256U, false
+            );
+            if (!first || first->info.candidate_count != 1U) return {false, false};
+
+            *memory = minimum;
+            auto increased = service.scan_next(
+                first->info.id, domain::ScanComparison::increased_by, std::nullopt, one
+            );
+            if (!increased || increased->candidate_count != 1U) return {false, false};
+
+            *memory = maximum;
+            auto decreased = service.scan_next(
+                first->info.id, domain::ScanComparison::decreased_by, std::nullopt, one
+            );
+            return {true, decreased.has_value() && decreased->candidate_count == 1U};
+        };
+
+        const auto i8_wrap = exercise_signed_wrap(
+            domain::ScanValueType::i8,
+            encode_signed(std::numeric_limits<std::int8_t>::max()),
+            encode_signed(std::numeric_limits<std::int8_t>::min()),
+            encode_signed<std::int8_t>(1)
+        );
+        check(i8_wrap.first && i8_wrap.second,
+              "signed i8 delta comparisons wrap at extrema without undefined behavior");
+
+        const auto i16_wrap = exercise_signed_wrap(
+            domain::ScanValueType::i16,
+            encode_signed(std::numeric_limits<std::int16_t>::max()),
+            encode_signed(std::numeric_limits<std::int16_t>::min()),
+            encode_signed<std::int16_t>(1)
+        );
+        check(i16_wrap.first && i16_wrap.second,
+              "signed i16 delta comparisons wrap at extrema without undefined behavior");
+
+        const auto i32_wrap = exercise_signed_wrap(
+            domain::ScanValueType::i32,
+            encode_signed(std::numeric_limits<std::int32_t>::max()),
+            encode_signed(std::numeric_limits<std::int32_t>::min()),
+            encode_signed<std::int32_t>(1)
+        );
+        check(i32_wrap.first && i32_wrap.second,
+              "signed i32 delta comparisons wrap at extrema without undefined behavior");
+
+        const auto i64_wrap = exercise_signed_wrap(
+            domain::ScanValueType::i64,
+            encode_signed(std::numeric_limits<std::int64_t>::max()),
+            encode_signed(std::numeric_limits<std::int64_t>::min()),
+            encode_signed<std::int64_t>(1)
+        );
+        check(i64_wrap.first && i64_wrap.second,
+              "signed i64 delta comparisons wrap at extrema without undefined behavior");
     }
     {
         auto memory = make_memory();
@@ -719,7 +1237,7 @@ void test_scan_sessions() {
             attached->id, domain::ScanValueType::i32, domain::ScanComparison::unknown,
             std::nullopt, std::nullopt, 4096U, 2U, false
         );
-        check(first.has_value() && first->candidate_count == 2U,
+        check(first.has_value() && first->info.candidate_count == 2U,
               "scan_first stops accumulating candidates at the configured limit");
     }
     {
@@ -743,6 +1261,214 @@ void test_scan_sessions() {
         check(!second.has_value() && second.error().code == domain::DebugErrorCode::limit_exceeded,
               "a second scan session beyond the per-session limit is rejected");
     }
+}
+
+void test_scan_session_snapshot_cow() {
+    namespace application = argos::application;
+    namespace domain = argos::domain;
+
+    auto owner = domain::SessionId::create("cow-owner");
+    check(owner.has_value(), "COW scan-session test creates an owner id");
+    if (!owner) return;
+
+    application::ScanSessionManager manager;
+    std::vector<application::ScanCandidate> candidates;
+    const auto first_value = encode_i32(10);
+    const auto second_value = encode_i32(20);
+    candidates.emplace_back(0x1000U, std::span<const std::byte>{first_value});
+    candidates.emplace_back(0x1004U, std::span<const std::byte>{second_value});
+    const auto* const original_data = candidates.data();
+
+    auto created = manager.create(*owner, domain::ScanValueType::i32, std::move(candidates), 4U);
+    check(created.has_value(), "COW scan-session test creates a session");
+    if (!created) return;
+
+    auto first_snapshot = manager.snapshot(created->id);
+    auto second_snapshot = manager.snapshot(created->id);
+    check(first_snapshot.has_value() && second_snapshot.has_value(),
+          "scan-session snapshots are available");
+    if (!first_snapshot || !second_snapshot) return;
+
+    check(first_snapshot->candidates().data() == original_data,
+          "scan-session create moves the candidate vector without a deep copy");
+    check(second_snapshot->candidates().data() == first_snapshot->candidates().data(),
+          "multiple snapshots share the same immutable candidate generation");
+
+    std::atomic<bool> reader_started{false};
+    std::atomic<bool> release_reader{false};
+    std::atomic<bool> snapshot_stable{true};
+    std::jthread reader([&] {
+        reader_started.store(true, std::memory_order_release);
+        while (!release_reader.load(std::memory_order_acquire)) {
+            const auto observed = first_snapshot->candidates();
+            if (observed.size() != 2U || observed[0].address != 0x1000U) {
+                snapshot_stable.store(false, std::memory_order_relaxed);
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    std::vector<application::ScanCandidate> replacement;
+    const auto replacement_value = encode_i32(30);
+    replacement.emplace_back(0x2000U, std::span<const std::byte>{replacement_value});
+    const auto* const replacement_data = replacement.data();
+    while (!reader_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    auto replaced = manager.replace(created->id, *first_snapshot, std::move(replacement));
+    release_reader.store(true, std::memory_order_release);
+    reader.join();
+
+    check(replaced.has_value() && replaced->generation == 1U,
+          "replacing a current scan snapshot publishes the next generation");
+    check(snapshot_stable.load(std::memory_order_relaxed),
+          "a reader keeps a stable old generation while replacement runs concurrently");
+    check(first_snapshot->candidates().size() == 2U && first_snapshot->candidates()[0].address == 0x1000U,
+          "an old snapshot remains readable after copy-on-write replacement");
+
+    auto current_snapshot = manager.snapshot(created->id);
+    check(current_snapshot.has_value() && current_snapshot->candidates().data() == replacement_data,
+          "replacement moves and publishes its candidate vector without a deep copy");
+    check(current_snapshot.has_value() && current_snapshot->candidates().size() == 1U &&
+              current_snapshot->candidates()[0].address == 0x2000U,
+          "new snapshots observe the replacement generation");
+
+    std::vector<application::ScanCandidate> stale_replacement;
+    stale_replacement.emplace_back(0x3000U, std::span<const std::byte>{replacement_value});
+    auto stale = manager.replace(created->id, *first_snapshot, std::move(stale_replacement));
+    check(!stale.has_value() && stale.error().code == domain::DebugErrorCode::invalid_state,
+          "a stale snapshot cannot overwrite a newer candidate generation");
+
+    manager.remove_owned_by(*owner);
+    auto removed = manager.snapshot(created->id);
+    check(!removed.has_value() && removed.error().code == domain::DebugErrorCode::not_found,
+          "removing an owner removes its scan-session registry entry");
+    check(first_snapshot->candidates().size() == 2U,
+          "a snapshot safely retains candidate lifetime after owner removal");
+}
+
+void test_scan_next_batches_contiguous_candidates() {
+    namespace domain = argos::domain;
+
+    auto memory = std::make_shared<std::vector<std::byte>>();
+    for (const std::int32_t value : {10, 20, 30, 40}) {
+        const auto bytes = encode_i32(value);
+        memory->insert(memory->end(), bytes.begin(), bytes.end());
+    }
+    auto probe = std::make_shared<MutableReadProbe>();
+    auto provider = std::make_unique<SingleSessionFakeProvider>(
+        [memory, probe]() -> std::unique_ptr<domain::ProcessSession> {
+            return std::make_unique<MutableFakeSession>(memory, probe);
+        }
+    );
+    argos::security::SecurityPolicy policy;
+    policy.max_read_bytes = 8U;
+    argos::application::MemoryDebugService service{std::move(provider), policy};
+
+    auto attached = service.attach(42U, domain::AccessMode::read_only, true);
+    check(attached.has_value(), "batched scan_next test attaches fake process");
+    if (!attached) return;
+
+    auto first = service.scan_first(
+        attached->id, domain::ScanValueType::i32, domain::ScanComparison::unknown,
+        std::nullopt, std::nullopt, memory->size(), 16U, false
+    );
+    check(first.has_value() && first->info.candidate_count == 4U,
+          "batched scan_next fixture captures four contiguous candidates");
+    if (!first) return;
+
+    probe->calls.store(0U, std::memory_order_relaxed);
+    auto unchanged = service.scan_next(
+        first->info.id, domain::ScanComparison::unchanged, std::nullopt, std::nullopt
+    );
+    check(unchanged.has_value() && unchanged->candidate_count == 4U,
+          "batched scan_next preserves all unchanged candidates");
+    check(probe->calls.load(std::memory_order_relaxed) == 2U,
+          "scan_next reads contiguous candidates in max_read_bytes-bounded runs");
+
+    probe->calls.store(0U, std::memory_order_relaxed);
+    probe->short_batch_reads.store(true, std::memory_order_relaxed);
+    auto after_short_reads = service.scan_next(
+        first->info.id, domain::ScanComparison::unchanged, std::nullopt, std::nullopt
+    );
+    check(after_short_reads.has_value() && after_short_reads->candidate_count == 4U,
+          "scan_next falls back after short batched reads without losing candidates");
+    check(probe->calls.load(std::memory_order_relaxed) == 4U,
+          "each short two-candidate run falls back only for its unread suffix");
+
+    probe->short_batch_reads.store(false, std::memory_order_relaxed);
+    probe->calls.store(0U, std::memory_order_relaxed);
+    probe->cancel_after_calls.store(1U, std::memory_order_relaxed);
+    auto cancelled = service.scan_next(
+        first->info.id, domain::ScanComparison::unchanged, std::nullopt, std::nullopt,
+        probe->cancellation.get_token()
+    );
+    check(!cancelled.has_value() && cancelled.error().code == domain::DebugErrorCode::cancelled,
+          "scan_next observes cancellation raised while processing a batched run");
+    check(probe->calls.load(std::memory_order_relaxed) == 1U,
+          "cancellation prevents scan_next from issuing the next contiguous run");
+}
+
+void test_read_batch_coalesces_ranges() {
+    namespace application = argos::application;
+    namespace domain = argos::domain;
+
+    auto memory = std::make_shared<std::vector<std::byte>>();
+    for (const std::int32_t value : {10, 20, 30, 40}) {
+        const auto bytes = encode_i32(value);
+        memory->insert(memory->end(), bytes.begin(), bytes.end());
+    }
+    auto probe = std::make_shared<MutableReadProbe>();
+    auto provider = std::make_unique<SingleSessionFakeProvider>(
+        [memory, probe]() -> std::unique_ptr<domain::ProcessSession> {
+            return std::make_unique<MutableFakeSession>(memory, probe);
+        }
+    );
+    argos::security::SecurityPolicy policy;
+    application::MemoryDebugService service{std::move(provider), policy};
+    auto attached = service.attach(42U, domain::AccessMode::read_only, true);
+    check(attached.has_value(), "coalesced read_batch test attaches fake process");
+    if (!attached) return;
+
+    const std::array<application::BatchReadItem, 4> items{{
+        {0x1008U, 4U}, {0x1000U, 4U}, {0x100CU, 4U}, {0x1004U, 4U}
+    }};
+    auto result = service.read_batch(attached->id, items);
+    check(result.has_value() && result->size() == items.size(),
+          "read_batch preserves all results for out-of-order adjacent ranges");
+    check(probe->calls.load(std::memory_order_relaxed) == 1U,
+          "read_batch coalesces four adjacent ranges into one native read");
+    if (result && result->size() == items.size()) {
+        for (std::size_t index = 0; index < items.size(); ++index) {
+            const auto expected_offset = static_cast<std::size_t>(items[index].address - 0x1000U);
+            check((*result)[index].address == items[index].address && (*result)[index].success &&
+                      (*result)[index].bytes == std::vector<std::byte>(
+                          memory->begin() + static_cast<std::ptrdiff_t>(expected_offset),
+                          memory->begin() + static_cast<std::ptrdiff_t>(expected_offset + items[index].size)
+                      ),
+                  "read_batch keeps input order and exact byte slices after coalescing");
+        }
+    }
+
+    probe->calls.store(0U, std::memory_order_relaxed);
+    probe->short_batch_reads.store(true, std::memory_order_relaxed);
+    result = service.read_batch(attached->id, items);
+    check(result.has_value() && std::ranges::all_of(*result, [](const auto& item) { return item.success; }),
+          "read_batch falls back to individual reads after a short coalesced read");
+    check(probe->calls.load(std::memory_order_relaxed) == 5U,
+          "short coalesced read performs one attempted run plus four safe fallbacks");
+
+    probe->short_batch_reads.store(false, std::memory_order_relaxed);
+    probe->oversized_reads.store(true, std::memory_order_relaxed);
+    auto oversized_read = service.read_memory(attached->id, 0x1000U, 4U);
+    check(!oversized_read.has_value() && oversized_read.error().code == domain::DebugErrorCode::io_error,
+          "read_memory rejects a backend count larger than the supplied span");
+    auto oversized_scan = service.scan_first(
+        attached->id, domain::ScanValueType::i32, domain::ScanComparison::unknown,
+        std::nullopt, std::nullopt, memory->size(), 16U, false
+    );
+    check(!oversized_scan.has_value() && oversized_scan.error().code == domain::DebugErrorCode::io_error,
+          "scan_first rejects a backend count larger than its reusable chunk span");
 }
 
 void test_output_ring_buffer() {
@@ -769,6 +1495,62 @@ void test_output_ring_buffer() {
 
     auto read5 = buffer.read(read3.next_position - 3U, 3U);
     check(read5.text.size() == 3U, "max_bytes caps how much text a single read returns");
+
+    buffer.append("0123456789ABCDEF");
+    auto read6 = buffer.read(0U, 100U);
+    check(read6.text == "89ABCDEF" && buffer.retained() == 8U,
+          "an append larger than capacity retains exactly its newest tail");
+
+    argos::infrastructure::OutputRingBuffer wrapped{5U};
+    wrapped.append("ab");
+    wrapped.append("cd");
+    wrapped.append("ef");
+    wrapped.append("gh");
+    check(wrapped.read(0U, 100U).text == "defgh",
+          "multiple wrapped appends preserve FIFO order without shifting storage");
+}
+
+void test_domain_query_helpers() {
+    namespace domain = argos::domain;
+
+    const auto encoded_i32 = domain::encode_scan_value(domain::ScanValueType::i32, " 91293908 ");
+    check(encoded_i32.has_value() && *encoded_i32 == std::vector<std::byte>{
+              std::byte{0xD4}, std::byte{0x08}, std::byte{0x71}, std::byte{0x05}
+          },
+          "decimal scan values are encoded as exact little-endian bytes");
+    check(!domain::encode_scan_value(domain::ScanValueType::u8, "256").has_value(),
+          "decimal encoding rejects integral overflow");
+    check(!domain::encode_scan_value(domain::ScanValueType::u32, "-1").has_value(),
+          "decimal encoding rejects a negative value for an unsigned type");
+    check(!domain::encode_scan_value(domain::ScanValueType::f32, "1e39").has_value(),
+          "decimal encoding rejects values that overflow only after narrowing to f32");
+    check(!domain::encode_scan_value(domain::ScanValueType::f32, "1e-50").has_value(),
+          "decimal encoding rejects values that silently underflow to zero in f32");
+
+    const std::vector<domain::MemoryRegion> regions{
+        {0x1000U, 0x2000U, true, true, false, true, "heap-main"},
+        {0x2000U, 0x2800U, true, false, true, false, "game.exe"},
+        {0x3000U, 0x3400U, false, true, false, true, "heap-guard"}
+    };
+    domain::RegionFilter writable_heap{};
+    writable_heap.writable = true;
+    writable_heap.name_contains = "HEAP";
+    const auto page = domain::filter_regions(regions, writable_heap, 0U, 1U);
+    check(page.total_matched == 2U && page.regions.size() == 1U && page.truncated,
+          "region filtering is case-insensitive, paginated and reports the full match count");
+    const auto out_of_range_page = domain::filter_regions(
+        regions, writable_heap, std::numeric_limits<std::size_t>::max(), 1U
+    );
+    check(out_of_range_page.regions.empty() && !out_of_range_page.truncated,
+          "region pagination handles a maximal offset without arithmetic overflow");
+
+    const auto summary = domain::summarize_address_space(regions);
+    check(summary.region_count == 3U && summary.total_bytes == 0x1C00U,
+          "address-space summary reports total regions and bytes");
+    check(summary.scannable_bytes == 0x1800U && summary.scannable_writable_bytes == 0x1000U,
+          "address-space summary distinguishes readable and writable scan coverage");
+    check(summary.lowest_address == 0x1000U && summary.highest_address == 0x3400U,
+          "address-space summary reports the full address range");
 }
 
 void test_authorize_launch_policy() {
@@ -987,13 +1769,40 @@ void write_u16(std::vector<std::byte>& bytes, const std::size_t offset, const st
     }
 }
 
+class ScopedTestDirectory final {
+public:
+    explicit ScopedTestDirectory(std::filesystem::path path) : path_(std::move(path)) {}
+    ~ScopedTestDirectory() {
+        std::error_code ignored;
+        std::filesystem::remove_all(path_, ignored);
+    }
+
+    ScopedTestDirectory(const ScopedTestDirectory&) = delete;
+    ScopedTestDirectory& operator=(const ScopedTestDirectory&) = delete;
+
+private:
+    std::filesystem::path path_;
+};
+
 void test_unity_il2cpp_metadata() {
-    const auto root = std::filesystem::temp_directory_path() / "argos-unity-metadata-fixture";
-    std::error_code cleanup_error;
-    std::filesystem::remove_all(root, cleanup_error);
-    std::filesystem::create_directories(root, cleanup_error);
-    check(!cleanup_error, "Unity fixture directory is created");
-    if (cleanup_error) return;
+    std::filesystem::path root;
+    std::error_code directory_error;
+    std::random_device entropy;
+    for (std::size_t attempt = 0U; attempt < 32U && root.empty(); ++attempt) {
+        const auto token = (static_cast<std::uint64_t>(entropy()) << 32U) |
+                           static_cast<std::uint64_t>(entropy());
+        auto candidate = std::filesystem::temp_directory_path() /
+                         ("argos-unity-metadata-fixture-" + std::to_string(token));
+        directory_error.clear();
+        if (std::filesystem::create_directory(candidate, directory_error)) {
+            root = std::move(candidate);
+        } else if (directory_error && directory_error != std::errc::file_exists) {
+            break;
+        }
+    }
+    check(!root.empty(), "Unity fixture directory is created");
+    if (root.empty()) return;
+    const ScopedTestDirectory cleanup{root};
 
     const auto module = root / "GameAssembly.dll";
     const auto metadata_path = root / "global-metadata.dat";
@@ -1044,10 +1853,243 @@ void test_unity_il2cpp_metadata() {
     check(!invalid_unreal.has_value() &&
               invalid_unreal.error().code == argos::domain::DebugErrorCode::invalid_argument,
           "Unreal parser rejects non-reflected type names before touching symbols");
-    std::filesystem::remove_all(root, cleanup_error);
 }
 
 }  // namespace
+
+void test_encode_scan_value() {
+    using argos::domain::ScanValueType;
+    using argos::domain::encode_scan_value;
+
+    const auto bytes_of = [](std::initializer_list<int> values) {
+        std::vector<std::byte> out;
+        for (const int value : values) out.push_back(static_cast<std::byte>(value));
+        return out;
+    };
+
+    // The literal that motivated this: 91293908 == 0x057108D4, little-endian.
+    auto credits = encode_scan_value(ScanValueType::i32, "91293908");
+    check(credits.has_value() && *credits == bytes_of({0xD4, 0x08, 0x71, 0x05}),
+          "encode_scan_value encodes i32 decimal as little-endian bytes");
+
+    auto negative = encode_scan_value(ScanValueType::i32, "-2");
+    check(negative.has_value() && *negative == bytes_of({0xFE, 0xFF, 0xFF, 0xFF}),
+          "encode_scan_value encodes negative i32 in two's complement");
+
+    auto byte_max = encode_scan_value(ScanValueType::u8, "255");
+    check(byte_max.has_value() && byte_max->size() == 1U,
+          "encode_scan_value honours the width of the value_type");
+
+    auto overflow = encode_scan_value(ScanValueType::u8, "256");
+    check(!overflow.has_value(), "encode_scan_value rejects values wider than value_type");
+
+    auto signed_overflow = encode_scan_value(ScanValueType::i8, "128");
+    check(!signed_overflow.has_value(), "encode_scan_value rejects signed overflow");
+
+    auto negative_unsigned = encode_scan_value(ScanValueType::u32, "-1");
+    check(!negative_unsigned.has_value(), "encode_scan_value rejects a negative value for an unsigned type");
+
+    auto fractional_integer = encode_scan_value(ScanValueType::i32, "1.5");
+    check(!fractional_integer.has_value(), "encode_scan_value rejects a fractional literal for an integer type");
+
+    auto garbage = encode_scan_value(ScanValueType::i32, "12abc");
+    check(!garbage.has_value(), "encode_scan_value rejects trailing garbage");
+
+    auto empty = encode_scan_value(ScanValueType::i32, "   ");
+    check(!empty.has_value(), "encode_scan_value rejects an empty literal");
+
+    auto single = encode_scan_value(ScanValueType::f32, "1.0");
+    check(single.has_value() && *single == bytes_of({0x00, 0x00, 0x80, 0x3F}),
+          "encode_scan_value encodes f32 1.0 as IEEE-754 little-endian");
+
+    auto padded = encode_scan_value(ScanValueType::i32, "  7 ");
+    check(padded.has_value(), "encode_scan_value tolerates surrounding whitespace");
+}
+
+void test_region_queries() {
+    using argos::domain::MemoryRegion;
+    const std::vector<MemoryRegion> regions{
+        MemoryRegion{0x1000U, 0x2000U, true,  false, false, true,  "heap-ro"},
+        MemoryRegion{0x2000U, 0x6000U, true,  true,  false, true,  "heap-rw"},
+        MemoryRegion{0x6000U, 0x6800U, true,  true,  true,  false, "image-rwx"},
+        MemoryRegion{0x8000U, 0x8100U, false, true,  false, true,  "reserved"}
+    };
+
+    const auto summary = argos::domain::summarize_address_space(regions);
+    check(summary.region_count == 4U, "summarize_address_space counts every region");
+    check(summary.total_bytes == 0x1000U + 0x4000U + 0x800U + 0x100U,
+          "summarize_address_space totals every region size");
+    // Only readable regions can be swept; the unreadable one must not count.
+    check(summary.scannable_bytes == 0x1000U + 0x4000U + 0x800U,
+          "summarize_address_space counts only readable bytes as scannable");
+    check(summary.scannable_writable_bytes == 0x4000U + 0x800U,
+          "summarize_address_space separates readable+writable bytes");
+    check(summary.largest_region_bytes == 0x4000U, "summarize_address_space reports the largest region");
+    check(summary.lowest_address == 0x1000U && summary.highest_address == 0x8100U,
+          "summarize_address_space reports the address span");
+    check(summary.executable_count == 1U && summary.private_count == 3U,
+          "summarize_address_space counts by attribute");
+
+    argos::domain::RegionFilter writable{};
+    writable.writable = true;
+    auto page = argos::domain::filter_regions(regions, writable, 0U, 10U);
+    check(page.total_matched == 3U && page.regions.size() == 3U && !page.truncated,
+          "filter_regions selects by attribute");
+
+    argos::domain::RegionFilter readable_writable{};
+    readable_writable.writable = true;
+    readable_writable.readable = true;
+    page = argos::domain::filter_regions(regions, readable_writable, 0U, 10U);
+    check(page.total_matched == 2U, "filter_regions combines attribute predicates");
+
+    argos::domain::RegionFilter by_size{};
+    by_size.min_size = 0x1000U;
+    page = argos::domain::filter_regions(regions, by_size, 0U, 10U);
+    check(page.total_matched == 2U, "filter_regions applies min_size");
+
+    argos::domain::RegionFilter by_name{};
+    by_name.name_contains = "HEAP";
+    page = argos::domain::filter_regions(regions, by_name, 0U, 10U);
+    check(page.total_matched == 2U, "filter_regions matches name case-insensitively");
+
+    argos::domain::RegionFilter overlap{};
+    overlap.start_address = 0x6000U;
+    page = argos::domain::filter_regions(regions, overlap, 0U, 10U);
+    check(page.total_matched == 2U, "filter_regions keeps regions overlapping start_address");
+
+    // Paging must report the full match count, not just the page size, so the
+    // caller knows whether to ask for more.
+    argos::domain::RegionFilter none{};
+    page = argos::domain::filter_regions(regions, none, 0U, 2U);
+    check(page.total_matched == 4U && page.regions.size() == 2U && page.truncated,
+          "filter_regions reports total_matched beyond the page and flags truncation");
+    page = argos::domain::filter_regions(regions, none, 2U, 2U);
+    check(page.total_matched == 4U && page.regions.size() == 2U && !page.truncated &&
+              page.regions.front().start == 0x6000U,
+          "filter_regions honours offset and clears truncation on the last page");
+    page = argos::domain::filter_regions(regions, none, 99U, 2U);
+    check(page.total_matched == 4U && page.regions.empty(),
+          "filter_regions returns an empty page past the end without losing the total");
+
+    const auto [all_bytes, all_regions] =
+        argos::domain::eligible_scan_bytes(regions, false, std::nullopt, std::nullopt);
+    check(all_bytes == 0x1000U + 0x4000U + 0x800U && all_regions == 3U,
+          "eligible_scan_bytes skips unreadable regions");
+    const auto [rw_bytes, rw_regions] =
+        argos::domain::eligible_scan_bytes(regions, true, std::nullopt, std::nullopt);
+    check(rw_bytes == 0x4000U + 0x800U && rw_regions == 2U,
+          "eligible_scan_bytes honours writable_only");
+    const auto [clamped_bytes, clamped_regions] =
+        argos::domain::eligible_scan_bytes(regions, false, 0x1800U, 0x2400U);
+    check(clamped_bytes == 0x800U + 0x400U && clamped_regions == 2U,
+          "eligible_scan_bytes clamps to the requested address window");
+}
+
+void test_scan_coverage() {
+    argos::domain::ScanCoverage full{};
+    full.bytes_scanned = 1024U;
+    full.bytes_eligible = 1024U;
+    check(full.coverage_ratio() == 1.0 && full.complete(), "full sweep reports ratio 1.0 and complete");
+
+    argos::domain::ScanCoverage partial{};
+    partial.bytes_scanned = 256U;
+    partial.bytes_eligible = 1024U;
+    partial.truncated_by_budget = true;
+    check(partial.coverage_ratio() == 0.25 && !partial.complete(),
+          "budget-truncated sweep reports a fractional ratio and is not complete");
+
+    argos::domain::ScanCoverage empty{};
+    check(empty.coverage_ratio() == 1.0, "an empty address space counts as fully covered");
+
+    // A sweep may read slightly past the pre-computed eligible total when a
+    // chunk straddles the window edge; the ratio must stay clamped at 1.0.
+    argos::domain::ScanCoverage over{};
+    over.bytes_scanned = 2048U;
+    over.bytes_eligible = 1024U;
+    check(over.coverage_ratio() == 1.0, "coverage_ratio never exceeds 1.0");
+
+    // This is the case that made an empty result ambiguous in the field: a
+    // budget smaller than the target silently covered a fraction of it.
+    argos::security::SecurityPolicy policy{};
+    policy.max_scan_bytes = 1024U * 1024U;
+    policy.max_scan_session_candidates = 4096U;
+    policy.max_scan_sessions_per_session = 4U;
+    argos::application::MemoryDebugService service{
+        std::make_unique<FakeProvider>(), policy
+    };
+    auto session = service.attach(42U, argos::domain::AccessMode::read_only, true);
+    check(session.has_value(), "coverage test attaches");
+    if (!session) return;
+
+    const std::array<std::byte, 4> needle{
+        std::byte{0x11}, std::byte{0x22}, std::byte{0x33}, std::byte{0x44}
+    };
+    auto starved = service.scan_first(
+        session->id, argos::domain::ScanValueType::i32, argos::domain::ScanComparison::exact,
+        std::vector<std::byte>(needle.begin(), needle.end()), std::nullopt,
+        4U, 64U, false
+    );
+    check(starved.has_value(), "scan_first with a starved budget still succeeds");
+    if (starved) {
+        check(starved->info.candidate_count == 0U, "starved sweep finds nothing");
+        check(starved->coverage.truncated_by_budget, "starved sweep is flagged as budget-truncated");
+        check(!starved->coverage.complete(), "starved sweep is not complete");
+        check(starved->coverage.coverage_ratio() < 1.0, "starved sweep reports partial coverage");
+        check(starved->coverage.bytes_eligible == 8U, "coverage reports the full eligible size");
+    }
+
+    auto complete = service.scan_first(
+        session->id, argos::domain::ScanValueType::i32, argos::domain::ScanComparison::exact,
+        std::vector<std::byte>(needle.begin(), needle.end()), std::nullopt,
+        1024U, 64U, false
+    );
+    check(complete.has_value(), "scan_first with a sufficient budget succeeds");
+    if (complete) {
+        check(complete->info.candidate_count == 1U, "complete sweep finds the value");
+        check(complete->coverage.complete(), "complete sweep is flagged complete");
+        check(complete->coverage.coverage_ratio() == 1.0, "complete sweep reports full coverage");
+        check(complete->coverage.regions_scanned == 1U, "complete sweep counts the region it swept");
+    }
+}
+
+void test_region_page_service() {
+    argos::security::SecurityPolicy policy{};
+    argos::application::MemoryDebugService service{
+        std::make_unique<FakeProvider>(), policy
+    };
+    auto session = service.attach(42U, argos::domain::AccessMode::read_only, true);
+    check(session.has_value(), "region page test attaches");
+    if (!session) return;
+
+    auto summary = service.address_space_summary(session->id);
+    check(summary.has_value() && summary->region_count == 1U && summary->scannable_bytes == 8U,
+          "address_space_summary aggregates the session regions");
+
+    argos::domain::RegionFilter none{};
+    auto page = service.regions_page(session->id, none, 0U, 10U);
+    check(page.has_value() && page->total_matched == 1U, "regions_page returns matching regions");
+
+    argos::domain::RegionFilter writable{};
+    writable.writable = true;
+    page = service.regions_page(session->id, writable, 0U, 10U);
+    check(page.has_value() && page->total_matched == 0U,
+          "regions_page filters out non-writable regions");
+
+    auto zero_limit = service.regions_page(session->id, none, 0U, 0U);
+    check(!zero_limit.has_value(), "regions_page rejects a zero limit");
+
+    argos::domain::RegionFilter inverted{};
+    inverted.start_address = 0x2000U;
+    inverted.end_address = 0x1000U;
+    auto bad_window = service.regions_page(session->id, inverted, 0U, 10U);
+    check(!bad_window.has_value(), "regions_page rejects an inverted address window");
+
+    argos::domain::RegionFilter bad_size{};
+    bad_size.min_size = 100U;
+    bad_size.max_size = 10U;
+    auto inverted_size = service.regions_page(session->id, bad_size, 0U, 10U);
+    check(!inverted_size.has_value(), "regions_page rejects max_size below min_size");
+}
 
 int main() {
     test_json();
@@ -1055,12 +2097,21 @@ int main() {
     test_memory_service();
     test_pdb_metadata_service();
     test_scan_pointers_to();
+    test_scan_pointer_chains();
     test_scan_sessions();
+    test_scan_session_snapshot_cow();
+    test_scan_next_batches_contiguous_candidates();
+    test_read_batch_coalesces_ranges();
+    test_domain_query_helpers();
     test_output_ring_buffer();
     test_authorize_launch_policy();
     test_launch_and_managed_process();
     test_extract_strings();
     test_unity_il2cpp_metadata();
+    test_encode_scan_value();
+    test_region_queries();
+    test_scan_coverage();
+    test_region_page_service();
     if (failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

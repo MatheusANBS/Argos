@@ -25,7 +25,11 @@ Controles: confirmação explícita, mesmo usuário por padrão, permissões do 
 
 ### Leitura excessiva ou negação de serviço
 
-Controles: limite por leitura, limite de itens em batch, orçamento total de scan, limite de resultados e chunks de 64 KiB.
+Controles: limite por leitura, limite de itens em batch, orçamento total de scan, limite de resultados e chunks de 64 KiB. `scan_pointer_chains` reutiliza o mesmo orçamento de bytes compartilhado e adiciona tetos de profundidade e fan-out (`ARGOS_MCP_MAX_POINTER_CHAIN_DEPTH`/`ARGOS_MCP_MAX_POINTER_CHAIN_FANOUT`). A fronteira inteira é comparada em uma única passagem por profundidade, limitando o I/O a `O(max_depth)` passagens; `visited` previne ciclos.
+
+`memory_debug.regions` aplica filtro e paginação no servidor, e `memory_debug.address_space_summary` devolve apenas agregados de tamanho e contagem. Ambos **reduzem** o volume trafegado: substituem o despejo integral da lista de regiões — dezenas de milhares de entradas num alvo real — por um recorte ou por um resumo de tamanho constante. Nenhum dos dois expõe conteúdo de memória, apenas metadados de mapeamento que `regions` já expunha.
+
+O bloco `coverage` de `scan_first` reporta apenas contagens de bytes e regiões varridas, sem conteúdo. Ele existe para evitar uma falha de interpretação com consequência prática: sem ele, um resultado vazio por orçamento esgotado é indistinguível de "o valor não existe", o que leva o cliente a repetir varreduras desnecessárias — custo que este mesmo controle de DoS pretende limitar.
 
 ### Escrita acidental
 
@@ -45,7 +49,7 @@ Controles de escopo: não há injection, remote thread, mudança de proteção, 
 
 ### Corrupção do protocolo
 
-Controles: `stdout` reservado, parser rejeita chaves duplicadas e números não finitos, erros JSON-RPC tipados e testes de contrato.
+Controles: `stdout` reservado; cada frame é drenado e rejeitado acima de 8 MiB antes de crescer sem limite; parser limita nesting a 128 e o DOM a 65.536 nós, rejeita chaves duplicadas e nunca serializa números não finitos; erros JSON-RPC são tipados. Cancelamento é linearizado com a conclusão e suprime qualquer resposta tardia com o ID cancelado. Testes de contrato verificam ressincronização após frame excessivo e as duas eras do protocolo.
 
 ### Execução de binário arbitrário escolhido pelo cliente
 

@@ -51,15 +51,20 @@ Reaproveitamento estrutural: o laço de varredura por regiões de
 re-buscar regiões a cada nível. `scan_pattern` vira um invólucro fino —
 comportamento de `scan_exact`/`scan_pointers_to` inalterado.
 
-Custo é limitado por: um único `byte_budget` compartilhado, decrementado
-cumulativamente através de todos os hops (mesmo idioma que `scan_pattern` já
-usa entre regiões/chunks, só elevado um nível), mais dois campos novos com
-teto rígido no `SecurityPolicy`: `max_pointer_chain_depth` (padrão 8, teto
-16, env `ARGOS_MCP_MAX_POINTER_CHAIN_DEPTH`) e `max_pointer_chain_fanout`
-(padrão 16, teto 64, env `ARGOS_MCP_MAX_POINTER_CHAIN_FANOUT`). `max_fanout`
-limita tanto a largura da fronteira por nível quanto os matches por endereço
-varrido, então o custo é `O(max_depth × max_fanout)` chamadas de scan, nunca
-exponencial. Nova checagem `authorize_pointer_chain_scan` reaproveita
+Custo é limitado por um único `byte_budget` compartilhado, decrementado
+cumulativamente através de todos os hops, mais dois campos com teto rígido no
+`SecurityPolicy`: `max_pointer_chain_depth` (padrão 8, teto 16, env
+`ARGOS_MCP_MAX_POINTER_CHAIN_DEPTH`) e `max_pointer_chain_fanout` (padrão 16,
+teto 64, env `ARGOS_MCP_MAX_POINTER_CHAIN_FANOUT`).
+
+A implementação compara cada ponteiro lido contra **toda a fronteira atual em
+uma única passagem por profundidade** (`scan_pointer_frontier_over_regions`).
+Assim, uma fronteira de N itens não relê o processo N vezes: o limite é
+`O(max_depth)` passagens de memória, com lookup médio O(1) no conjunto de
+destinos. O orçamento restante é repartido entre as profundidades ainda
+possíveis, impedindo que o primeiro hop consuma sozinho todo o orçamento sem
+nem tentar os seguintes. `max_fanout` limita a largura produzida por cada
+passagem. A checagem `authorize_pointer_chain_scan` continua reaproveitando
 `authorize_scan` internamente.
 
 ## Consequências
@@ -68,6 +73,8 @@ exponencial. Nova checagem `authorize_pointer_chain_scan` reaproveita
   de código/DLL, sem hooking; apenas generalização do scan reverso existente;
 - reaproveita 100% do motor de varredura e limites já revisados;
 - proteção contra ciclos via conjunto `visited`;
+- uma passagem multi-alvo por profundidade, em vez de uma passagem por item da
+  fronteira;
 - `truncated=true` cobre: orçamento esgotado, `result_limit` atingido cedo,
   fronteira/matches limitados por `max_fanout`, ou `max_depth` atingido com
   fronteira ainda não vazia;

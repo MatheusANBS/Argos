@@ -28,7 +28,7 @@ tarefa "encontrar classes e offsets" muito mais lenta do que deveria:
 
 Este roadmap define, em ordem de implementação recomendada, as specs e ADRs
 que fecham essas lacunas. Cada item individual continua sujeito à sequência
-obrigatória do `CLAUDE.md` (ADR → contrato → implementação → testes →
+obrigatória do `AGENTS.md` (ADR → contrato → implementação → testes →
 compilação com warnings elevados → sanitizers → revisão de segurança →
 documentação) e às skills `.skills/cpp-*` aplicáveis.
 
@@ -68,5 +68,5 @@ revisão de segurança dedicada e, por padrão, deve permanecer desligado.
 - Escrita habilitada por padrão, bypass de proteção, injeção de código,
   criação de thread remota, ocultação de processo/handle ou captura de
   credenciais continuam proibidos, sem exceção, para todos os itens acima
-  (ver `CLAUDE.md`).
+  (ver `AGENTS.md`).
 - Suporte a macOS não é alterado por nenhuma destas specs.

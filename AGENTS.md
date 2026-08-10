@@ -1,6 +1,6 @@
 # Argos Runtime Memory MCP — regras para agentes
 
-Antes de alterar código C++, leia as skills locais aplicáveis em `.codex/skills/<skill>/SKILL.md`.
+Antes de alterar código C++, leia as skills locais aplicáveis em `.skills/<skill>/SKILL.md`.
 
 Para qualquer alteração neste repositório, são obrigatórias:
 

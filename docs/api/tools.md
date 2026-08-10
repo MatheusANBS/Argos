@@ -6,14 +6,26 @@
 - Bytes entram e saem em hexadecimal sem prefixo obrigatório.
 - Toda resposta de tool contém `ok` e `data` ou `error`.
 - Erros de execução são retornados com `isError: true`, sem expor mensagens nativas sensíveis.
+- Tool inexistente ou requisição MCP estruturalmente inválida retorna erro JSON-RPC `-32602`; cada definição anuncia `outputSchema` para o envelope estruturado `ok`/`data`/`error`.
 
 ## Fluxo recomendado
 
 1. `memory_debug.process_list`
 2. `memory_debug.attach`
-3. `memory_debug.regions` e/ou `memory_debug.modules`
-4. `memory_debug.read`, `read_typed`, `read_batch`, `scan_exact` ou `resolve_pointer_chain`
-5. `memory_debug.detach`
+3. `memory_debug.address_space_summary` para dimensionar o alvo antes de varrer
+4. `memory_debug.regions` (com filtro) e/ou `memory_debug.modules`
+5. `memory_debug.read`, `read_typed`, `read_batch`, `scan_exact`, `scan_pointer_chains` ou `resolve_pointer_chain`
+6. `memory_debug.detach`
+
+## Operações básicas
+
+- `memory_debug.process_list`: lista processos com filtro/limite e informa se pertencem ao mesmo usuário;
+- `memory_debug.sessions`: lista apenas as sessões abertas por esta instância;
+- `memory_debug.modules`: lista módulos/mapeamentos carregados da sessão;
+- `memory_debug.read`: lê um intervalo limitado e devolve bytes hexadecimais;
+- `memory_debug.read_batch`: preserva a ordem de até 256 itens e coalesce intervalos adjacentes ou sobrepostos; em falha/short-read de uma run, repete os itens individualmente para preservar a semântica;
+- `memory_debug.read_typed`: decodifica inteiros, floats e UTF-8 little-endian;
+- `memory_debug.resolve_pointer_chain`: soma cada offset não final antes de dereferenciar um ponteiro de 32/64 bits; o último offset produz o endereço final.
 
 ## Exemplo de attach
 
@@ -24,6 +36,56 @@
     "pid": 12345,
     "access": "read_only",
     "authorized": true
+  }
+}
+```
+
+## Dimensionar o espaço de endereçamento
+
+`memory_debug.address_space_summary` devolve totais e contagens agregadas por classe de região numa resposta pequena e de tamanho constante, qualquer que seja o alvo. Use antes de qualquer scan para saber quanto há para varrer e escolher `byte_budget` com base em fato, não em palpite.
+
+`scannable_bytes` conta apenas regiões legíveis; `scannable_writable_bytes` conta legíveis **e** graváveis — são exatamente os dois totais que um scan com e sem `writable_only` percorreria.
+
+```json
+{"name": "memory_debug.address_space_summary", "arguments": {"session_id": "..."}}
+```
+
+```json
+{
+  "ok": true,
+  "data": {
+    "region_count": 25561,
+    "total_bytes": 140737488355328,
+    "scannable_bytes": 3484033024,
+    "scannable_writable_bytes": 3484033024,
+    "largest_region_bytes": 268435456,
+    "lowest_address": "0x10000",
+    "highest_address": "0x7FFB06494000"
+  }
+}
+```
+
+## Regiões com filtro e paginação
+
+`memory_debug.regions` aceita filtros aplicados **no servidor** e paginação. Um alvo real tem dezenas de milhares de regiões, e a lista completa não é transportável — filtre ou pagine sempre.
+
+Filtros: `readable`, `writable`, `executable`, `private` (booleanos tri-estado — ausente significa "não filtrar por este atributo", que é diferente de `false`), `start_address`/`end_address` (mantém regiões que se sobrepõem à faixa), `min_size`/`max_size` e `name_contains` (substring, case-insensitive). Paginação: `offset` e `limit` (padrão 512).
+
+A resposta traz `total_matched` com o número total de regiões que casaram — não apenas as devolvidas — para que o cliente saiba se precisa pedir mais páginas.
+
+```json
+{"name": "memory_debug.regions", "arguments": {"session_id": "...", "writable": true, "readable": true, "min_size": 65536, "limit": 100}}
+```
+
+```json
+{
+  "ok": true,
+  "data": {
+    "regions": [{"start": "0x1AD10490000", "end": "0x1AD10500000", "readable": true, "writable": true, "executable": false, "private": true, "name": "", "size": 458752}],
+    "total_matched": 1832,
+    "offset": 0,
+    "returned": 100,
+    "truncated": true
   }
 }
 ```
@@ -66,16 +128,90 @@ result = p2 + o2
 }
 ```
 
+## Scan de cadeia de ponteiros
+
+`memory_debug.scan_pointer_chains` generaliza `scan_pointers_to` para múltiplos níveis: faz uma BFS reversa ("quem aponta para X", depois "quem aponta para quem aponta para X", ...) reutilizando o mesmo motor de varredura, nível a nível, até um hit cair dentro do range estático de um módulo carregado. Use quando o endereço de partida é um valor dinâmico (heap/stack, muda a cada execução) e você precisa de uma cadeia estável (`module + offset estático + hops`) que sobrevive a reinícios, em vez de repetir `scan_pointers_to` manualmente e checar módulo a módulo.
+
+Cada candidato devolve `hop_offsets` já prontos para `resolve_pointer_chain`: todos os hops não-finais valem `0` (o passo descoberto é literalmente o ponteiro achado no nível anterior, sem ajuste aritmético) e só o primeiro elemento é um offset estático real (`X_d - module_base`).
+
+Fluxo após reinício: chamar `memory_debug.modules` para pegar a base fresca do módulo, depois `resolve_pointer_chain(base_fresca, hop_offsets, pointer_size)` para obter o endereço fresco, e por fim mais um `read`/`read_typed` (um deref extra) para chegar ao valor vivo. Se `target_address` já está dentro de um módulo, a busca nem entra na BFS e `candidates` volta vazio (curto-circuito).
+
+Limites dedicados: `ARGOS_MCP_MAX_POINTER_CHAIN_DEPTH` (profundidade máxima da BFS) e `ARGOS_MCP_MAX_POINTER_CHAIN_FANOUT` (largura máxima por nível), além do `byte_budget`/`result_limit` já usados por `scan_exact`. Cada nível compara os ponteiros lidos com toda a fronteira numa única passagem; aumentar o fan-out não multiplica as leituras do processo.
+
+```json
+{"name": "memory_debug.scan_pointer_chains", "arguments": {"session_id": "...", "target_address": "0x1F2A3B4C0010", "pointer_size": "8", "max_depth": 6, "max_fanout": 16}}
+```
+
+```json
+{
+  "ok": true,
+  "data": {
+    "candidates": [
+      {
+        "module": "Game.exe",
+        "module_base": "0x7FF7F4000000",
+        "hop_offsets": [81936, 0],
+        "resolved_address": "0x1F2A3B4C1000"
+      }
+    ],
+    "bytes_scanned": 13631488,
+    "truncated": false
+  }
+}
+```
+
 ## Scan incremental (first scan / next scan)
 
 Quando não há PDB, RTTI ou valor já conhecido, `memory_debug.scan_first` e `memory_debug.scan_next` implementam a técnica clássica de scan incremental para localizar o offset de um campo dinâmico (vida, posição, score) observando como o valor muda entre leituras sucessivas.
 
-1. `memory_debug.scan_first` varre o intervalo pedido para um `value_type` (`u8`..`u64`, `i8`..`i64`, `f32`, `f64`) usando `comparison: "unknown"` (captura todos os valores), `"exact"` (requer `value` em hex) ou `"in_range"` (requer `range_low`/`range_high` em hex). Devolve `scan_id`, `candidate_count` e `generation: 0`.
-2. `memory_debug.scan_next` relê **apenas os endereços já candidatos** (nunca o intervalo inteiro de novo) e filtra por `comparison`: `changed`, `unchanged`, `increased`, `decreased`, `increased_by`/`decreased_by` (requer `delta` em hex) ou `exact` (requer `value`). `in_range` não é suportado em `scan_next` — a chamada não tem parâmetro de faixa; use `scan_first` novamente se precisar de uma nova faixa.
-3. `memory_debug.scan_results` pagina os endereços candidatos atuais (`offset`/`limit`).
+1. `memory_debug.scan_first` varre o intervalo pedido para um `value_type` (`u8`..`u64`, `i8`..`i64`, `f32`, `f64`) usando `comparison: "unknown"` (captura todos os valores), `"exact"` (requer `value`/`value_decimal`) ou `"in_range"` (requer os dois extremos em hex ou decimal). Devolve `scan_id`, `candidate_count`, `generation: 0` e `coverage`.
+2. `memory_debug.scan_next` relê **apenas os endereços já candidatos**, em runs contíguas limitadas, e filtra por `comparison`: `changed`, `unchanged`, `increased`, `decreased`, `increased_by`/`decreased_by` (requer `delta` ou `delta_decimal`) ou `exact` (requer `value` ou `value_decimal`). `in_range` não é suportado em `scan_next` — use `scan_first` para uma nova faixa.
+3. `memory_debug.scan_results` pagina os endereços do mesmo snapshot imutável (`offset`/`limit`) e devolve também `total`, `returned`, `truncated`, `generation`, `value_type` e a sessão dona.
 4. `memory_debug.scan_reset` zera os candidatos sem precisar de novo `attach`/`detach`.
 
 Scan sessions morrem junto com o `detach` da sessão de depuração dona. Limites: `ARGOS_MCP_MAX_SCAN_SESSION_CANDIDATES` (candidatos retidos por scan session) e `ARGOS_MCP_MAX_SCAN_SESSIONS_PER_SESSION` (scan sessions simultâneas por sessão de depuração).
+
+### Valor em decimal
+
+`value`, `delta`, `range_low` e `range_high` aceitam a forma `..._decimal`, em que o servidor codifica o literal decimal em little-endian na largura de `value_type`. Em `scan_next`, o tipo vem da própria scan session. `{"value_decimal": "91293908"}` equivale a `{"value": "d4087105"}` para `i32`. Passar as duas formas do mesmo campo é erro. Estouro de largura, sinal incompatível com tipo sem sinal e literal fracionário para tipo inteiro são rejeitados em vez de truncados.
+
+### Cobertura do scan
+
+`scan_first` devolve `coverage` junto com a scan session. Sem isso, `candidate_count: 0` é ambíguo: pode significar "o valor não está na memória" ou "o orçamento acabou antes de chegar nele".
+
+| Campo | Significado |
+|---|---|
+| `bytes_scanned` | Bytes efetivamente lidos nesta varredura |
+| `bytes_eligible` | Bytes que a varredura percorreria com cobertura total, aplicando as mesmas regras de elegibilidade (`writable_only`, `start_address`/`end_address`) |
+| `regions_scanned` / `regions_eligible` | Idem, em número de regiões |
+| `coverage_ratio` | `bytes_scanned / bytes_eligible`, limitado a 1.0 |
+| `truncated_by_budget` | O `byte_budget` foi o fator limitante |
+| `truncated_by_result_limit` | O `result_limit` encheu antes do fim da varredura |
+| `complete` | Varreu tudo que era elegível e não foi interrompida |
+
+**Só trate um conjunto vazio de candidatos como conclusivo quando `complete` for `true`.** `coverage_ratio` abaixo de 1.0 com ambos os `truncated_*` em `false` indica que alguma região elegível falhou na leitura — a varredura foi parcial mesmo sem estourar limite algum.
+
+```json
+{
+  "ok": true,
+  "data": {
+    "scan_id": "...",
+    "value_type": "i32",
+    "candidate_count": 0,
+    "generation": 0,
+    "coverage": {
+      "bytes_scanned": 268435456,
+      "bytes_eligible": 3484033024,
+      "regions_scanned": 1204,
+      "regions_eligible": 18292,
+      "coverage_ratio": 0.077,
+      "truncated_by_budget": true,
+      "truncated_by_result_limit": false,
+      "complete": false
+    }
+  }
+}
+```
 
 ```json
 {"name": "memory_debug.scan_first", "arguments": {"session_id": "...", "value_type": "i32", "comparison": "unknown", "byte_budget": 33554432, "result_limit": 262144, "writable_only": true}}
@@ -108,6 +244,13 @@ Scan sessions morrem junto com o `detach` da sessão de depuração dona. Limite
 
 ## Escrita
 
+`memory_debug.write` permanece desligada por padrão. Requisitos cumulativos:
+
+1. servidor iniciado com `ARGOS_MCP_ALLOW_WRITE=1`;
+2. attach com `access: "read_write"`;
+3. chamada com `confirmation: "AUTHORIZED_DEBUG_WRITE"`;
+4. tamanho dentro de `ARGOS_MCP_MAX_WRITE_BYTES`.
+
 ## Tipo via PDB
 
 `memory_debug.pdb_type` recebe `session_id`, `module`, `type` e opcionalmente
@@ -132,13 +275,6 @@ layout nativo enriquecido.
 `StaticStruct` e seus RVAs relativos. Nenhuma dessas tools injeta ou executa
 codigo no processo alvo.
 
-Requisitos cumulativos:
-
-1. servidor iniciado com `ARGOS_MCP_ALLOW_WRITE=1`;
-2. attach com `access: "read_write"`;
-3. chamada com `confirmation: "AUTHORIZED_DEBUG_WRITE"`;
-4. tamanho dentro de `ARGOS_MCP_MAX_WRITE_BYTES`.
-
 ## Histórico
 
 As tools `memory_debug.strings`, `memory_debug.scan_pointers_to`,
@@ -146,4 +282,14 @@ As tools `memory_debug.strings`, `memory_debug.scan_pointers_to`,
 `scan_results`/`scan_reset` e `memory_debug.launch`/`read_output` foram
 especificadas em
 [`docs/specs/0000-roadmap-introspeccao-runtime.md`](../specs/0000-roadmap-introspeccao-runtime.md)
-e estão implementadas (ver seções acima).
+e estão implementadas (ver seções acima). `memory_debug.scan_pointer_chains`
+foi especificada em
+[`docs/specs/0006-pointer-chain-scan.md`](../specs/0006-pointer-chain-scan.md)
+e também está implementada.
+
+A fase 1 de
+[`docs/specs/0007-roadmap-eficiencia-agente.md`](../specs/0007-roadmap-eficiencia-agente.md)
+está implementada: cobertura em `scan_first` (A3), filtro e paginação em
+`memory_debug.regions` (B1), `memory_debug.address_space_summary` (B2) e valor
+em decimal (F1). São extensões de contrato dentro de ADR-0009; não houve
+mudança na superfície de autorização nem novo gate de ambiente.

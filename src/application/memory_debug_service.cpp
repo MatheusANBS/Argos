@@ -5,6 +5,8 @@
 #include <bit>
 #include <cstring>
 #include <limits>
+#include <type_traits>
+#include <unordered_set>
 #include <utility>
 
 namespace argos::application {
@@ -39,6 +41,24 @@ namespace {
         value |= byte_value << (index * 8U);
     }
     return value;
+}
+
+template <typename UInt>
+[[nodiscard]] bool matches_modular_integer_delta(
+    const std::uint64_t old_raw,
+    const std::uint64_t new_raw,
+    const std::uint64_t delta_raw,
+    const bool increase
+) noexcept {
+    static_assert(std::is_unsigned_v<UInt>);
+    const auto old_value = static_cast<UInt>(old_raw);
+    const auto delta_value = static_cast<UInt>(delta_raw);
+    const auto expected = static_cast<UInt>(
+        increase
+            ? static_cast<std::uint64_t>(old_value) + static_cast<std::uint64_t>(delta_value)
+            : static_cast<std::uint64_t>(old_value) - static_cast<std::uint64_t>(delta_value)
+    );
+    return expected == static_cast<UInt>(new_raw);
 }
 
 enum class Ordering { less, equal, greater };
@@ -101,51 +121,21 @@ enum class Ordering { less, equal, greater };
     const auto new_raw = decode_pointer(new_bytes);
     const auto delta_raw = decode_pointer(delta_bytes);
     switch (type) {
-    case domain::ScanValueType::u8: {
-        const auto o = static_cast<std::uint8_t>(old_raw);
-        const auto d = static_cast<std::uint8_t>(delta_raw);
-        const auto n = static_cast<std::uint8_t>(new_raw);
-        return static_cast<std::uint8_t>(increase ? o + d : o - d) == n;
-    }
-    case domain::ScanValueType::u16: {
-        const auto o = static_cast<std::uint16_t>(old_raw);
-        const auto d = static_cast<std::uint16_t>(delta_raw);
-        const auto n = static_cast<std::uint16_t>(new_raw);
-        return static_cast<std::uint16_t>(increase ? o + d : o - d) == n;
-    }
-    case domain::ScanValueType::u32: {
-        const auto o = static_cast<std::uint32_t>(old_raw);
-        const auto d = static_cast<std::uint32_t>(delta_raw);
-        const auto n = static_cast<std::uint32_t>(new_raw);
-        return static_cast<std::uint32_t>(increase ? o + d : o - d) == n;
-    }
-    case domain::ScanValueType::u64: {
-        return (increase ? old_raw + delta_raw : old_raw - delta_raw) == new_raw;
-    }
-    case domain::ScanValueType::i8: {
-        const auto o = static_cast<std::int8_t>(static_cast<std::uint8_t>(old_raw));
-        const auto d = static_cast<std::int8_t>(static_cast<std::uint8_t>(delta_raw));
-        const auto n = static_cast<std::int8_t>(static_cast<std::uint8_t>(new_raw));
-        return static_cast<std::int8_t>(increase ? o + d : o - d) == n;
-    }
-    case domain::ScanValueType::i16: {
-        const auto o = static_cast<std::int16_t>(static_cast<std::uint16_t>(old_raw));
-        const auto d = static_cast<std::int16_t>(static_cast<std::uint16_t>(delta_raw));
-        const auto n = static_cast<std::int16_t>(static_cast<std::uint16_t>(new_raw));
-        return static_cast<std::int16_t>(increase ? o + d : o - d) == n;
-    }
-    case domain::ScanValueType::i32: {
-        const auto o = static_cast<std::int32_t>(static_cast<std::uint32_t>(old_raw));
-        const auto d = static_cast<std::int32_t>(static_cast<std::uint32_t>(delta_raw));
-        const auto n = static_cast<std::int32_t>(static_cast<std::uint32_t>(new_raw));
-        return static_cast<std::int32_t>(increase ? o + d : o - d) == n;
-    }
-    case domain::ScanValueType::i64: {
-        const auto o = static_cast<std::int64_t>(old_raw);
-        const auto d = static_cast<std::int64_t>(delta_raw);
-        const auto n = static_cast<std::int64_t>(new_raw);
-        return (increase ? o + d : o - d) == n;
-    }
+    // Delta comparisons use the stored N-bit representation. Unsigned
+    // arithmetic makes the intended two's-complement modulo-2^N behavior
+    // explicit for both signed and unsigned scan types, including extrema.
+    case domain::ScanValueType::u8:
+    case domain::ScanValueType::i8:
+        return matches_modular_integer_delta<std::uint8_t>(old_raw, new_raw, delta_raw, increase);
+    case domain::ScanValueType::u16:
+    case domain::ScanValueType::i16:
+        return matches_modular_integer_delta<std::uint16_t>(old_raw, new_raw, delta_raw, increase);
+    case domain::ScanValueType::u32:
+    case domain::ScanValueType::i32:
+        return matches_modular_integer_delta<std::uint32_t>(old_raw, new_raw, delta_raw, increase);
+    case domain::ScanValueType::u64:
+    case domain::ScanValueType::i64:
+        return matches_modular_integer_delta<std::uint64_t>(old_raw, new_raw, delta_raw, increase);
     case domain::ScanValueType::f32: {
         const auto o = std::bit_cast<float>(static_cast<std::uint32_t>(old_raw));
         const auto d = std::bit_cast<float>(static_cast<std::uint32_t>(delta_raw));
@@ -160,6 +150,200 @@ enum class Ordering { less, equal, greater };
     }
     }
     return false;
+}
+
+[[nodiscard]] domain::Result<ScanResult> scan_pattern_over_regions(
+    const domain::ProcessSession& session,
+    const std::span<const domain::MemoryRegion> regions,
+    const std::span<const std::byte> pattern,
+    const std::size_t alignment,
+    const std::size_t byte_budget,
+    const std::size_t result_limit,
+    const bool writable_only,
+    const std::optional<domain::Address> start_address,
+    const std::optional<domain::Address> end_address,
+    const std::stop_token cancellation
+) {
+    constexpr std::size_t chunk_size = 64U * 1024U;
+    ScanResult result;
+    result.matches.reserve(result_limit);
+    std::array<std::byte, chunk_size> chunk{};
+    std::vector<std::byte> buffer;
+    buffer.reserve(chunk_size + pattern.size());
+    std::vector<std::byte> carry;
+    carry.reserve(pattern.size() - 1U);
+
+    for (const auto& region : regions) {
+        if (cancellation.stop_requested()) {
+            return std::unexpected(error(domain::DebugErrorCode::cancelled, "operation cancelled"));
+        }
+        if (!region.readable || (writable_only && !region.writable) || region.size() == 0U) {
+            continue;
+        }
+        const domain::Address scan_start = std::max(region.start, start_address.value_or(region.start));
+        const domain::Address scan_end = std::min(region.end, end_address.value_or(region.end));
+        if (scan_end <= scan_start) {
+            continue;
+        }
+        domain::Address cursor = scan_start;
+        carry.clear();
+        while (cursor < scan_end && result.bytes_scanned < byte_budget) {
+            if (cancellation.stop_requested()) {
+                return std::unexpected(error(domain::DebugErrorCode::cancelled, "operation cancelled"));
+            }
+            const auto remaining_region = scan_end - cursor;
+            const auto remaining_budget = byte_budget - result.bytes_scanned;
+            const auto request_u64 = std::min<std::uint64_t>(
+                {remaining_region, static_cast<std::uint64_t>(remaining_budget), static_cast<std::uint64_t>(chunk_size)}
+            );
+            const auto request = static_cast<std::size_t>(request_u64);
+            if (request == 0U) {
+                break;
+            }
+            auto read = session.read(cursor, std::span<std::byte>{chunk}.first(request));
+            if (!read || *read == 0U) {
+                break;
+            }
+            if (*read > request) {
+                return std::unexpected(error(domain::DebugErrorCode::io_error, "memory backend returned an oversized read"));
+            }
+            result.bytes_scanned += *read;
+
+            buffer.clear();
+            buffer.insert(buffer.end(), carry.begin(), carry.end());
+            buffer.insert(buffer.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
+            const domain::Address buffer_base = cursor - static_cast<domain::Address>(carry.size());
+
+            if (buffer.size() >= pattern.size()) {
+                const auto misalignment = static_cast<std::size_t>(buffer_base & (alignment - 1U));
+                std::size_t index = (alignment - misalignment) & (alignment - 1U);
+                for (; index + pattern.size() <= buffer.size(); index += alignment) {
+                    const domain::Address candidate = buffer_base + static_cast<domain::Address>(index);
+                    if (std::equal(pattern.begin(), pattern.end(), buffer.begin() + static_cast<std::ptrdiff_t>(index))) {
+                        result.matches.push_back(domain::ScanMatch{candidate});
+                        if (result.matches.size() >= result_limit) {
+                            result.truncated = true;
+                            return result;
+                        }
+                    }
+                }
+            }
+
+            const std::size_t carry_size = std::min(pattern.size() - 1U, buffer.size());
+            carry.assign(buffer.end() - static_cast<std::ptrdiff_t>(carry_size), buffer.end());
+            cursor += static_cast<domain::Address>(*read);
+        }
+        if (result.bytes_scanned >= byte_budget) {
+            result.truncated = true;
+            break;
+        }
+    }
+    return result;
+}
+
+// Reverse-pointer BFS needs to find references to every address in the current
+// frontier. Scanning once per address multiplies process I/O by fanout and can
+// consume the entire shared budget before the second hop. This variant decodes
+// each aligned pointer once and tests it against the whole frontier.
+[[nodiscard]] domain::Result<ScanResult> scan_pointer_frontier_over_regions(
+    const domain::ProcessSession& session,
+    const std::span<const domain::MemoryRegion> regions,
+    const std::span<const domain::Address> frontier,
+    const std::size_t pointer_size,
+    const std::size_t byte_budget,
+    const std::size_t result_limit,
+    const bool writable_only,
+    const std::optional<domain::Address> start_address,
+    const std::optional<domain::Address> end_address,
+    const std::stop_token cancellation
+) {
+    constexpr std::size_t chunk_size = 64U * 1024U;
+    std::unordered_set<domain::Address> targets;
+    targets.reserve(frontier.size());
+    for (const auto address : frontier) {
+        if (pointer_size == 8U || address <= std::numeric_limits<std::uint32_t>::max()) {
+            targets.insert(address);
+        }
+    }
+
+    ScanResult result;
+    if (targets.empty()) {
+        return result;
+    }
+
+    std::array<std::byte, chunk_size> chunk{};
+    std::vector<std::byte> buffer;
+    buffer.reserve(chunk_size + pointer_size - 1U);
+    std::vector<std::byte> carry;
+    carry.reserve(pointer_size - 1U);
+
+    for (const auto& region : regions) {
+        if (cancellation.stop_requested()) {
+            return std::unexpected(error(domain::DebugErrorCode::cancelled, "operation cancelled"));
+        }
+        if (!region.readable || (writable_only && !region.writable) || region.size() == 0U) {
+            continue;
+        }
+        const domain::Address scan_start = std::max(region.start, start_address.value_or(region.start));
+        const domain::Address scan_end = std::min(region.end, end_address.value_or(region.end));
+        if (scan_end <= scan_start) {
+            continue;
+        }
+
+        domain::Address cursor = scan_start;
+        carry.clear();
+        while (cursor < scan_end && result.bytes_scanned < byte_budget) {
+            if (cancellation.stop_requested()) {
+                return std::unexpected(error(domain::DebugErrorCode::cancelled, "operation cancelled"));
+            }
+            const auto request_u64 = std::min<std::uint64_t>({
+                scan_end - cursor,
+                static_cast<std::uint64_t>(byte_budget - result.bytes_scanned),
+                static_cast<std::uint64_t>(chunk_size)
+            });
+            const auto request = static_cast<std::size_t>(request_u64);
+            if (request == 0U) {
+                break;
+            }
+            auto read = session.read(cursor, std::span<std::byte>{chunk}.first(request));
+            if (!read || *read == 0U) {
+                break;
+            }
+            if (*read > request) {
+                return std::unexpected(error(domain::DebugErrorCode::io_error, "memory backend returned an oversized read"));
+            }
+            result.bytes_scanned += *read;
+
+            buffer.clear();
+            buffer.insert(buffer.end(), carry.begin(), carry.end());
+            buffer.insert(buffer.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
+            const domain::Address buffer_base = cursor - static_cast<domain::Address>(carry.size());
+            const auto misalignment = static_cast<std::size_t>(buffer_base & (pointer_size - 1U));
+            std::size_t index = (pointer_size - misalignment) & (pointer_size - 1U);
+            for (; index + pointer_size <= buffer.size(); index += pointer_size) {
+                const std::span<const std::byte> encoded{buffer.data() + index, pointer_size};
+                if (!targets.contains(decode_pointer(encoded))) {
+                    continue;
+                }
+                result.matches.push_back(domain::ScanMatch{
+                    buffer_base + static_cast<domain::Address>(index)
+                });
+                if (result.matches.size() >= result_limit) {
+                    result.truncated = true;
+                    return result;
+                }
+            }
+
+            const auto carry_size = std::min(pointer_size - 1U, buffer.size());
+            carry.assign(buffer.end() - static_cast<std::ptrdiff_t>(carry_size), buffer.end());
+            cursor += static_cast<domain::Address>(*read);
+        }
+        if (result.bytes_scanned >= byte_budget) {
+            result.truncated = true;
+            break;
+        }
+    }
+    return result;
 }
 
 }  // namespace
@@ -292,6 +476,52 @@ domain::Result<std::vector<domain::MemoryRegion>> MemoryDebugService::regions(
         return std::unexpected(session.error());
     }
     return (*session)->regions();
+}
+
+domain::Result<domain::RegionPage> MemoryDebugService::regions_page(
+    const domain::SessionId& id,
+    const domain::RegionFilter& filter,
+    const std::size_t offset,
+    const std::size_t limit
+) const {
+    if (limit == 0U || limit > 4096U) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument, "limit must be between 1 and 4096"
+        ));
+    }
+    if (filter.start_address && filter.end_address && *filter.end_address <= *filter.start_address) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument, "end_address must be greater than start_address"
+        ));
+    }
+    if (filter.max_size && *filter.max_size < filter.min_size) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument, "max_size must be greater than or equal to min_size"
+        ));
+    }
+    auto session = sessions_.get(id);
+    if (!session) {
+        return std::unexpected(session.error());
+    }
+    auto all = (*session)->regions();
+    if (!all) {
+        return std::unexpected(all.error());
+    }
+    return domain::filter_regions(*all, filter, offset, limit);
+}
+
+domain::Result<domain::AddressSpaceSummary> MemoryDebugService::address_space_summary(
+    const domain::SessionId& id
+) const {
+    auto session = sessions_.get(id);
+    if (!session) {
+        return std::unexpected(session.error());
+    }
+    auto all = (*session)->regions();
+    if (!all) {
+        return std::unexpected(all.error());
+    }
+    return domain::summarize_address_space(*all);
 }
 
 domain::Result<std::vector<domain::ModuleInfo>> MemoryDebugService::modules(
@@ -428,6 +658,9 @@ domain::Result<std::vector<std::byte>> MemoryDebugService::read_memory(
     if (!read) {
         return std::unexpected(read.error());
     }
+    if (*read > output.size()) {
+        return std::unexpected(error(domain::DebugErrorCode::io_error, "memory backend returned an oversized read"));
+    }
     output.resize(*read);
     return output;
 }
@@ -444,6 +677,9 @@ domain::Result<std::vector<BatchReadResult>> MemoryDebugService::read_batch(
     }
     std::size_t total = 0;
     for (const auto& item : items) {
+        if (item.size == 0U) {
+            return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "batch read size must be positive"));
+        }
         if (item.size > policy_.max_read_bytes - std::min(total, policy_.max_read_bytes)) {
             return std::unexpected(error(domain::DebugErrorCode::limit_exceeded, "batch byte limit exceeded"));
         }
@@ -457,21 +693,99 @@ domain::Result<std::vector<BatchReadResult>> MemoryDebugService::read_batch(
     if (!session) {
         return std::unexpected(session.error());
     }
-    std::vector<BatchReadResult> output;
-    output.reserve(items.size());
-    for (const auto& item : items) {
-        BatchReadResult result;
-        result.address = item.address;
+    std::vector<BatchReadResult> output(items.size());
+    for (std::size_t index = 0; index < items.size(); ++index) {
+        output[index].address = items[index].address;
+    }
+
+    const auto read_one = [&](const std::size_t index) {
+        const auto& item = items[index];
+        auto& result = output[index];
         result.bytes.resize(item.size);
         auto read = (*session)->read(item.address, result.bytes);
         if (read) {
-            result.bytes.resize(*read);
-            result.success = true;
+            if (*read <= item.size) {
+                result.bytes.resize(*read);
+                result.success = true;
+            } else {
+                result.bytes.clear();
+                result.error = "memory backend returned an oversized read";
+            }
         } else {
             result.bytes.clear();
             result.error = read.error().safe_message;
         }
-        output.push_back(std::move(result));
+    };
+
+    std::vector<std::size_t> order(items.size());
+    for (std::size_t index = 0; index < order.size(); ++index) {
+        order[index] = index;
+    }
+    std::ranges::sort(order, [&](const std::size_t left, const std::size_t right) {
+        if (items[left].address != items[right].address) {
+            return items[left].address < items[right].address;
+        }
+        return items[left].size < items[right].size;
+    });
+
+    // Merge only adjacent or overlapping requests. No unrequested gap is read,
+    // output order stays identical to the input, and a failed/short coalesced
+    // read falls back to the previous per-item behavior.
+    std::size_t run_begin = 0U;
+    while (run_begin < order.size()) {
+        const auto first_index = order[run_begin];
+        const auto& first = items[first_index];
+        if (first.size > std::numeric_limits<domain::Address>::max() - first.address) {
+            read_one(first_index);
+            ++run_begin;
+            continue;
+        }
+
+        const domain::Address run_address = first.address;
+        domain::Address run_end_address = first.address + static_cast<domain::Address>(first.size);
+        std::size_t run_end = run_begin + 1U;
+        while (run_end < order.size()) {
+            const auto next_index = order[run_end];
+            const auto& next = items[next_index];
+            if (next.size > std::numeric_limits<domain::Address>::max() - next.address ||
+                next.address > run_end_address) {
+                break;
+            }
+            run_end_address = std::max(
+                run_end_address, next.address + static_cast<domain::Address>(next.size)
+            );
+            ++run_end;
+        }
+
+        if (run_end == run_begin + 1U) {
+            read_one(first_index);
+            run_begin = run_end;
+            continue;
+        }
+
+        const auto run_size = static_cast<std::size_t>(run_end_address - run_address);
+        std::vector<std::byte> run_bytes(run_size);
+        auto read = (*session)->read(run_address, run_bytes);
+        if (!read || *read != run_size) {
+            for (std::size_t position = run_begin; position < run_end; ++position) {
+                read_one(order[position]);
+            }
+            run_begin = run_end;
+            continue;
+        }
+
+        for (std::size_t position = run_begin; position < run_end; ++position) {
+            const auto index = order[position];
+            const auto& item = items[index];
+            auto& result = output[index];
+            const auto offset = static_cast<std::size_t>(item.address - run_address);
+            result.bytes.assign(
+                run_bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                run_bytes.begin() + static_cast<std::ptrdiff_t>(offset + item.size)
+            );
+            result.success = true;
+        }
+        run_begin = run_end;
     }
     return output;
 }
@@ -539,6 +853,11 @@ domain::Result<ScanResult> MemoryDebugService::scan_pointers_to(
     if (target == 0U) {
         return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "target_address must not be zero"));
     }
+    if (pointer_size == 4U && target > std::numeric_limits<std::uint32_t>::max()) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument, "target_address does not fit in a 32-bit pointer"
+        ));
+    }
     std::array<std::byte, 8> pattern_bytes{};
     for (std::size_t index = 0; index < pointer_size; ++index) {
         pattern_bytes[index] = static_cast<std::byte>((target >> (index * 8U)) & 0xFFU);
@@ -578,77 +897,143 @@ domain::Result<ScanResult> MemoryDebugService::scan_pattern(
     if (!region_result) {
         return std::unexpected(region_result.error());
     }
+    return scan_pattern_over_regions(
+        **session, *region_result, pattern, alignment, byte_budget, result_limit, writable_only,
+        start_address, end_address, cancellation
+    );
+}
 
-    constexpr std::size_t chunk_size = 64U * 1024U;
-    ScanResult result;
-    std::vector<std::byte> buffer;
-    buffer.reserve(chunk_size + pattern.size());
+domain::Result<PointerChainScanResult> MemoryDebugService::scan_pointer_chains(
+    const domain::SessionId& id,
+    const domain::Address target,
+    const std::size_t pointer_size,
+    const std::size_t max_depth,
+    const std::size_t max_fanout,
+    const std::size_t byte_budget,
+    const std::size_t result_limit,
+    const bool writable_only,
+    const std::optional<domain::Address> start_address,
+    const std::optional<domain::Address> end_address,
+    const std::stop_token cancellation
+) const {
+    if (pointer_size != 4U && pointer_size != 8U) {
+        return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "pointer_size must be 4 or 8"));
+    }
+    if (target == 0U) {
+        return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "target_address must not be zero"));
+    }
+    if (pointer_size == 4U && target > std::numeric_limits<std::uint32_t>::max()) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument, "target_address does not fit in a 32-bit pointer"
+        ));
+    }
+    if (start_address && end_address && *end_address <= *start_address) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument,
+            "end_address must be greater than start_address"
+        ));
+    }
+    auto authorization = policy_.authorize_pointer_chain_scan(byte_budget, result_limit, max_depth, max_fanout);
+    if (!authorization) {
+        return std::unexpected(authorization.error());
+    }
+    auto session = sessions_.get(id);
+    if (!session) {
+        return std::unexpected(session.error());
+    }
+    auto region_result = (*session)->regions();
+    if (!region_result) {
+        return std::unexpected(region_result.error());
+    }
+    auto module_result = (*session)->modules();
+    if (!module_result) {
+        return std::unexpected(module_result.error());
+    }
 
-    for (const auto& region : *region_result) {
+    const auto find_owning_module = [&module_result](const domain::Address address) -> const domain::ModuleInfo* {
+        const auto module = std::find_if(
+            module_result->begin(), module_result->end(),
+            [address](const domain::ModuleInfo& candidate) {
+                return candidate.size != 0U && candidate.base <= address && address - candidate.base < candidate.size;
+            }
+        );
+        return module == module_result->end() ? nullptr : &(*module);
+    };
+
+    if (find_owning_module(target) != nullptr) {
+        return PointerChainScanResult{};
+    }
+
+    PointerChainScanResult result;
+    std::size_t total_bytes = 0;
+    std::unordered_set<domain::Address> visited{target};
+    std::vector<domain::Address> frontier{target};
+
+    for (std::size_t depth = 1; depth <= max_depth; ++depth) {
         if (cancellation.stop_requested()) {
             return std::unexpected(error(domain::DebugErrorCode::cancelled, "operation cancelled"));
         }
-        if (!region.readable || (writable_only && !region.writable) || region.size() == 0U) {
-            continue;
+        if (frontier.size() > max_fanout) {
+            frontier.resize(max_fanout);
+            result.truncated = true;
         }
-        const domain::Address scan_start = std::max(region.start, start_address.value_or(region.start));
-        const domain::Address scan_end = std::min(region.end, end_address.value_or(region.end));
-        if (scan_end <= scan_start) {
-            continue;
-        }
-        domain::Address cursor = scan_start;
-        std::vector<std::byte> carry;
-        while (cursor < scan_end && result.bytes_scanned < byte_budget) {
-            if (cancellation.stop_requested()) {
-                return std::unexpected(error(domain::DebugErrorCode::cancelled, "operation cancelled"));
-            }
-            const auto remaining_region = scan_end - cursor;
-            const auto remaining_budget = byte_budget - result.bytes_scanned;
-            const auto request_u64 = std::min<std::uint64_t>(
-                {remaining_region, static_cast<std::uint64_t>(remaining_budget), static_cast<std::uint64_t>(chunk_size)}
-            );
-            const auto request = static_cast<std::size_t>(request_u64);
-            if (request == 0U) {
-                break;
-            }
-            std::vector<std::byte> chunk(request);
-            auto read = (*session)->read(cursor, chunk);
-            if (!read || *read == 0U) {
-                break;
-            }
-            chunk.resize(*read);
-            result.bytes_scanned += chunk.size();
-
-            buffer.clear();
-            buffer.insert(buffer.end(), carry.begin(), carry.end());
-            buffer.insert(buffer.end(), chunk.begin(), chunk.end());
-            const domain::Address buffer_base = cursor - static_cast<domain::Address>(carry.size());
-
-            if (buffer.size() >= pattern.size()) {
-                for (std::size_t index = 0; index + pattern.size() <= buffer.size(); ++index) {
-                    const domain::Address candidate = buffer_base + static_cast<domain::Address>(index);
-                    if ((candidate % alignment) != 0U) {
-                        continue;
-                    }
-                    if (std::equal(pattern.begin(), pattern.end(), buffer.begin() + static_cast<std::ptrdiff_t>(index))) {
-                        result.matches.push_back(domain::ScanMatch{candidate});
-                        if (result.matches.size() >= result_limit) {
-                            result.truncated = true;
-                            return result;
-                        }
-                    }
-                }
-            }
-
-            const std::size_t carry_size = std::min(pattern.size() - 1U, buffer.size());
-            carry.assign(buffer.end() - static_cast<std::ptrdiff_t>(carry_size), buffer.end());
-            cursor += static_cast<domain::Address>(chunk.size());
-        }
-        if (result.bytes_scanned >= byte_budget) {
+        if (total_bytes >= byte_budget) {
             result.truncated = true;
             break;
         }
+        const auto remaining_depths = max_depth - depth + 1U;
+        const auto remaining_budget = byte_budget - total_bytes;
+        const auto level_budget = std::max<std::size_t>(1U, remaining_budget / remaining_depths);
+        auto partial = scan_pointer_frontier_over_regions(
+            **session, *region_result, frontier, pointer_size, level_budget, max_fanout,
+            writable_only, start_address, end_address, cancellation
+        );
+        if (!partial) {
+            return std::unexpected(partial.error());
+        }
+        total_bytes += partial->bytes_scanned;
+        result.truncated = result.truncated || partial->truncated;
+
+        std::vector<domain::Address> next_frontier;
+        next_frontier.reserve(partial->matches.size());
+        bool result_limit_reached = false;
+        for (const auto& match : partial->matches) {
+            if (!visited.insert(match.address).second) {
+                continue;
+            }
+            const auto* owning = find_owning_module(match.address);
+            if (owning == nullptr) {
+                next_frontier.push_back(match.address);
+                continue;
+            }
+            std::vector<std::int64_t> hop_offsets(depth, 0);
+            hop_offsets.front() = static_cast<std::int64_t>(match.address - owning->base);
+            auto resolved = resolve_pointer_chain(id, owning->base, hop_offsets, pointer_size);
+            if (!resolved) {
+                continue;
+            }
+            result.candidates.push_back(PointerChainCandidate{
+                owning->name, owning->base, std::move(hop_offsets), *resolved
+            });
+            if (result.candidates.size() >= result_limit) {
+                result.truncated = true;
+                result_limit_reached = true;
+                break;
+            }
+        }
+        if (result_limit_reached) {
+            break;
+        }
+        if (next_frontier.empty()) {
+            break;
+        }
+        if (depth == max_depth && !next_frontier.empty()) {
+            result.truncated = true;
+        }
+        frontier = std::move(next_frontier);
     }
+
+    result.bytes_scanned = total_bytes;
     return result;
 }
 
@@ -737,6 +1122,12 @@ domain::Result<StringScanResult> MemoryDebugService::extract_strings(
     const std::size_t unit = utf16 ? 2U : 1U;
     const std::string encoding_label = utf16 ? "utf16le" : "ascii";
     StringScanResult result;
+    result.matches.reserve(result_limit);
+    std::array<std::byte, chunk_size> chunk{};
+    std::vector<std::byte> buffer;
+    buffer.reserve(chunk_size + unit - 1U);
+    std::vector<std::byte> carry;
+    carry.reserve(unit - 1U);
 
     for (const auto& region : *region_result) {
         if (cancellation.stop_requested()) {
@@ -752,12 +1143,13 @@ domain::Result<StringScanResult> MemoryDebugService::extract_strings(
         }
 
         domain::Address cursor = scan_start;
-        std::vector<std::byte> carry;
+        carry.clear();
 
         bool in_run = false;
         domain::Address run_start = 0;
         std::uint64_t run_length = 0;
         std::string run_text;
+        run_text.reserve(policy_.max_string_result_length);
         bool truncated_by_limit = false;
 
         const auto flush_run = [&]() {
@@ -786,18 +1178,18 @@ domain::Result<StringScanResult> MemoryDebugService::extract_strings(
             if (request == 0U) {
                 break;
             }
-            std::vector<std::byte> chunk(request);
-            auto read = (*session)->read(cursor, chunk);
+            auto read = (*session)->read(cursor, std::span<std::byte>{chunk}.first(request));
             if (!read || *read == 0U) {
                 break;
             }
-            chunk.resize(*read);
-            result.bytes_scanned += chunk.size();
+            if (*read > request) {
+                return std::unexpected(error(domain::DebugErrorCode::io_error, "memory backend returned an oversized read"));
+            }
+            result.bytes_scanned += *read;
 
-            std::vector<std::byte> buffer;
-            buffer.reserve(carry.size() + chunk.size());
+            buffer.clear();
             buffer.insert(buffer.end(), carry.begin(), carry.end());
-            buffer.insert(buffer.end(), chunk.begin(), chunk.end());
+            buffer.insert(buffer.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
             const domain::Address buffer_base = cursor - static_cast<domain::Address>(carry.size());
 
             std::size_t index = 0;
@@ -834,7 +1226,7 @@ domain::Result<StringScanResult> MemoryDebugService::extract_strings(
 
             const std::size_t leftover = buffer.size() - index;
             carry.assign(buffer.end() - static_cast<std::ptrdiff_t>(leftover), buffer.end());
-            cursor += static_cast<domain::Address>(chunk.size());
+            cursor += static_cast<domain::Address>(*read);
         }
         flush_run();
         if (truncated_by_limit) {
@@ -848,7 +1240,7 @@ domain::Result<StringScanResult> MemoryDebugService::extract_strings(
     return result;
 }
 
-domain::Result<domain::ScanSessionInfo> MemoryDebugService::scan_first(
+domain::Result<MemoryDebugService::ScanFirstResult> MemoryDebugService::scan_first(
     const domain::SessionId& id,
     const domain::ScanValueType value_type,
     const domain::ScanComparison comparison,
@@ -868,7 +1260,7 @@ domain::Result<domain::ScanSessionInfo> MemoryDebugService::scan_first(
         ));
     }
     const auto value_size = domain::scan_value_size(value_type);
-    if (value_size == 0U) {
+    if (value_size == 0U || value_size > ScanCandidate::max_value_size) {
         return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "unsupported value_type"));
     }
     if (comparison == domain::ScanComparison::exact && (!value || value->size() != value_size)) {
@@ -906,6 +1298,33 @@ domain::Result<domain::ScanSessionInfo> MemoryDebugService::scan_first(
     std::size_t bytes_scanned = 0;
     bool truncated_by_limit = false;
 
+    // Measured before the sweep so the caller can tell a conclusive empty
+    // result from one that merely exhausted the budget.
+    const auto [bytes_eligible, regions_eligible] =
+        domain::eligible_scan_bytes(*region_result, writable_only, start_address, end_address);
+    const auto bounded_scan_bytes =
+        std::min<std::uint64_t>(bytes_eligible, static_cast<std::uint64_t>(byte_budget));
+    const auto candidates_by_bytes = bounded_scan_bytes == std::numeric_limits<std::uint64_t>::max()
+        ? bounded_scan_bytes
+        : bounded_scan_bytes / value_size + 1U;
+    const auto candidate_upper_bound = std::min<std::uint64_t>(
+        static_cast<std::uint64_t>(result_limit), candidates_by_bytes
+    );
+    const auto reserve_count = comparison == domain::ScanComparison::unknown
+        ? candidate_upper_bound
+        : std::min<std::uint64_t>(candidate_upper_bound, chunk_size / value_size);
+    candidates.reserve(static_cast<std::size_t>(reserve_count));
+
+    // Reuse the scan buffers for the whole sweep. The old implementation
+    // allocated both vectors for every 64 KiB read and tested every byte with
+    // a modulo operation even though only naturally aligned addresses qualify.
+    std::array<std::byte, chunk_size> chunk{};
+    std::vector<std::byte> carry;
+    carry.reserve(value_size - 1U);
+    std::vector<std::byte> buffer;
+    buffer.reserve(chunk_size + value_size - 1U);
+    std::size_t regions_scanned = 0;
+
     for (const auto& region : *region_result) {
         if (truncated_by_limit) {
             break;
@@ -921,8 +1340,12 @@ domain::Result<domain::ScanSessionInfo> MemoryDebugService::scan_first(
         if (scan_end <= scan_start) {
             continue;
         }
+        if (bytes_scanned >= byte_budget) {
+            break;
+        }
+        ++regions_scanned;
         domain::Address cursor = scan_start;
-        std::vector<std::byte> carry;
+        carry.clear();
         while (cursor < scan_end && bytes_scanned < byte_budget && !truncated_by_limit) {
             if (cancellation.stop_requested()) {
                 return std::unexpected(error(domain::DebugErrorCode::cancelled, "operation cancelled"));
@@ -936,26 +1359,27 @@ domain::Result<domain::ScanSessionInfo> MemoryDebugService::scan_first(
             if (request == 0U) {
                 break;
             }
-            std::vector<std::byte> chunk(request);
-            auto read = (*session)->read(cursor, chunk);
+            auto read = (*session)->read(cursor, std::span<std::byte>{chunk.data(), request});
             if (!read || *read == 0U) {
                 break;
             }
-            chunk.resize(*read);
-            bytes_scanned += chunk.size();
+            if (*read > request) {
+                return std::unexpected(error(domain::DebugErrorCode::io_error, "memory backend returned an oversized read"));
+            }
+            bytes_scanned += *read;
 
-            std::vector<std::byte> buffer;
-            buffer.reserve(carry.size() + chunk.size());
+            buffer.clear();
             buffer.insert(buffer.end(), carry.begin(), carry.end());
-            buffer.insert(buffer.end(), chunk.begin(), chunk.end());
+            buffer.insert(buffer.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
             const domain::Address buffer_base = cursor - static_cast<domain::Address>(carry.size());
 
             if (buffer.size() >= value_size) {
-                for (std::size_t index = 0; index + value_size <= buffer.size(); ++index) {
+                const auto alignment_mask = static_cast<domain::Address>(value_size - 1U);
+                std::size_t index = static_cast<std::size_t>(
+                    (static_cast<domain::Address>(value_size) - (buffer_base & alignment_mask)) & alignment_mask
+                );
+                for (; index + value_size <= buffer.size(); index += value_size) {
                     const domain::Address candidate_address = buffer_base + static_cast<domain::Address>(index);
-                    if ((candidate_address % value_size) != 0U) {
-                        continue;
-                    }
                     const std::span<const std::byte> window{buffer.data() + index, value_size};
                     bool matches = false;
                     if (comparison == domain::ScanComparison::unknown) {
@@ -967,9 +1391,7 @@ domain::Result<domain::ScanSessionInfo> MemoryDebugService::scan_first(
                             compare_scan_values(value_type, window, range->second) != Ordering::greater;
                     }
                     if (matches) {
-                        candidates.push_back(ScanCandidate{
-                            candidate_address, std::vector<std::byte>(window.begin(), window.end())
-                        });
+                        candidates.emplace_back(candidate_address, window);
                         if (candidates.size() >= result_limit) {
                             truncated_by_limit = true;
                             break;
@@ -980,11 +1402,29 @@ domain::Result<domain::ScanSessionInfo> MemoryDebugService::scan_first(
 
             const std::size_t carry_size = std::min(value_size - 1U, buffer.size());
             carry.assign(buffer.end() - static_cast<std::ptrdiff_t>(carry_size), buffer.end());
-            cursor += static_cast<domain::Address>(chunk.size());
+            cursor += static_cast<domain::Address>(*read);
         }
     }
 
-    return scan_sessions_.create(id, value_type, std::move(candidates), policy_.max_scan_sessions_per_session);
+    domain::ScanCoverage coverage{};
+    coverage.bytes_scanned = static_cast<std::uint64_t>(bytes_scanned);
+    coverage.bytes_eligible = bytes_eligible;
+    coverage.regions_scanned = regions_scanned;
+    coverage.regions_eligible = regions_eligible;
+    coverage.truncated_by_result_limit = truncated_by_limit;
+    // Only the budget being the binding constraint counts as budget truncation.
+    // A short sweep caused by an unreadable region shows up as a coverage_ratio
+    // below 1.0 instead of as a false budget flag.
+    coverage.truncated_by_budget = bytes_scanned >= byte_budget &&
+        static_cast<std::uint64_t>(bytes_scanned) < bytes_eligible;
+
+    auto info = scan_sessions_.create(
+        id, value_type, std::move(candidates), policy_.max_scan_sessions_per_session
+    );
+    if (!info) {
+        return std::unexpected(info.error());
+    }
+    return ScanFirstResult{std::move(*info), coverage};
 }
 
 domain::Result<domain::ScanSessionInfo> MemoryDebugService::scan_next(
@@ -1004,7 +1444,12 @@ domain::Result<domain::ScanSessionInfo> MemoryDebugService::scan_next(
     if (!snapshot) {
         return std::unexpected(snapshot.error());
     }
-    const auto value_size = domain::scan_value_size(snapshot->value_type);
+    const auto value_type = snapshot->value_type();
+    const auto candidates = snapshot->candidates();
+    const auto value_size = domain::scan_value_size(value_type);
+    if (value_size == 0U || value_size > ScanCandidate::max_value_size) {
+        return std::unexpected(error(domain::DebugErrorCode::invalid_state, "scan session has an unsupported value_type"));
+    }
     if (comparison == domain::ScanComparison::exact && (!value || value->size() != value_size)) {
         return std::unexpected(error(
             domain::DebugErrorCode::invalid_argument, "exact comparison requires a value matching value_type size"
@@ -1018,54 +1463,139 @@ domain::Result<domain::ScanSessionInfo> MemoryDebugService::scan_next(
         ));
     }
 
-    auto session = sessions_.get(snapshot->owner);
+    auto session = sessions_.get(snapshot->owner());
     if (!session) {
         return std::unexpected(session.error());
     }
 
     std::vector<ScanCandidate> survivors;
-    survivors.reserve(snapshot->candidates.size());
-    std::vector<std::byte> buffer(value_size);
-    for (const auto& candidate : snapshot->candidates) {
-        if (cancellation.stop_requested()) {
-            return std::unexpected(error(domain::DebugErrorCode::cancelled, "operation cancelled"));
-        }
-        auto read = (*session)->read(candidate.address, buffer);
-        if (!read || *read != value_size) {
-            continue;
-        }
+    survivors.reserve(candidates.size());
+
+    const auto retain_if_matching = [&](const ScanCandidate& candidate, const std::span<const std::byte> bytes) {
+        const auto previous_value = candidate.value_bytes(value_size);
         bool matches = false;
         switch (comparison) {
         case domain::ScanComparison::exact:
-            matches = std::equal(buffer.begin(), buffer.end(), value->begin());
+            matches = std::equal(bytes.begin(), bytes.end(), value->begin());
             break;
         case domain::ScanComparison::changed:
-            matches = !std::equal(buffer.begin(), buffer.end(), candidate.value.begin());
+            matches = !std::equal(bytes.begin(), bytes.end(), previous_value.begin());
             break;
         case domain::ScanComparison::unchanged:
-            matches = std::equal(buffer.begin(), buffer.end(), candidate.value.begin());
+            matches = std::equal(bytes.begin(), bytes.end(), previous_value.begin());
             break;
         case domain::ScanComparison::increased:
-            matches = compare_scan_values(snapshot->value_type, buffer, candidate.value) == Ordering::greater;
+            matches = compare_scan_values(value_type, bytes, previous_value) == Ordering::greater;
             break;
         case domain::ScanComparison::decreased:
-            matches = compare_scan_values(snapshot->value_type, buffer, candidate.value) == Ordering::less;
+            matches = compare_scan_values(value_type, bytes, previous_value) == Ordering::less;
             break;
         case domain::ScanComparison::increased_by:
-            matches = matches_delta(snapshot->value_type, candidate.value, buffer, *delta, true);
+            matches = matches_delta(value_type, previous_value, bytes, *delta, true);
             break;
         case domain::ScanComparison::decreased_by:
-            matches = matches_delta(snapshot->value_type, candidate.value, buffer, *delta, false);
+            matches = matches_delta(value_type, previous_value, bytes, *delta, false);
             break;
         default:
             break;
         }
         if (matches) {
-            survivors.push_back(ScanCandidate{candidate.address, std::vector<std::byte>(buffer.begin(), buffer.end())});
+            survivors.emplace_back(candidate.address, bytes);
         }
+    };
+
+    // scan_first emits candidates in ascending address order and scan_next
+    // preserves that order. Read strictly contiguous candidates as one bounded
+    // run instead of issuing one native syscall per value. A failed/short run
+    // falls back to individual reads for the unread suffix, preserving the
+    // previous soft-skip behavior for inaccessible candidates.
+    const std::size_t max_candidates_per_run = policy_.max_read_bytes / value_size;
+    std::vector<std::byte> run_buffer;
+    if (max_candidates_per_run > 1U) {
+        run_buffer.reserve(max_candidates_per_run * value_size);
+    }
+    std::array<std::byte, 8> single_buffer{};
+
+    std::size_t run_begin = 0U;
+    while (run_begin < candidates.size()) {
+        if (cancellation.stop_requested()) {
+            return std::unexpected(error(domain::DebugErrorCode::cancelled, "operation cancelled"));
+        }
+
+        std::size_t run_end = run_begin + 1U;
+        while (max_candidates_per_run > 1U && run_end < candidates.size() &&
+               run_end - run_begin < max_candidates_per_run) {
+            const auto previous_address = candidates[run_end - 1U].address;
+            if (previous_address > std::numeric_limits<domain::Address>::max() - value_size ||
+                candidates[run_end].address != previous_address + value_size) {
+                break;
+            }
+            ++run_end;
+        }
+
+        const std::size_t run_count = run_end - run_begin;
+        if (run_count == 1U) {
+            const auto bytes = std::span<std::byte>{single_buffer}.first(value_size);
+            auto read = (*session)->read(candidates[run_begin].address, bytes);
+            if (read && *read > value_size) {
+                return std::unexpected(error(domain::DebugErrorCode::io_error, "memory backend returned an oversized read"));
+            }
+            if (read && *read == value_size) {
+                retain_if_matching(candidates[run_begin], bytes);
+            }
+            run_begin = run_end;
+            continue;
+        }
+
+        const std::size_t run_size = run_count * value_size;
+        run_buffer.resize(run_size);
+        auto run_read = (*session)->read(candidates[run_begin].address, run_buffer);
+        if (run_read && *run_read > run_size) {
+            return std::unexpected(error(domain::DebugErrorCode::io_error, "memory backend returned an oversized read"));
+        }
+        const std::size_t complete_prefix = run_read
+            ? std::min(run_count, *run_read / value_size)
+            : 0U;
+
+        for (std::size_t index = 0U; index < complete_prefix; ++index) {
+            if (cancellation.stop_requested()) {
+                return std::unexpected(error(domain::DebugErrorCode::cancelled, "operation cancelled"));
+            }
+            retain_if_matching(
+                candidates[run_begin + index],
+                std::span<const std::byte>{run_buffer}.subspan(index * value_size, value_size)
+            );
+        }
+
+        if (!run_read || *run_read < run_size) {
+            for (std::size_t index = complete_prefix; index < run_count; ++index) {
+                if (cancellation.stop_requested()) {
+                    return std::unexpected(error(domain::DebugErrorCode::cancelled, "operation cancelled"));
+                }
+                const auto bytes = std::span<std::byte>{single_buffer}.first(value_size);
+                auto read = (*session)->read(candidates[run_begin + index].address, bytes);
+                if (read && *read > value_size) {
+                    return std::unexpected(error(domain::DebugErrorCode::io_error, "memory backend returned an oversized read"));
+                }
+                if (read && *read == value_size) {
+                    retain_if_matching(candidates[run_begin + index], bytes);
+                }
+            }
+        }
+        run_begin = run_end;
     }
 
-    return scan_sessions_.replace(scan_id, std::move(survivors));
+    return scan_sessions_.replace(scan_id, *snapshot, std::move(survivors));
+}
+
+domain::Result<domain::ScanValueType> MemoryDebugService::scan_value_type(
+    const domain::ScanSessionId& scan_id
+) const {
+    auto snapshot = scan_sessions_.snapshot(scan_id);
+    if (!snapshot) {
+        return std::unexpected(snapshot.error());
+    }
+    return snapshot->value_type();
 }
 
 domain::Result<std::vector<domain::ScanMatch>> MemoryDebugService::scan_results(
@@ -1073,10 +1603,47 @@ domain::Result<std::vector<domain::ScanMatch>> MemoryDebugService::scan_results(
     const std::size_t offset,
     const std::size_t limit
 ) const {
+    auto page = scan_results_page(scan_id, offset, limit);
+    if (!page) {
+        return std::unexpected(page.error());
+    }
+    return std::move(page->matches);
+}
+
+domain::Result<ScanResultsPage> MemoryDebugService::scan_results_page(
+    const domain::ScanSessionId& scan_id,
+    const std::size_t offset,
+    const std::size_t limit
+) const {
     if (limit == 0U || limit > 4096U) {
         return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "limit must be between 1 and 4096"));
     }
-    return scan_sessions_.results(scan_id, offset, limit);
+    auto snapshot = scan_sessions_.snapshot(scan_id);
+    if (!snapshot) {
+        return std::unexpected(snapshot.error());
+    }
+    const auto candidates = snapshot->candidates();
+    std::vector<domain::ScanMatch> matches;
+    if (offset < candidates.size()) {
+        const auto count = std::min(limit, candidates.size() - offset);
+        matches.reserve(count);
+        for (std::size_t index = offset; index < offset + count; ++index) {
+            matches.push_back(domain::ScanMatch{candidates[index].address});
+        }
+    }
+    const bool truncated = offset < candidates.size() && matches.size() < candidates.size() - offset;
+    return ScanResultsPage{
+        domain::ScanSessionInfo{
+            scan_id,
+            snapshot->owner(),
+            snapshot->value_type(),
+            candidates.size(),
+            snapshot->generation()
+        },
+        offset,
+        std::move(matches),
+        truncated
+    };
 }
 
 domain::Result<void> MemoryDebugService::scan_reset(const domain::ScanSessionId& scan_id) {

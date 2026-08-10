@@ -140,7 +140,7 @@ acima do limite), `invalid_argument` (path relativo, argv com bytes nulos).
   processo;
 - `argv` é sempre um vetor; a serialização para `CreateProcessW` usa a
   rotina padrão de quoting de argumentos, nunca concatenação livre nem
-  `cmd.exe`/`system()` — atende à restrição do `CLAUDE.md` contra "comandos
+  `cmd.exe`/`system()` — atende à restrição do `AGENTS.md` contra "comandos
   shell montados com entrada externa";
 - pipes de `stdout`/`stderr` do filho nunca são herdados pelo `stdout` do
   MCP (`bInheritHandles` restrito só aos handles de pipe necessários) —

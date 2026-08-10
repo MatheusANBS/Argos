@@ -30,16 +30,18 @@ PDB para completar offsets. `memory_debug.unreal_type` e
 | `memory_debug.attach` | Abre uma sessão explícita para um PID autorizado. |
 | `memory_debug.detach` | Fecha a sessão e libera handles; `terminate: true` encerra sessões criadas por `launch`. |
 | `memory_debug.sessions` | Lista sessões ativas. |
-| `memory_debug.regions` | Lista regiões de memória e permissões. |
+| `memory_debug.regions` | Lista regiões de memória e permissões, com filtro por atributo/tamanho/nome e paginação aplicados no servidor. |
+| `memory_debug.address_space_summary` | Agrega tamanho e contagem do espaço de endereçamento por classe; dimensiona o alvo antes de varrer. |
 | `memory_debug.modules` | Lista módulos carregados/mapeamentos de arquivo. |
 | `memory_debug.pdb_list_types` | Enumera tipos disponíveis no PDB de um módulo carregado. |
 | `memory_debug.read` | Lê bytes limitados e retorna hexadecimal. |
-| `memory_debug.read_batch` | Executa múltiplas leituras limitadas. |
+| `memory_debug.read_batch` | Executa múltiplas leituras limitadas, coalescendo intervalos adjacentes/sobrepostos em uma única leitura nativa. |
 | `memory_debug.read_typed` | Decodifica inteiros, floats e UTF-8 little-endian. |
 | `memory_debug.strings` | Extrai strings ASCII/UTF-16LE legíveis da memória do processo. |
 | `memory_debug.scan_exact` | Busca um padrão exato de bytes com orçamento explícito. |
 | `memory_debug.scan_pointers_to` | Busca ponteiros que referenciam um endereço conhecido. |
-| `memory_debug.scan_first` / `scan_next` / `scan_results` / `scan_reset` | Scan incremental (first scan/next scan) para localizar offsets de campos dinâmicos sem PDB/RTTI. |
+| `memory_debug.scan_pointer_chains` | Descobre cadeias reversas estáveis com uma única passagem multi-alvo por profundidade. |
+| `memory_debug.scan_first` / `scan_next` / `scan_results` / `scan_reset` | Scan incremental (first scan/next scan) para localizar offsets de campos dinâmicos sem PDB/RTTI. `scan_first` e `scan_next` aceitam decimal; cobertura e páginas trazem metadados completos. |
 | `memory_debug.resolve_pointer_chain` | Resolve pointer chains de 32 ou 64 bits. |
 | `memory_debug.write` | Escreve bytes somente quando habilitado e confirmado. |
 | `memory_debug.launch` / `read_output` | Inicia um executável escolhido pelo operador e captura `stdout`/`stderr`. Desligado por padrão (`ARGOS_MCP_ALLOW_LAUNCH`). |
@@ -67,6 +69,10 @@ ctest --preset dev
 ```
 
 Release:
+
+IPO/LTO pode ser testado com `-DARGOS_ENABLE_IPO=ON`, mas permanece desligado
+no preset Release: o benchmark de protocolo em MSVC reduziu o binário em 3,1%,
+porém perdeu 6,4% de throughput em `tools/list`.
 
 ```bash
 cmake --preset release
@@ -168,7 +174,7 @@ Depois disso, o `attach` deve solicitar `access: "read_write"`, e cada chamada d
 
 ## Skills instaladas
 
-As skills C++ estão instaladas no projeto em `.codex/skills/`. O arquivo `AGENTS.md` define quando cada uma é obrigatória. Para copiar o pacote para o diretório global do Codex:
+As skills C++ estão instaladas no projeto em `.skills/`. O arquivo `AGENTS.md` define quando cada uma é obrigatória. Para copiar o pacote para o diretório global do Codex:
 
 ```powershell
 .\tools\install-skills.ps1

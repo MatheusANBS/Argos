@@ -1,6 +1,6 @@
 function(argos_set_warnings target)
     if(MSVC)
-        target_compile_options(${target} PRIVATE /W4 /permissive- /Zc:__cplusplus)
+        target_compile_options(${target} PRIVATE /W4 /permissive- /Zc:__cplusplus /EHsc)
     else()
         target_compile_options(${target} PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow

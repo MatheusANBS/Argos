@@ -82,6 +82,8 @@ SecurityPolicy SecurityPolicy::from_environment() {
         "ARGOS_MCP_MAX_SCAN_SESSION_CANDIDATES", 262144U, 4U * 1024U * 1024U
     );
     policy.max_scan_sessions_per_session = env_size("ARGOS_MCP_MAX_SCAN_SESSIONS_PER_SESSION", 4U, 64U);
+    policy.max_pointer_chain_depth = env_size("ARGOS_MCP_MAX_POINTER_CHAIN_DEPTH", 8U, 16U);
+    policy.max_pointer_chain_fanout = env_size("ARGOS_MCP_MAX_POINTER_CHAIN_FANOUT", 16U, 64U);
     policy.allow_launch = env_flag("ARGOS_MCP_ALLOW_LAUNCH");
     policy.launch_allowed_dirs = env_dir_list("ARGOS_MCP_LAUNCH_ALLOWED_DIRS");
     policy.max_launched_processes = env_size("ARGOS_MCP_MAX_LAUNCHED_PROCESSES", 4U, 64U);
@@ -162,6 +164,29 @@ domain::Result<void> SecurityPolicy::authorize_scan_session(
     if (result_limit == 0U || result_limit > max_scan_session_candidates) {
         return std::unexpected(error(
             domain::DebugErrorCode::limit_exceeded, "scan session candidate limit exceeds configured limit"
+        ));
+    }
+    return {};
+}
+
+domain::Result<void> SecurityPolicy::authorize_pointer_chain_scan(
+    const std::size_t byte_budget,
+    const std::size_t result_limit,
+    const std::size_t max_depth,
+    const std::size_t max_fanout
+) const {
+    auto scan_authorization = authorize_scan(byte_budget, result_limit);
+    if (!scan_authorization) {
+        return scan_authorization;
+    }
+    if (max_depth == 0U || max_depth > max_pointer_chain_depth) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::limit_exceeded, "max_depth exceeds configured pointer chain depth limit"
+        ));
+    }
+    if (max_fanout == 0U || max_fanout > max_pointer_chain_fanout) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::limit_exceeded, "max_fanout exceeds configured pointer chain fanout limit"
         ));
     }
     return {};

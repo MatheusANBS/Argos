@@ -19,6 +19,8 @@ struct SecurityPolicy {
     std::size_t max_string_result_length{256U};
     std::size_t max_scan_session_candidates{262144U};
     std::size_t max_scan_sessions_per_session{4U};
+    std::size_t max_pointer_chain_depth{8U};
+    std::size_t max_pointer_chain_fanout{16U};
     bool allow_launch{false};
     std::vector<std::string> launch_allowed_dirs;
     std::size_t max_launched_processes{4U};
@@ -46,6 +48,13 @@ struct SecurityPolicy {
     [[nodiscard]] domain::Result<void> authorize_scan_session(
         std::size_t byte_budget,
         std::size_t result_limit
+    ) const;
+
+    [[nodiscard]] domain::Result<void> authorize_pointer_chain_scan(
+        std::size_t byte_budget,
+        std::size_t result_limit,
+        std::size_t max_depth,
+        std::size_t max_fanout
     ) const;
 
     [[nodiscard]] domain::Result<void> authorize_launch(

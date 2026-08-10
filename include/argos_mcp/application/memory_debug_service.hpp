@@ -49,6 +49,26 @@ struct BatchReadResult {
     std::string error;
 };
 
+struct ScanResultsPage {
+    domain::ScanSessionInfo info;
+    std::size_t offset{};
+    std::vector<domain::ScanMatch> matches;
+    bool truncated{false};
+};
+
+struct PointerChainCandidate {
+    std::string module_name;
+    domain::Address module_base{};
+    std::vector<std::int64_t> hop_offsets;
+    domain::Address resolved_address{};
+};
+
+struct PointerChainScanResult {
+    std::vector<PointerChainCandidate> candidates;
+    std::size_t bytes_scanned{};
+    bool truncated{false};
+};
+
 class MemoryDebugService final {
 public:
     MemoryDebugService(
@@ -86,6 +106,19 @@ public:
     ) const;
 
     [[nodiscard]] domain::Result<std::vector<domain::MemoryRegion>> regions(
+        const domain::SessionId& id
+    ) const;
+
+    // Filtered/paginated view over regions(). A real target has tens of
+    // thousands of regions, so the unfiltered list is not transportable.
+    [[nodiscard]] domain::Result<domain::RegionPage> regions_page(
+        const domain::SessionId& id,
+        const domain::RegionFilter& filter,
+        std::size_t offset,
+        std::size_t limit
+    ) const;
+
+    [[nodiscard]] domain::Result<domain::AddressSpaceSummary> address_space_summary(
         const domain::SessionId& id
     ) const;
 
@@ -189,7 +222,30 @@ public:
         std::stop_token cancellation = {}
     ) const;
 
-    [[nodiscard]] domain::Result<domain::ScanSessionInfo> scan_first(
+    [[nodiscard]] domain::Result<PointerChainScanResult> scan_pointer_chains(
+        const domain::SessionId& id,
+        domain::Address target,
+        std::size_t pointer_size,
+        std::size_t max_depth,
+        std::size_t max_fanout,
+        std::size_t byte_budget,
+        std::size_t result_limit,
+        bool writable_only,
+        std::optional<domain::Address> start_address = std::nullopt,
+        std::optional<domain::Address> end_address = std::nullopt,
+        std::stop_token cancellation = {}
+    ) const;
+
+    // scan_first reports coverage alongside the session because an empty
+    // candidate set is ambiguous without it: the sweep may simply have run out
+    // of budget before reaching the value. scan_next needs no equivalent -- it
+    // always re-reads every candidate it holds, so its coverage is total.
+    struct ScanFirstResult {
+        domain::ScanSessionInfo info;
+        domain::ScanCoverage coverage;
+    };
+
+    [[nodiscard]] domain::Result<ScanFirstResult> scan_first(
         const domain::SessionId& id,
         domain::ScanValueType value_type,
         domain::ScanComparison comparison,
@@ -211,7 +267,17 @@ public:
         std::stop_token cancellation = {}
     ) const;
 
+    [[nodiscard]] domain::Result<domain::ScanValueType> scan_value_type(
+        const domain::ScanSessionId& scan_id
+    ) const;
+
     [[nodiscard]] domain::Result<std::vector<domain::ScanMatch>> scan_results(
+        const domain::ScanSessionId& scan_id,
+        std::size_t offset,
+        std::size_t limit
+    ) const;
+
+    [[nodiscard]] domain::Result<ScanResultsPage> scan_results_page(
         const domain::ScanSessionId& scan_id,
         std::size_t offset,
         std::size_t limit

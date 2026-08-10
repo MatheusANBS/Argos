@@ -105,9 +105,11 @@ valor vivo. Se `target` já está num módulo, `candidates` volta vazio
 
 Mesmos limites de `authorize_scan` (reaproveitados) mais os dois tetos novos
 `max_pointer_chain_depth` / `max_pointer_chain_fanout` (envs
-`ARGOS_MCP_MAX_POINTER_CHAIN_DEPTH` / `ARGOS_MCP_MAX_POINTER_CHAIN_FANOUT`),
-garantindo custo `O(max_depth × max_fanout)`. Read-only, sem nova classe de
-risco; `visited` previne ciclos.
+`ARGOS_MCP_MAX_POINTER_CHAIN_DEPTH` / `ARGOS_MCP_MAX_POINTER_CHAIN_FANOUT`).
+Cada profundidade faz uma única passagem multi-alvo, comparando o ponteiro
+decodificado com um conjunto da fronteira; portanto o custo de I/O é limitado
+a `O(max_depth)` passagens, não `O(max_depth × max_fanout)`. Read-only, sem
+nova classe de risco; `visited` previne ciclos.
 
 ## Observabilidade
 
@@ -139,4 +141,5 @@ descobertos — apenas o registro genérico de invocação da tool.
 - curto-circuito `d=0` correto;
 - semântica de `truncated` conforme descrita (orçamento, `result_limit`,
   fanout, depth);
-- custo limitado a `O(max_depth × max_fanout)` chamadas de scan.
+- custo limitado a `O(max_depth)` chamadas de scan, independentemente da
+  largura efetiva da fronteira.

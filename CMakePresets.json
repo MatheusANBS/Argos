@@ -19,7 +19,8 @@
       "binaryDir": "${sourceDir}/build/release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "ARGOS_BUILD_TESTS": "ON"
+        "ARGOS_BUILD_TESTS": "ON",
+        "ARGOS_ENABLE_IPO": "OFF"
       }
     },
     {

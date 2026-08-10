@@ -59,7 +59,10 @@ using InputResult = std::expected<T, InputError>;
 }
 
 [[nodiscard]] ToolCallResult success(Value data) {
-    return ToolCallResult{Value::object({{"ok", true}, {"data", std::move(data)}}), false};
+    Value result = Value::object();
+    result["ok"] = true;
+    result["data"] = std::move(data);
+    return ToolCallResult{std::move(result), false};
 }
 
 [[nodiscard]] const Value::Object* require_object(const Value& value) {
@@ -102,6 +105,36 @@ using InputResult = std::expected<T, InputError>;
         return std::unexpected(InputError{"argument must be boolean: " + std::string{key}});
     }
     return value->as_bool();
+}
+
+// Tri-state: absent means "do not filter on this attribute", which is distinct
+// from an explicit false.
+[[nodiscard]] InputResult<std::optional<bool>> optional_bool_arg(
+    const Value& arguments,
+    std::string_view key
+) {
+    const Value* value = arguments.find(key);
+    if (value == nullptr) {
+        return std::optional<bool>{};
+    }
+    if (!value->is_bool()) {
+        return std::unexpected(InputError{"argument must be boolean: " + std::string{key}});
+    }
+    return std::optional<bool>{value->as_bool()};
+}
+
+[[nodiscard]] InputResult<std::optional<std::uint64_t>> optional_unsigned_arg(
+    const Value& arguments,
+    std::string_view key
+) {
+    const Value* value = arguments.find(key);
+    if (value == nullptr) {
+        return std::optional<std::uint64_t>{};
+    }
+    if (!value->is_integer() || value->as_integer() < 0) {
+        return std::unexpected(InputError{"argument must be a non-negative integer: " + std::string{key}});
+    }
+    return std::optional<std::uint64_t>{static_cast<std::uint64_t>(value->as_integer())};
 }
 
 [[nodiscard]] InputResult<std::uint64_t> unsigned_arg(
@@ -273,12 +306,14 @@ using InputResult = std::expected<T, InputError>;
 }
 
 [[nodiscard]] std::string hex_bytes(std::span<const std::byte> bytes) {
-    std::ostringstream output;
-    output << std::hex << std::setfill('0');
-    for (const auto byte : bytes) {
-        output << std::setw(2) << std::to_integer<unsigned int>(byte);
+    static constexpr std::string_view digits{"0123456789abcdef"};
+    std::string output(bytes.size() * 2U, '0');
+    for (std::size_t index = 0; index < bytes.size(); ++index) {
+        const auto value = std::to_integer<unsigned int>(bytes[index]);
+        output[index * 2U] = digits[value >> 4U];
+        output[index * 2U + 1U] = digits[value & 0x0FU];
     }
-    return output.str();
+    return output;
 }
 
 [[nodiscard]] std::string hex_address(domain::Address address) {
@@ -477,6 +512,52 @@ using InputResult = std::expected<T, InputError>;
     });
 }
 
+[[nodiscard]] Value scan_coverage_to_json(const domain::ScanCoverage& coverage) {
+    return Value::object({
+        {"bytes_scanned", static_cast<std::int64_t>(coverage.bytes_scanned)},
+        {"bytes_eligible", static_cast<std::int64_t>(coverage.bytes_eligible)},
+        {"regions_scanned", static_cast<std::int64_t>(coverage.regions_scanned)},
+        {"regions_eligible", static_cast<std::int64_t>(coverage.regions_eligible)},
+        {"coverage_ratio", coverage.coverage_ratio()},
+        {"truncated_by_budget", coverage.truncated_by_budget},
+        {"truncated_by_result_limit", coverage.truncated_by_result_limit},
+        {"complete", coverage.complete()}
+    });
+}
+
+[[nodiscard]] Value region_page_to_json(const domain::RegionPage& page) {
+    Value::Array regions;
+    regions.reserve(page.regions.size());
+    for (const auto& region : page.regions) regions.push_back(region_to_json(region));
+    return Value::object({
+        {"regions", Value{std::move(regions)}},
+        {"total_matched", static_cast<std::int64_t>(page.total_matched)},
+        {"offset", static_cast<std::int64_t>(page.offset)},
+        {"returned", static_cast<std::int64_t>(page.regions.size())},
+        {"truncated", page.truncated}
+    });
+}
+
+[[nodiscard]] Value address_space_summary_to_json(const domain::AddressSpaceSummary& summary) {
+    return Value::object({
+        {"region_count", static_cast<std::int64_t>(summary.region_count)},
+        {"total_bytes", static_cast<std::int64_t>(summary.total_bytes)},
+        {"readable_count", static_cast<std::int64_t>(summary.readable_count)},
+        {"readable_bytes", static_cast<std::int64_t>(summary.readable_bytes)},
+        {"writable_count", static_cast<std::int64_t>(summary.writable_count)},
+        {"writable_bytes", static_cast<std::int64_t>(summary.writable_bytes)},
+        {"executable_count", static_cast<std::int64_t>(summary.executable_count)},
+        {"executable_bytes", static_cast<std::int64_t>(summary.executable_bytes)},
+        {"private_count", static_cast<std::int64_t>(summary.private_count)},
+        {"private_bytes", static_cast<std::int64_t>(summary.private_bytes)},
+        {"scannable_bytes", static_cast<std::int64_t>(summary.scannable_bytes)},
+        {"scannable_writable_bytes", static_cast<std::int64_t>(summary.scannable_writable_bytes)},
+        {"largest_region_bytes", static_cast<std::int64_t>(summary.largest_region_bytes)},
+        {"lowest_address", hex_address(summary.lowest_address)},
+        {"highest_address", hex_address(summary.highest_address)}
+    });
+}
+
 [[nodiscard]] Value reflection_metadata_to_json(const domain::ReflectionMetadata& metadata) {
     Value::Array symbols;
     symbols.reserve(metadata.symbols.size());
@@ -494,6 +575,38 @@ using InputResult = std::expected<T, InputError>;
         {"truncated", metadata.truncated},
         {"symbols", Value{std::move(symbols)}}
     });
+}
+
+// Accepts either `<key>` (raw little-endian hex) or `<key>_decimal` (decimal
+// literal encoded server-side). Supplying both is rejected rather than silently
+// preferring one, so a mistake surfaces at the call instead of as a wrong scan.
+[[nodiscard]] InputResult<std::optional<std::vector<std::byte>>> scan_value_arg(
+    const Value& arguments,
+    std::string_view key,
+    const domain::ScanValueType value_type
+) {
+    const std::string decimal_key = std::string{key} + "_decimal";
+    auto hex = optional_hex_arg(arguments, key);
+    if (!hex) {
+        return std::unexpected(hex.error());
+    }
+    const Value* decimal = arguments.find(decimal_key);
+    if (decimal == nullptr) {
+        return *hex;
+    }
+    if (*hex) {
+        return std::unexpected(InputError{
+            "provide either " + std::string{key} + " or " + decimal_key + ", not both"
+        });
+    }
+    if (!decimal->is_string()) {
+        return std::unexpected(InputError{"argument must be a string: " + decimal_key});
+    }
+    auto encoded = domain::encode_scan_value(value_type, decimal->as_string());
+    if (!encoded) {
+        return std::unexpected(InputError{decimal_key + ": " + encoded.error()});
+    }
+    return std::optional<std::vector<std::byte>>{std::move(*encoded)};
 }
 
 [[nodiscard]] InputResult<std::vector<std::int64_t>> offsets_arg(const Value& arguments) {
@@ -563,7 +676,14 @@ using InputResult = std::expected<T, InputError>;
 
 }  // namespace
 
-std::vector<ToolDefinition> ToolCatalog::definitions() const {
+ToolCatalog::ToolCatalog(
+    application::MemoryDebugService& service,
+    const observability::Logger& logger
+) : service_(service), logger_(logger), definitions_(build_definitions()) {
+    std::ranges::sort(definitions_, {}, &ToolDefinition::name);
+}
+
+std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     const auto address = string_schema("Hexadecimal address such as 0x7FF612340000.");
     const auto session = string_schema("Opaque session_id returned by memory_debug.attach.");
     std::vector<ToolDefinition> tools;
@@ -596,7 +716,7 @@ std::vector<ToolDefinition> ToolCatalog::definitions() const {
             {"session_id", session},
             {"terminate", boolean_schema()}
         }, {"session_id"}),
-        stateful_annotations()
+        destructive_annotations()
     });
 
     tools.push_back(ToolDefinition{
@@ -636,7 +756,27 @@ std::vector<ToolDefinition> ToolCatalog::definitions() const {
 
     tools.push_back(ToolDefinition{
         "memory_debug.regions",
-        "List virtual memory regions and their read/write/execute attributes.",
+        "List virtual memory regions and their read/write/execute attributes. Supports server-side filtering and paging; a real target has tens of thousands of regions, so prefer a filter over listing everything.",
+        object_schema({
+            {"session_id", session},
+            {"readable", boolean_schema()},
+            {"writable", boolean_schema()},
+            {"executable", boolean_schema()},
+            {"private", boolean_schema()},
+            {"start_address", address},
+            {"end_address", address},
+            {"min_size", integer_schema(0, 1LL << 62)},
+            {"max_size", integer_schema(0, 1LL << 62)},
+            {"name_contains", string_schema("Case-insensitive substring match against the region name.")},
+            {"offset", integer_schema(0, 1LL << 40)},
+            {"limit", integer_schema(1, 4096)}
+        }, {"session_id"}),
+        read_only_annotations()
+    });
+
+    tools.push_back(ToolDefinition{
+        "memory_debug.address_space_summary",
+        "Aggregate size and counts of the target address space by class (readable, writable, executable, private). Answers how much memory a scan would have to sweep, in one small response, without listing regions.",
         object_schema({{"session_id", session}}, {"session_id"}),
         read_only_annotations()
     });
@@ -781,11 +921,33 @@ std::vector<ToolDefinition> ToolCatalog::definitions() const {
         read_only_annotations()
     });
 
+    tools.push_back(ToolDefinition{
+        "memory_debug.scan_pointer_chains",
+        "Perform a bounded multi-hop reverse pointer chain scan from a dynamic address back to a static module base + offset chain that stays stable across process restarts, reusing the same scan engine as scan_pointers_to.",
+        object_schema({
+            {"session_id", session},
+            {"target_address", address},
+            {"pointer_size", enum_string_schema({"4", "8"})},
+            {"max_depth", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_pointer_chain_depth))},
+            {"max_fanout", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_pointer_chain_fanout))},
+            {"byte_budget", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_scan_bytes))},
+            {"result_limit", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_scan_results))},
+            {"start_address", address},
+            {"end_address", address},
+            {"writable_only", boolean_schema()}
+        }, {"session_id", "target_address"}),
+        read_only_annotations()
+    });
+
     const auto value_type_schema = enum_string_schema({
         "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64"
     });
     const auto hex_value_schema = string_schema("Bytes in hexadecimal form matching value_type size.");
     const auto scan_id_schema = string_schema("Opaque scan_id returned by memory_debug.scan_first.");
+    const auto decimal_value_schema = string_schema(
+        "Decimal literal encoded server-side into little-endian bytes of value_type width, "
+        "for example \"91293908\" or \"-1.5\". Mutually exclusive with the hex form."
+    );
 
     tools.push_back(ToolDefinition{
         "memory_debug.scan_first",
@@ -795,8 +957,11 @@ std::vector<ToolDefinition> ToolCatalog::definitions() const {
             {"value_type", value_type_schema},
             {"comparison", enum_string_schema({"exact", "unknown", "in_range"})},
             {"value", hex_value_schema},
+            {"value_decimal", decimal_value_schema},
             {"range_low", hex_value_schema},
+            {"range_low_decimal", decimal_value_schema},
             {"range_high", hex_value_schema},
+            {"range_high_decimal", decimal_value_schema},
             {"byte_budget", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_scan_bytes))},
             {"result_limit", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_scan_session_candidates))},
             {"writable_only", boolean_schema()},
@@ -815,7 +980,9 @@ std::vector<ToolDefinition> ToolCatalog::definitions() const {
                 "changed", "unchanged", "increased", "decreased", "increased_by", "decreased_by", "exact"
             })},
             {"value", hex_value_schema},
-            {"delta", hex_value_schema}
+            {"value_decimal", decimal_value_schema},
+            {"delta", hex_value_schema},
+            {"delta_decimal", decimal_value_schema}
         }, {"scan_id", "comparison"}),
         stateful_annotations()
     });
@@ -886,7 +1053,7 @@ std::vector<ToolDefinition> ToolCatalog::definitions() const {
     return tools;
 }
 
-ToolCallResult ToolCatalog::invoke(
+std::optional<ToolCallResult> ToolCatalog::invoke(
     const std::string_view name,
     const Value& arguments,
     const std::stop_token cancellation
@@ -994,13 +1161,60 @@ ToolCallResult ToolCatalog::invoke(
 
     if (name == "memory_debug.regions") {
         auto session = session_arg(arguments);
+        auto readable = optional_bool_arg(arguments, "readable");
+        auto writable = optional_bool_arg(arguments, "writable");
+        auto executable = optional_bool_arg(arguments, "executable");
+        auto private_mapping = optional_bool_arg(arguments, "private");
+        auto start_address = optional_address_arg(arguments, "start_address");
+        auto end_address = optional_address_arg(arguments, "end_address");
+        auto min_size = unsigned_arg(arguments, "min_size", false, 0U);
+        auto max_size = optional_unsigned_arg(arguments, "max_size");
+        auto name_contains = string_arg(arguments, "name_contains", false);
+        auto offset = unsigned_arg(arguments, "offset", false, 0U);
+        auto limit = unsigned_arg(arguments, "limit", false, 512U);
         if (!session) return input_error(session.error().message);
-        auto result = service_.regions(*session);
+        if (!readable) return input_error(readable.error().message);
+        if (!writable) return input_error(writable.error().message);
+        if (!executable) return input_error(executable.error().message);
+        if (!private_mapping) return input_error(private_mapping.error().message);
+        if (!start_address) return input_error(start_address.error().message);
+        if (!end_address) return input_error(end_address.error().message);
+        if (!min_size) return input_error(min_size.error().message);
+        if (!max_size) return input_error(max_size.error().message);
+        if (!name_contains) return input_error(name_contains.error().message);
+        if (!offset) return input_error(offset.error().message);
+        if (!limit) return input_error(limit.error().message);
+        if (*offset > std::numeric_limits<std::size_t>::max()) {
+            return input_error("offset is out of range");
+        }
+        if (*limit == 0U || *limit > 4096U || *limit > std::numeric_limits<std::size_t>::max()) {
+            return input_error("limit must be between 1 and 4096");
+        }
+
+        domain::RegionFilter filter{};
+        filter.readable = *readable;
+        filter.writable = *writable;
+        filter.executable = *executable;
+        filter.private_mapping = *private_mapping;
+        filter.start_address = *start_address;
+        filter.end_address = *end_address;
+        filter.min_size = *min_size;
+        filter.max_size = *max_size;
+        filter.name_contains = *name_contains;
+
+        auto result = service_.regions_page(
+            *session, filter, static_cast<std::size_t>(*offset), static_cast<std::size_t>(*limit)
+        );
         if (!result) return domain_error(result.error());
-        Value::Array regions;
-        regions.reserve(result->size());
-        for (const auto& region : *result) regions.push_back(region_to_json(region));
-        return success(Value::object({{"regions", Value{std::move(regions)}}}));
+        return success(region_page_to_json(*result));
+    }
+
+    if (name == "memory_debug.address_space_summary") {
+        auto session = session_arg(arguments);
+        if (!session) return input_error(session.error().message);
+        auto result = service_.address_space_summary(*session);
+        if (!result) return domain_error(result.error());
+        return success(address_space_summary_to_json(*result));
     }
 
     if (name == "memory_debug.modules") {
@@ -1201,9 +1415,10 @@ ToolCallResult ToolCatalog::invoke(
         auto session = session_arg(arguments);
         auto value_type = value_type_arg(arguments);
         auto comparison = comparison_arg(arguments);
-        auto value = optional_hex_arg(arguments, "value");
-        auto range_low = optional_hex_arg(arguments, "range_low");
-        auto range_high = optional_hex_arg(arguments, "range_high");
+        if (!value_type) return input_error(value_type.error().message);
+        auto value = scan_value_arg(arguments, "value", *value_type);
+        auto range_low = scan_value_arg(arguments, "range_low", *value_type);
+        auto range_high = scan_value_arg(arguments, "range_high", *value_type);
         auto budget = unsigned_arg(arguments, "byte_budget", false, service_.policy().max_scan_bytes);
         auto limit = unsigned_arg(
             arguments, "result_limit", false, service_.policy().max_scan_session_candidates
@@ -1235,16 +1450,20 @@ ToolCallResult ToolCatalog::invoke(
             *start_address, *end_address, cancellation
         );
         if (!result) return domain_error(result.error());
-        return success(scan_session_info_to_json(*result));
+        auto payload = scan_session_info_to_json(result->info);
+        payload["coverage"] = scan_coverage_to_json(result->coverage);
+        return success(std::move(payload));
     }
 
     if (name == "memory_debug.scan_next") {
         auto scan_id = scan_session_arg(arguments);
         auto comparison = comparison_arg(arguments);
-        auto value = optional_hex_arg(arguments, "value");
-        auto delta = optional_hex_arg(arguments, "delta");
         if (!scan_id) return input_error(scan_id.error().message);
         if (!comparison) return input_error(comparison.error().message);
+        auto value_type = service_.scan_value_type(*scan_id);
+        if (!value_type) return domain_error(value_type.error());
+        auto value = scan_value_arg(arguments, "value", *value_type);
+        auto delta = scan_value_arg(arguments, "delta", *value_type);
         if (!value) return input_error(value.error().message);
         if (!delta) return input_error(delta.error().message);
         auto result = service_.scan_next(*scan_id, *comparison, *value, *delta, cancellation);
@@ -1259,14 +1478,20 @@ ToolCallResult ToolCatalog::invoke(
         if (!scan_id) return input_error(scan_id.error().message);
         if (!offset) return input_error(offset.error().message);
         if (!limit || *limit == 0U || *limit > 4096U) return input_error("limit must be between 1 and 4096");
-        auto result = service_.scan_results(
+        auto result = service_.scan_results_page(
             *scan_id, static_cast<std::size_t>(*offset), static_cast<std::size_t>(*limit)
         );
         if (!result) return domain_error(result.error());
         Value::Array matches;
-        matches.reserve(result->size());
-        for (const auto& match : *result) matches.push_back(hex_address(match.address));
-        return success(Value::object({{"matches", Value{std::move(matches)}}}));
+        matches.reserve(result->matches.size());
+        for (const auto& match : result->matches) matches.push_back(hex_address(match.address));
+        auto payload = scan_session_info_to_json(result->info);
+        payload["total"] = static_cast<std::int64_t>(result->info.candidate_count);
+        payload["offset"] = static_cast<std::int64_t>(result->offset);
+        payload["returned"] = static_cast<std::int64_t>(result->matches.size());
+        payload["truncated"] = result->truncated;
+        payload["matches"] = Value{std::move(matches)};
+        return success(std::move(payload));
     }
 
     if (name == "memory_debug.scan_reset") {
@@ -1306,6 +1531,55 @@ ToolCallResult ToolCatalog::invoke(
         for (const auto& match : result->matches) matches.push_back(hex_address(match.address));
         return success(Value::object({
             {"matches", Value{std::move(matches)}},
+            {"bytes_scanned", static_cast<std::int64_t>(result->bytes_scanned)},
+            {"truncated", result->truncated}
+        }));
+    }
+
+    if (name == "memory_debug.scan_pointer_chains") {
+        auto session = session_arg(arguments);
+        auto target = address_arg(arguments, "target_address");
+        auto pointer_size_text = string_arg(arguments, "pointer_size", false, sizeof(void*) == 8U ? "8" : "4");
+        auto max_depth = unsigned_arg(arguments, "max_depth", false, service_.policy().max_pointer_chain_depth);
+        auto max_fanout = unsigned_arg(arguments, "max_fanout", false, service_.policy().max_pointer_chain_fanout);
+        auto budget = unsigned_arg(arguments, "byte_budget", false, service_.policy().max_scan_bytes);
+        auto limit = unsigned_arg(arguments, "result_limit", false, service_.policy().max_scan_results);
+        auto start_address = optional_address_arg(arguments, "start_address");
+        auto end_address = optional_address_arg(arguments, "end_address");
+        auto writable_only = bool_arg(arguments, "writable_only", false, false);
+        if (!session) return input_error(session.error().message);
+        if (!target) return input_error(target.error().message);
+        if (!pointer_size_text) return input_error(pointer_size_text.error().message);
+        if (!max_depth) return input_error(max_depth.error().message);
+        if (!max_fanout) return input_error(max_fanout.error().message);
+        if (!budget) return input_error(budget.error().message);
+        if (!limit) return input_error(limit.error().message);
+        if (!start_address) return input_error(start_address.error().message);
+        if (!end_address) return input_error(end_address.error().message);
+        if (!writable_only) return input_error(writable_only.error().message);
+        const std::size_t pointer_size = *pointer_size_text == "4" ? 4U : (*pointer_size_text == "8" ? 8U : 0U);
+        if (pointer_size == 0U) return input_error("pointer_size must be 4 or 8");
+        auto result = service_.scan_pointer_chains(
+            *session, *target, pointer_size, static_cast<std::size_t>(*max_depth),
+            static_cast<std::size_t>(*max_fanout), static_cast<std::size_t>(*budget),
+            static_cast<std::size_t>(*limit), *writable_only, *start_address, *end_address, cancellation
+        );
+        if (!result) return domain_error(result.error());
+        Value::Array candidates;
+        candidates.reserve(result->candidates.size());
+        for (const auto& candidate : result->candidates) {
+            Value::Array offsets;
+            offsets.reserve(candidate.hop_offsets.size());
+            for (const auto offset : candidate.hop_offsets) offsets.push_back(static_cast<std::int64_t>(offset));
+            candidates.push_back(Value::object({
+                {"module", candidate.module_name},
+                {"module_base", hex_address(candidate.module_base)},
+                {"hop_offsets", Value{std::move(offsets)}},
+                {"resolved_address", hex_address(candidate.resolved_address)}
+            }));
+        }
+        return success(Value::object({
+            {"candidates", Value{std::move(candidates)}},
             {"bytes_scanned", static_cast<std::int64_t>(result->bytes_scanned)},
             {"truncated", result->truncated}
         }));
@@ -1372,7 +1646,7 @@ ToolCallResult ToolCatalog::invoke(
         }));
     }
 
-    return input_error("unknown tool: " + std::string{name});
+    return std::nullopt;
 }
 
 }  // namespace argos::protocol::mcp

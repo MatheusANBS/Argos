@@ -2,6 +2,24 @@
 
 ## Não lançado
 
+- compatibilidade dual-era MCP: protocolo moderno `2026-07-28` via
+  `server/discover` e `_meta` por request, mantendo clientes legados
+  `2025-11-25`/`2025-06-18`;
+- consultas de regiões filtradas/paginadas, resumo do espaço de endereçamento,
+  cobertura de `scan_first`, páginas autocontidas de `scan_results` e entrada
+  numérica decimal em `scan_first`/`scan_next`;
+- `scan_pointer_chains` passou de uma varredura por item da fronteira para uma
+  passagem multi-alvo por profundidade;
+- scan sessions usam snapshots imutáveis compartilhados, valores inline e
+  leitura agrupada de candidatos contíguos em `scan_next`;
+- `read_batch` coalesce intervalos adjacentes/sobrepostos e o catálogo de tools
+  é construído uma vez; IPO/LTO ficou disponível como opção, mas desligado por
+  padrão após regressão de 6,4% no benchmark MSVC de `tools/list`;
+- framing JSON limitado a 8 MiB/128 níveis/65.536 nós, serialização iterativa,
+  cancelamento MCP sem resposta tardia, `outputSchema` e erro JSON-RPC para
+  tool inexistente;
+- captura de processo usa buffer circular real e shutdown seguro das threads de
+  pipe no Windows;
 - `memory_debug.strings`: extração de strings ASCII/UTF-16LE no servidor;
 - `memory_debug.scan_pointers_to`: scan reverso de ponteiro, reaproveitando o
   mecanismo de `scan_exact`;
@@ -29,5 +47,5 @@
 - write gate desabilitado por padrão;
 - cancelamento cooperativo de scans via `notifications/cancelled`;
 - logs estruturados em `stderr`;
-- skills C++ instaladas em `.codex/skills`;
+- skills C++ instaladas em `.skills`;
 - testes unitários, contrato MCP, presets de sanitizer e documentação de segurança.

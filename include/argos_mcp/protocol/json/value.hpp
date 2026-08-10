@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <initializer_list>
@@ -10,6 +11,10 @@
 #include <vector>
 
 namespace argos::protocol::json {
+
+inline constexpr std::size_t max_parse_input_bytes = 8U * 1024U * 1024U;
+inline constexpr std::size_t max_parse_nesting_depth = 128U;
+inline constexpr std::size_t max_parse_nodes = 64U * 1024U;
 
 struct ParseError {
     std::size_t offset{};

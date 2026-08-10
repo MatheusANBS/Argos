@@ -10,6 +10,9 @@ O servidor precisa funcionar como processo local, com superfície mínima de red
 
 Implementar JSON-RPC 2.0 sobre `stdio`, negociando `2025-11-25` e aceitando `2025-06-18` para compatibilidade. `stdout` contém somente protocolo; logs estruturados usam `stderr`.
 
+A ADR-0016 amplia esta decisão com o modo sem estado `2026-07-28`,
+preservando integralmente a negociação legada descrita acima.
+
 ## Consequências
 
 - reduz superfície de rede e autenticação;

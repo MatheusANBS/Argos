@@ -6,6 +6,7 @@
 #include <array>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -20,6 +21,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -443,20 +445,31 @@ public:
     ) : pid_(pid), name_(std::move(name)), access_(access), process_(std::move(process)),
         stdout_read_(std::move(stdout_read)), stderr_read_(std::move(stderr_read)),
         stdout_buffer_(max_captured_output_bytes), stderr_buffer_(max_captured_output_bytes) {
-        stdout_thread_ = std::jthread{[this] { pump(stdout_read_.get(), stdout_buffer_, stdout_mutex_); }};
-        stderr_thread_ = std::jthread{[this] { pump(stderr_read_.get(), stderr_buffer_, stderr_mutex_); }};
+        stdout_thread_ = std::jthread{[this](const std::stop_token stop) {
+            pump(stdout_read_.get(), stdout_buffer_, stdout_mutex_, stop);
+        }};
+        stderr_thread_ = std::jthread{[this](const std::stop_token stop) {
+            pump(stderr_read_.get(), stderr_buffer_, stderr_mutex_, stop);
+        }};
     }
 
     ~WindowsLaunchedProcessSession() override {
-        // Closing the pipe read ends is what unblocks each reader thread's
-        // in-flight synchronous ReadFile (it fails once the handle is
-        // closed) -- there is no cooperative-cancellation path for a
-        // blocking ReadFile, so this is what lets the request_stop()+join()
-        // below complete instead of hanging on the child's pipe forever.
+        // Cancel synchronous I/O on the owning threads before closing either
+        // handle. Closing a handle concurrently with ReadFile can race with the
+        // in-flight call; CancelSynchronousIo + cooperative stop gives each
+        // pump a defined exit and lets us join before destroying its state.
+        stdout_thread_.request_stop();
+        stderr_thread_.request_stop();
+        if (stdout_thread_.joinable()) {
+            static_cast<void>(CancelSynchronousIo(stdout_thread_.native_handle()));
+        }
+        if (stderr_thread_.joinable()) {
+            static_cast<void>(CancelSynchronousIo(stderr_thread_.native_handle()));
+        }
+        if (stdout_thread_.joinable()) stdout_thread_.join();
+        if (stderr_thread_.joinable()) stderr_thread_.join();
         stdout_read_.reset();
         stderr_read_.reset();
-        stdout_thread_ = {};
-        stderr_thread_ = {};
     }
 
     WindowsLaunchedProcessSession(const WindowsLaunchedProcessSession&) = delete;
@@ -516,18 +529,40 @@ public:
         if (!TerminateProcess(process_.get(), 1U)) {
             return std::unexpected(error(DebugErrorCode::io_error, "TerminateProcess failed"));
         }
-        static_cast<void>(WaitForSingleObject(process_.get(), 2000U));
+        if (WaitForSingleObject(process_.get(), 2000U) != WAIT_OBJECT_0) {
+            return std::unexpected(error(DebugErrorCode::io_error, "process did not terminate within timeout"));
+        }
         return {};
     }
 
     [[nodiscard]] bool owned() const noexcept override { return true; }
 
 private:
-    void pump(HANDLE handle, infrastructure::OutputRingBuffer& buffer, std::mutex& guard) {
+    void pump(
+        HANDLE handle,
+        infrastructure::OutputRingBuffer& buffer,
+        std::mutex& guard,
+        const std::stop_token stop
+    ) {
         std::array<char, 4096> chunk{};
-        DWORD read_count = 0;
-        while (ReadFile(handle, chunk.data(), static_cast<DWORD>(chunk.size()), &read_count, nullptr) &&
-               read_count > 0U) {
+        while (!stop.stop_requested()) {
+            // Anonymous pipes are synchronous. Peek first so ReadFile is only
+            // issued for bytes already available; this avoids an unbounded
+            // blocking read in the request_stop/CancelSynchronousIo race
+            // window during session destruction.
+            DWORD available = 0U;
+            if (!PeekNamedPipe(handle, nullptr, 0U, nullptr, &available, nullptr)) {
+                break;
+            }
+            if (available == 0U) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{10});
+                continue;
+            }
+            const DWORD request = std::min<DWORD>(available, static_cast<DWORD>(chunk.size()));
+            DWORD read_count = 0U;
+            if (!ReadFile(handle, chunk.data(), request, &read_count, nullptr) || read_count == 0U) {
+                break;
+            }
             const auto sanitized = sanitize_utf8(std::string_view{chunk.data(), read_count});
             std::scoped_lock lock(guard);
             buffer.append(sanitized);

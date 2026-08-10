@@ -4,12 +4,12 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <iomanip>
 #include <limits>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
+#include <vector>
 
 namespace argos::protocol::json {
 namespace {
@@ -46,7 +46,11 @@ private:
         }
     }
 
-    [[nodiscard]] std::expected<Value, ParseError> parse_value() {
+    [[nodiscard]] std::expected<Value, ParseError> parse_value(const std::size_t nesting_depth = 0U) {
+        if (node_count_ >= max_parse_nodes) {
+            return fail("maximum JSON node count exceeded");
+        }
+        ++node_count_;
         if (position_ >= input_.size()) {
             return fail("unexpected end of input");
         }
@@ -61,8 +65,16 @@ private:
                 }
                 return Value{std::move(*text)};
             }
-            case '[': return parse_array();
-            case '{': return parse_object();
+            case '[':
+                if (nesting_depth >= max_parse_nesting_depth) {
+                    return fail("maximum nesting depth exceeded");
+                }
+                return parse_array(nesting_depth + 1U);
+            case '{':
+                if (nesting_depth >= max_parse_nesting_depth) {
+                    return fail("maximum nesting depth exceeded");
+                }
+                return parse_object(nesting_depth + 1U);
             default:
                 if (input_[position_] == '-' ||
                     (input_[position_] >= '0' && input_[position_] <= '9')) {
@@ -246,7 +258,7 @@ private:
         return Value{number};
     }
 
-    [[nodiscard]] std::expected<Value, ParseError> parse_array() {
+    [[nodiscard]] std::expected<Value, ParseError> parse_array(const std::size_t nesting_depth) {
         ++position_;
         skip_whitespace();
         Value::Array output;
@@ -257,7 +269,7 @@ private:
         }
         while (true) {
             skip_whitespace();
-            auto value = parse_value();
+            auto value = parse_value(nesting_depth);
             if (!value) {
                 return value;
             }
@@ -278,7 +290,7 @@ private:
         }
     }
 
-    [[nodiscard]] std::expected<Value, ParseError> parse_object() {
+    [[nodiscard]] std::expected<Value, ParseError> parse_object(const std::size_t nesting_depth) {
         ++position_;
         skip_whitespace();
         Value::Object output;
@@ -302,7 +314,7 @@ private:
             }
             ++position_;
             skip_whitespace();
-            auto value = parse_value();
+            auto value = parse_value(nesting_depth);
             if (!value) {
                 return value;
             }
@@ -329,64 +341,144 @@ private:
 
     std::string_view input_;
     std::size_t position_{0};
+    std::size_t node_count_{0};
 };
 
-void dump_string(std::ostringstream& output, std::string_view text) {
-    output << '"';
+void dump_string(std::string& output, const std::string_view text) {
+    constexpr char hex_digits[] = "0123456789abcdef";
+    output.push_back('"');
     for (const char raw_ch : text) {
         const auto ch = static_cast<unsigned char>(raw_ch);
         switch (ch) {
-            case '"': output << "\\\""; break;
-            case '\\': output << "\\\\"; break;
-            case '\b': output << "\\b"; break;
-            case '\f': output << "\\f"; break;
-            case '\n': output << "\\n"; break;
-            case '\r': output << "\\r"; break;
-            case '\t': output << "\\t"; break;
+            case '"': output.append("\\\""); break;
+            case '\\': output.append("\\\\"); break;
+            case '\b': output.append("\\b"); break;
+            case '\f': output.append("\\f"); break;
+            case '\n': output.append("\\n"); break;
+            case '\r': output.append("\\r"); break;
+            case '\t': output.append("\\t"); break;
             default:
                 if (ch < 0x20U) {
-                    output << "\\u" << std::hex << std::setw(4) << std::setfill('0')
-                           << static_cast<unsigned int>(ch) << std::dec;
+                    output.append("\\u00");
+                    output.push_back(hex_digits[ch >> 4U]);
+                    output.push_back(hex_digits[ch & 0x0FU]);
                 } else {
-                    output << static_cast<char>(ch);
+                    output.push_back(static_cast<char>(ch));
                 }
                 break;
         }
     }
-    output << '"';
+    output.push_back('"');
 }
 
-void dump_value(std::ostringstream& output, const Value& value) {
-    if (value.is_null()) {
-        output << "null";
-    } else if (value.is_bool()) {
-        output << (value.as_bool() ? "true" : "false");
-    } else if (value.is_integer()) {
-        output << value.as_integer();
-    } else if (value.is_number()) {
-        output << std::setprecision(std::numeric_limits<double>::max_digits10) << value.as_number();
-    } else if (value.is_string()) {
-        dump_string(output, value.as_string());
-    } else if (value.is_array()) {
-        output << '[';
-        bool first = true;
-        for (const auto& item : value.as_array()) {
-            if (!first) output << ',';
-            first = false;
-            dump_value(output, item);
+void dump_number(std::string& output, const double number) {
+    if (!std::isfinite(number)) {
+        output.append("null");
+        return;
+    }
+
+    char buffer[64]{};
+    const auto [end, error] = std::to_chars(
+        buffer,
+        buffer + sizeof(buffer),
+        number,
+        std::chars_format::general,
+        std::numeric_limits<double>::max_digits10
+    );
+    if (error != std::errc{}) {
+        output.append("null");
+        return;
+    }
+    output.append(buffer, static_cast<std::size_t>(end - buffer));
+}
+
+void dump_integer(std::string& output, const std::int64_t number) {
+    char buffer[32]{};
+    const auto [end, error] = std::to_chars(buffer, buffer + sizeof(buffer), number);
+    if (error != std::errc{}) {
+        output.append("null");
+        return;
+    }
+    output.append(buffer, static_cast<std::size_t>(end - buffer));
+}
+
+struct ArrayDumpFrame final {
+    const Value::Array* values{};
+    std::size_t next_index{};
+};
+
+struct ObjectDumpFrame final {
+    const Value::Object* values{};
+    Value::Object::const_iterator next;
+};
+
+using DumpFrame = std::variant<ArrayDumpFrame, ObjectDumpFrame>;
+
+void dump_value(std::string& output, const Value& root) {
+    std::vector<DumpFrame> stack;
+    const Value* value = &root;
+
+    while (value != nullptr) {
+        if (value->is_null()) {
+            output.append("null");
+        } else if (value->is_bool()) {
+            output.append(value->as_bool() ? "true" : "false");
+        } else if (value->is_integer()) {
+            dump_integer(output, value->as_integer());
+        } else if (value->is_number()) {
+            dump_number(output, value->as_number());
+        } else if (value->is_string()) {
+            dump_string(output, value->as_string());
+        } else if (value->is_array()) {
+            output.push_back('[');
+            const auto& array = value->as_array();
+            if (array.empty()) {
+                output.push_back(']');
+            } else {
+                stack.emplace_back(ArrayDumpFrame{&array, 1U});
+                value = &array.front();
+                continue;
+            }
+        } else {
+            output.push_back('{');
+            const auto& object = value->as_object();
+            if (object.empty()) {
+                output.push_back('}');
+            } else {
+                auto current = object.begin();
+                dump_string(output, current->first);
+                output.push_back(':');
+                value = &current->second;
+                stack.emplace_back(ObjectDumpFrame{&object, ++current});
+                continue;
+            }
         }
-        output << ']';
-    } else {
-        output << '{';
-        bool first = true;
-        for (const auto& [key, item] : value.as_object()) {
-            if (!first) output << ',';
-            first = false;
-            dump_string(output, key);
-            output << ':';
-            dump_value(output, item);
+
+        value = nullptr;
+        while (!stack.empty()) {
+            if (auto* array_frame = std::get_if<ArrayDumpFrame>(&stack.back())) {
+                if (array_frame->next_index < array_frame->values->size()) {
+                    output.push_back(',');
+                    value = &(*array_frame->values)[array_frame->next_index++];
+                    break;
+                }
+                output.push_back(']');
+                stack.pop_back();
+                continue;
+            }
+
+            auto& object_frame = std::get<ObjectDumpFrame>(stack.back());
+            if (object_frame.next != object_frame.values->end()) {
+                output.push_back(',');
+                dump_string(output, object_frame.next->first);
+                output.push_back(':');
+                value = &object_frame.next->second;
+                ++object_frame.next;
+                break;
+            }
+            output.push_back('}');
+            stack.pop_back();
         }
-        output << '}';
     }
 }
 
@@ -459,12 +551,19 @@ const Value& Value::at(std::string_view key) const {
 }
 
 std::string Value::dump() const {
-    std::ostringstream output;
+    std::string output;
+    output.reserve(256U);
     dump_value(output, *this);
-    return output.str();
+    return output;
 }
 
 std::expected<Value, ParseError> parse(std::string_view input) {
+    if (input.size() > max_parse_input_bytes) {
+        return std::unexpected(ParseError{
+            max_parse_input_bytes,
+            "maximum input size exceeded"
+        });
+    }
     return Parser{input}.run();
 }
 

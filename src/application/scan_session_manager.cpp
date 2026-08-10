@@ -51,7 +51,7 @@ std::string ScanSessionManager::generate_id() {
 }
 
 domain::ScanSessionInfo ScanSessionManager::info_of(const domain::ScanSessionId& id, const State& state) {
-    return domain::ScanSessionInfo{id, state.owner, state.value_type, state.candidates.size(), state.generation};
+    return domain::ScanSessionInfo{id, state.owner, state.value_type, state.candidates->size(), state.generation};
 }
 
 domain::Result<domain::ScanSessionInfo> ScanSessionManager::create(
@@ -60,6 +60,7 @@ domain::Result<domain::ScanSessionInfo> ScanSessionManager::create(
     std::vector<ScanCandidate> candidates,
     const std::size_t max_sessions_per_owner
 ) {
+    auto shared_candidates = std::make_shared<const CandidateSet>(std::move(candidates));
     std::scoped_lock lock(mutex_);
     const auto owned_count = std::ranges::count_if(sessions_, [&owner](const auto& entry) {
         return entry.second.owner == owner;
@@ -76,7 +77,7 @@ domain::Result<domain::ScanSessionInfo> ScanSessionManager::create(
             continue;
         }
         const auto [iterator, inserted] = sessions_.emplace(
-            id_result->value(), State{owner, value_type, candidates, 0U}
+            id_result->value(), State{owner, value_type, shared_candidates, 0U}
         );
         if (inserted) {
             return info_of(*id_result, iterator->second);
@@ -93,21 +94,37 @@ domain::Result<ScanSessionManager::Snapshot> ScanSessionManager::snapshot(
     if (iterator == sessions_.end()) {
         return std::unexpected(error(domain::DebugErrorCode::not_found, "scan session not found"));
     }
-    return Snapshot{iterator->second.owner, iterator->second.value_type, iterator->second.candidates};
+    return Snapshot{
+        iterator->second.owner,
+        iterator->second.value_type,
+        iterator->second.candidates,
+        iterator->second.generation
+    };
 }
 
 domain::Result<domain::ScanSessionInfo> ScanSessionManager::replace(
     const domain::ScanSessionId& id,
+    const Snapshot& source,
     std::vector<ScanCandidate> candidates
 ) {
-    std::scoped_lock lock(mutex_);
-    const auto iterator = sessions_.find(id.value());
-    if (iterator == sessions_.end()) {
-        return std::unexpected(error(domain::DebugErrorCode::not_found, "scan session not found"));
+    auto replacement = std::make_shared<const CandidateSet>(std::move(candidates));
+    CandidateSnapshot retired;
+    {
+        std::scoped_lock lock(mutex_);
+        const auto iterator = sessions_.find(id.value());
+        if (iterator == sessions_.end()) {
+            return std::unexpected(error(domain::DebugErrorCode::not_found, "scan session not found"));
+        }
+        if (iterator->second.candidates != source.candidates_) {
+            return std::unexpected(error(
+                domain::DebugErrorCode::invalid_state,
+                "scan session changed while candidates were being sampled"
+            ));
+        }
+        retired = std::exchange(iterator->second.candidates, std::move(replacement));
+        ++iterator->second.generation;
+        return info_of(id, iterator->second);
     }
-    iterator->second.candidates = std::move(candidates);
-    ++iterator->second.generation;
-    return info_of(id, iterator->second);
 }
 
 domain::Result<std::vector<domain::ScanMatch>> ScanSessionManager::results(
@@ -115,38 +132,56 @@ domain::Result<std::vector<domain::ScanMatch>> ScanSessionManager::results(
     const std::size_t offset,
     const std::size_t limit
 ) const {
-    std::scoped_lock lock(mutex_);
-    const auto iterator = sessions_.find(id.value());
-    if (iterator == sessions_.end()) {
-        return std::unexpected(error(domain::DebugErrorCode::not_found, "scan session not found"));
+    CandidateSnapshot candidates;
+    {
+        std::scoped_lock lock(mutex_);
+        const auto iterator = sessions_.find(id.value());
+        if (iterator == sessions_.end()) {
+            return std::unexpected(error(domain::DebugErrorCode::not_found, "scan session not found"));
+        }
+        candidates = iterator->second.candidates;
     }
-    const auto& candidates = iterator->second.candidates;
     std::vector<domain::ScanMatch> output;
-    if (offset >= candidates.size()) {
+    if (offset >= candidates->size()) {
         return output;
     }
-    const auto count = std::min(limit, candidates.size() - offset);
+    const auto count = std::min(limit, candidates->size() - offset);
     output.reserve(count);
     for (std::size_t index = offset; index < offset + count; ++index) {
-        output.push_back(domain::ScanMatch{candidates[index].address});
+        output.push_back(domain::ScanMatch{(*candidates)[index].address});
     }
     return output;
 }
 
 domain::Result<domain::ScanSessionInfo> ScanSessionManager::reset(const domain::ScanSessionId& id) {
-    std::scoped_lock lock(mutex_);
-    const auto iterator = sessions_.find(id.value());
-    if (iterator == sessions_.end()) {
-        return std::unexpected(error(domain::DebugErrorCode::not_found, "scan session not found"));
+    auto empty = std::make_shared<const CandidateSet>();
+    CandidateSnapshot retired;
+    {
+        std::scoped_lock lock(mutex_);
+        const auto iterator = sessions_.find(id.value());
+        if (iterator == sessions_.end()) {
+            return std::unexpected(error(domain::DebugErrorCode::not_found, "scan session not found"));
+        }
+        retired = std::exchange(iterator->second.candidates, std::move(empty));
+        iterator->second.generation = 0U;
+        return info_of(id, iterator->second);
     }
-    iterator->second.candidates.clear();
-    iterator->second.generation = 0U;
-    return info_of(id, iterator->second);
 }
 
 void ScanSessionManager::remove_owned_by(const domain::SessionId& owner) {
-    std::scoped_lock lock(mutex_);
-    std::erase_if(sessions_, [&owner](const auto& entry) { return entry.second.owner == owner; });
+    std::vector<CandidateSnapshot> retired;
+    {
+        std::scoped_lock lock(mutex_);
+        retired.reserve(sessions_.size());
+        for (auto iterator = sessions_.begin(); iterator != sessions_.end();) {
+            if (iterator->second.owner != owner) {
+                ++iterator;
+                continue;
+            }
+            retired.push_back(std::move(iterator->second.candidates));
+            iterator = sessions_.erase(iterator);
+        }
+    }
 }
 
 }  // namespace argos::application

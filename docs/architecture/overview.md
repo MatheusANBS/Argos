@@ -26,6 +26,10 @@ Contém tipos fortes, erros tipados e as interfaces `ProcessSession` e `ProcessM
 
 `ToolCatalog` valida JSON, converte argumentos em tipos internos, delega ao serviço e apresenta respostas seguras. `Server` implementa o dispatcher JSON-RPC e o transporte `stdio` linha a linha.
 
+O dispatcher seleciona o contrato por requisição: metadados reservados ativam
+o MCP sem estado `2026-07-28`; na ausência deles, `initialize`/`ping` e os
+envelopes `2025-11-25`/`2025-06-18` permanecem disponíveis (ADR-0016).
+
 ## Dependências
 
 ```text

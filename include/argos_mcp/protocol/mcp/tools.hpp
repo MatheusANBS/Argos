@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <stop_token>
+#include <optional>
 #include <vector>
 
 namespace argos::protocol::mcp {
@@ -28,19 +29,24 @@ public:
     ToolCatalog(
         application::MemoryDebugService& service,
         const observability::Logger& logger
-    ) noexcept : service_(service), logger_(logger) {}
+    );
 
-    [[nodiscard]] std::vector<ToolDefinition> definitions() const;
+    [[nodiscard]] const std::vector<ToolDefinition>& definitions() const noexcept {
+        return definitions_;
+    }
 
-    [[nodiscard]] ToolCallResult invoke(
+    [[nodiscard]] std::optional<ToolCallResult> invoke(
         std::string_view name,
         const json::Value& arguments,
         std::stop_token cancellation = {}
     );
 
 private:
+    [[nodiscard]] std::vector<ToolDefinition> build_definitions() const;
+
     application::MemoryDebugService& service_;
     const observability::Logger& logger_;
+    std::vector<ToolDefinition> definitions_;
 };
 
 }  // namespace argos::protocol::mcp

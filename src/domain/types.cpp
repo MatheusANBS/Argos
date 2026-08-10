@@ -1,10 +1,119 @@
 #include "argos_mcp/domain/types.hpp"
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cctype>
+#include <charconv>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <type_traits>
 #include <utility>
 
 namespace argos::domain {
+namespace {
+
+template <typename T>
+[[nodiscard]] std::vector<std::byte> to_little_endian(const T value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    std::array<std::byte, sizeof(T)> raw{};
+    std::memcpy(raw.data(), &value, sizeof(T));
+    if constexpr (std::endian::native == std::endian::big) {
+        std::ranges::reverse(raw);
+    }
+    return std::vector<std::byte>(raw.begin(), raw.end());
+}
+
+// Integral path: parse into the widest signed/unsigned form, then range-check
+// against the requested width before narrowing.
+template <typename T>
+[[nodiscard]] std::expected<std::vector<std::byte>, std::string> encode_integral(
+    const std::string_view decimal
+) {
+    if constexpr (std::is_signed_v<T>) {
+        std::int64_t parsed = 0;
+        const auto* const first = decimal.data();
+        const auto* const last = decimal.data() + decimal.size();
+        const auto [ptr, ec] = std::from_chars(first, last, parsed);
+        if (ec != std::errc{} || ptr != last) {
+            return std::unexpected(std::string{"value must be a decimal integer"});
+        }
+        if (parsed < static_cast<std::int64_t>(std::numeric_limits<T>::min()) ||
+            parsed > static_cast<std::int64_t>(std::numeric_limits<T>::max())) {
+            return std::unexpected(std::string{"value does not fit in the requested value_type"});
+        }
+        return to_little_endian(static_cast<T>(parsed));
+    } else {
+        if (!decimal.empty() && decimal.front() == '-') {
+            return std::unexpected(std::string{"negative value requires a signed value_type"});
+        }
+        std::uint64_t parsed = 0;
+        const auto* const first = decimal.data();
+        const auto* const last = decimal.data() + decimal.size();
+        const auto [ptr, ec] = std::from_chars(first, last, parsed);
+        if (ec != std::errc{} || ptr != last) {
+            return std::unexpected(std::string{"value must be a decimal integer"});
+        }
+        if (parsed > static_cast<std::uint64_t>(std::numeric_limits<T>::max())) {
+            return std::unexpected(std::string{"value does not fit in the requested value_type"});
+        }
+        return to_little_endian(static_cast<T>(parsed));
+    }
+}
+
+template <typename T>
+[[nodiscard]] std::expected<std::vector<std::byte>, std::string> encode_floating(
+    const std::string_view decimal
+) {
+    double parsed = 0.0;
+    const auto* const first = decimal.data();
+    const auto* const last = decimal.data() + decimal.size();
+    const auto [ptr, ec] = std::from_chars(first, last, parsed);
+    if (ec != std::errc{} || ptr != last) {
+        return std::unexpected(std::string{"value must be a decimal number"});
+    }
+    if (!std::isfinite(parsed)) {
+        return std::unexpected(std::string{"value must be finite"});
+    }
+    if (parsed < static_cast<double>(std::numeric_limits<T>::lowest()) ||
+        parsed > static_cast<double>(std::numeric_limits<T>::max()) ||
+        (parsed != 0.0 && std::abs(parsed) < static_cast<double>(std::numeric_limits<T>::denorm_min()))) {
+        return std::unexpected(std::string{"value does not fit in the requested value_type"});
+    }
+    const auto narrowed = static_cast<T>(parsed);
+    if (!std::isfinite(narrowed) || (parsed != 0.0 && narrowed == static_cast<T>(0))) {
+        return std::unexpected(std::string{"value does not fit in the requested value_type"});
+    }
+    return to_little_endian(narrowed);
+}
+
+[[nodiscard]] std::string_view trim(std::string_view text) noexcept {
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) text.remove_prefix(1U);
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) text.remove_suffix(1U);
+    return text;
+}
+
+[[nodiscard]] bool contains_ci(std::string_view haystack, std::string_view needle) noexcept {
+    if (needle.empty()) return true;
+    if (needle.size() > haystack.size()) return false;
+    const auto lower = [](const char ch) noexcept {
+        return static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    };
+    for (std::size_t start = 0; start + needle.size() <= haystack.size(); ++start) {
+        bool hit = true;
+        for (std::size_t index = 0; index < needle.size(); ++index) {
+            if (lower(haystack[start + index]) != lower(needle[index])) {
+                hit = false;
+                break;
+            }
+        }
+        if (hit) return true;
+    }
+    return false;
+}
+
+}  // namespace
 
 std::expected<SessionId, std::string> SessionId::create(std::string value) {
     const auto valid = !value.empty() && value.size() <= 128U &&
@@ -113,6 +222,124 @@ std::optional<ScanComparison> scan_comparison_from_string(const std::string_view
     if (text == "increased_by") return ScanComparison::increased_by;
     if (text == "decreased_by") return ScanComparison::decreased_by;
     return std::nullopt;
+}
+
+std::expected<std::vector<std::byte>, std::string> encode_scan_value(
+    const ScanValueType type,
+    const std::string_view decimal
+) {
+    const auto text = trim(decimal);
+    if (text.empty()) {
+        return std::unexpected(std::string{"value must not be empty"});
+    }
+    switch (type) {
+        case ScanValueType::u8:  return encode_integral<std::uint8_t>(text);
+        case ScanValueType::u16: return encode_integral<std::uint16_t>(text);
+        case ScanValueType::u32: return encode_integral<std::uint32_t>(text);
+        case ScanValueType::u64: return encode_integral<std::uint64_t>(text);
+        case ScanValueType::i8:  return encode_integral<std::int8_t>(text);
+        case ScanValueType::i16: return encode_integral<std::int16_t>(text);
+        case ScanValueType::i32: return encode_integral<std::int32_t>(text);
+        case ScanValueType::i64: return encode_integral<std::int64_t>(text);
+        case ScanValueType::f32: return encode_floating<float>(text);
+        case ScanValueType::f64: return encode_floating<double>(text);
+    }
+    return std::unexpected(std::string{"unsupported value_type"});
+}
+
+bool RegionFilter::matches(const MemoryRegion& region) const noexcept {
+    if (readable && *readable != region.readable) return false;
+    if (writable && *writable != region.writable) return false;
+    if (executable && *executable != region.executable) return false;
+    if (private_mapping && *private_mapping != region.private_mapping) return false;
+    const auto size = region.size();
+    if (size < min_size) return false;
+    if (max_size && size > *max_size) return false;
+    if (start_address && region.end <= *start_address) return false;
+    if (end_address && region.start >= *end_address) return false;
+    if (!name_contains.empty() && !contains_ci(region.name, name_contains)) return false;
+    return true;
+}
+
+AddressSpaceSummary summarize_address_space(const std::span<const MemoryRegion> regions) noexcept {
+    AddressSpaceSummary summary{};
+    summary.region_count = regions.size();
+    bool first = true;
+    for (const auto& region : regions) {
+        const auto size = region.size();
+        summary.total_bytes += size;
+        if (size > summary.largest_region_bytes) summary.largest_region_bytes = size;
+        if (first) {
+            summary.lowest_address = region.start;
+            summary.highest_address = region.end;
+            first = false;
+        } else {
+            summary.lowest_address = std::min(summary.lowest_address, region.start);
+            summary.highest_address = std::max(summary.highest_address, region.end);
+        }
+        if (region.readable) {
+            ++summary.readable_count;
+            summary.readable_bytes += size;
+            summary.scannable_bytes += size;
+            if (region.writable) summary.scannable_writable_bytes += size;
+        }
+        if (region.writable) {
+            ++summary.writable_count;
+            summary.writable_bytes += size;
+        }
+        if (region.executable) {
+            ++summary.executable_count;
+            summary.executable_bytes += size;
+        }
+        if (region.private_mapping) {
+            ++summary.private_count;
+            summary.private_bytes += size;
+        }
+    }
+    return summary;
+}
+
+RegionPage filter_regions(
+    const std::span<const MemoryRegion> regions,
+    const RegionFilter& filter,
+    const std::size_t offset,
+    const std::size_t limit
+) {
+    RegionPage page{};
+    page.offset = offset;
+    std::size_t matched = 0;
+    for (const auto& region : regions) {
+        if (!filter.matches(region)) continue;
+        const auto index = matched;
+        ++matched;
+        if (index < offset) continue;
+        if (page.regions.size() >= limit) continue;
+        page.regions.push_back(region);
+    }
+    page.total_matched = matched;
+    page.truncated = matched > offset && matched - offset > page.regions.size();
+    return page;
+}
+
+std::pair<std::uint64_t, std::size_t> eligible_scan_bytes(
+    const std::span<const MemoryRegion> regions,
+    const bool writable_only,
+    const std::optional<Address> start_address,
+    const std::optional<Address> end_address
+) noexcept {
+    std::uint64_t bytes = 0;
+    std::size_t count = 0;
+    for (const auto& region : regions) {
+        if (!region.readable || (writable_only && !region.writable) || region.size() == 0U) {
+            continue;
+        }
+        const Address scan_start = std::max(region.start, start_address.value_or(region.start));
+        const Address scan_end = std::min(region.end, end_address.value_or(region.end));
+        if (scan_end <= scan_start) continue;
+        bytes += scan_end - scan_start;
+        ++count;
+    }
+    return {bytes, count};
 }
 
 }  // namespace argos::domain
