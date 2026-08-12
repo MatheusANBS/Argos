@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <limits>
+#include <random>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -352,7 +354,15 @@ MemoryDebugService::MemoryDebugService(
     std::unique_ptr<domain::ProcessMemoryProvider> provider,
     security::SecurityPolicy policy,
     std::unique_ptr<domain::TypeMetadataProvider> metadata_provider
-) : provider_(std::move(provider)), metadata_provider_(std::move(metadata_provider)), policy_(policy) {}
+) : provider_(std::move(provider)), metadata_provider_(std::move(metadata_provider)), policy_(policy) {
+    std::random_device device;
+    resume_key_ = (static_cast<std::uint64_t>(device()) << 32U) ^ static_cast<std::uint64_t>(device());
+    // A zero key would make every token forgeable by anyone who knows the
+    // format, so refuse to start with one rather than degrade quietly.
+    if (resume_key_ == 0U) {
+        resume_key_ = 0x9E3779B97F4A7C15ULL;
+    }
+}
 
 domain::Result<std::vector<domain::ProcessInfo>> MemoryDebugService::list_processes(
     const std::string_view filter,
@@ -406,6 +416,9 @@ domain::Result<void> MemoryDebugService::detach(const domain::SessionId& id, con
         return removed;
     }
     scan_sessions_.remove_owned_by(id);
+    // Runtime contexts die with the session that authorized them: an id left
+    // behind would outlive the authorization it was built under.
+    unreal_contexts_.remove_owned_by(id);
     return removed;
 }
 
@@ -1652,6 +1665,865 @@ domain::Result<void> MemoryDebugService::scan_reset(const domain::ScanSessionId&
         return std::unexpected(result.error());
     }
     return {};
+}
+
+std::string_view to_string(const ReferenceTruncation reason) noexcept {
+    switch (reason) {
+        case ReferenceTruncation::byte_budget_exhausted: return "byte_budget_exhausted";
+        case ReferenceTruncation::result_limit_reached: return "result_limit_reached";
+        case ReferenceTruncation::region_read_failed: return "region_read_failed";
+    }
+    return "unknown";
+}
+
+domain::Result<ReferenceReport> MemoryDebugService::scan_references(
+    const domain::SessionId& id,
+    const domain::ProcessSession& session,
+    const std::span<const domain::MemoryRegion> sorted_regions,
+    const domain::Address target,
+    const domain::TargetPointerWidth width,
+    const ReferenceQuery& query,
+    const std::stop_token cancellation
+) const {
+    const auto pointer_size = domain::pointer_width_bytes(width);
+    if (target == 0U) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument, "reference target must not be zero"
+        ));
+    }
+    if (width == domain::TargetPointerWidth::x86 && target > std::numeric_limits<std::uint32_t>::max()) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument, "address does not fit in a 32-bit pointer"
+        ));
+    }
+    if (query.start_address && query.end_address && *query.end_address <= *query.start_address) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument, "end_address must be greater than start_address"
+        ));
+    }
+    auto authorization = policy_.authorize_scan(query.byte_budget, query.result_limit);
+    if (!authorization) {
+        return std::unexpected(authorization.error());
+    }
+
+    const auto binding = domain::resume_token::binding(
+        id.value(), target, width, query.writable_only, query.start_address, query.end_address
+    );
+    std::optional<domain::Address> range_start = query.start_address;
+    if (!query.resume_token.empty()) {
+        const auto resumed = domain::resume_token::decode(query.resume_token, resume_key_, binding);
+        if (!resumed) {
+            // A token that does not verify may belong to another session, target
+            // or filter set. Continuing anyway would silently sweep a different
+            // range than the caller believes it is resuming.
+            return std::unexpected(error(
+                domain::DebugErrorCode::invalid_argument,
+                "resume_token does not belong to this session and query"
+            ));
+        }
+        range_start = std::max(*resumed, query.start_address.value_or(0U));
+    }
+
+    // Measured over the range this slice may still sweep, so `complete` means
+    // "reached the end of what was left", not "reached the end of the process".
+    const auto [bytes_eligible, regions_eligible] = domain::eligible_scan_bytes(
+        sorted_regions, query.writable_only, range_start, query.end_address
+    );
+
+    std::array<std::byte, 8> needle{};
+    for (std::size_t index = 0; index < pointer_size; ++index) {
+        needle[index] = static_cast<std::byte>((target >> (index * 8U)) & 0xFFU);
+    }
+
+    constexpr std::size_t chunk_size = 64U * 1024U;
+    std::array<std::byte, chunk_size> chunk{};
+    std::vector<std::byte> buffer;
+    buffer.reserve(chunk_size + pointer_size);
+    std::vector<std::byte> carry;
+    carry.reserve(pointer_size - 1U);
+
+    std::vector<domain::Address> matches;
+    matches.reserve(std::min<std::size_t>(query.result_limit, 64U));
+    std::uint64_t bytes_scanned = 0;
+    std::size_t regions_scanned = 0;
+    std::optional<domain::Address> next_address;
+    bool budget_exhausted = false;
+    bool limit_reached = false;
+    bool read_failed = false;
+    bool stop = false;
+
+    for (const auto& region : sorted_regions) {
+        if (stop) {
+            break;
+        }
+        if (cancellation.stop_requested()) {
+            return std::unexpected(error(domain::DebugErrorCode::cancelled, "operation cancelled"));
+        }
+        if (!region.readable || (query.writable_only && !region.writable) || region.size() == 0U) {
+            continue;
+        }
+        const domain::Address scan_start = std::max(region.start, range_start.value_or(region.start));
+        const domain::Address scan_end = std::min(region.end, query.end_address.value_or(region.end));
+        if (scan_end <= scan_start) {
+            continue;
+        }
+        ++regions_scanned;
+        domain::Address cursor = scan_start;
+        carry.clear();
+        while (cursor < scan_end) {
+            if (cancellation.stop_requested()) {
+                return std::unexpected(error(domain::DebugErrorCode::cancelled, "operation cancelled"));
+            }
+            if (bytes_scanned >= query.byte_budget) {
+                budget_exhausted = true;
+                // Resume at the aligned position at or below the cursor: any
+                // pointer that started earlier was already fully read, and any
+                // pointer straddling the cursor gets a complete second look.
+                next_address = cursor & ~static_cast<domain::Address>(pointer_size - 1U);
+                stop = true;
+                break;
+            }
+            const auto request_u64 = std::min<std::uint64_t>({
+                scan_end - cursor,
+                query.byte_budget - bytes_scanned,
+                static_cast<std::uint64_t>(chunk_size)
+            });
+            const auto request = static_cast<std::size_t>(request_u64);
+            if (request == 0U) {
+                break;
+            }
+            auto read = session.read(cursor, std::span<std::byte>{chunk}.first(request));
+            if (!read || *read == 0U) {
+                // Skip the remainder of this region instead of retrying: the
+                // sweep stays bounded and the gap shows up as coverage below 1.
+                read_failed = true;
+                break;
+            }
+            if (*read > request) {
+                return std::unexpected(error(
+                    domain::DebugErrorCode::io_error, "memory backend returned an oversized read"
+                ));
+            }
+            bytes_scanned += *read;
+
+            buffer.clear();
+            buffer.insert(buffer.end(), carry.begin(), carry.end());
+            buffer.insert(buffer.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
+            const domain::Address buffer_base = cursor - static_cast<domain::Address>(carry.size());
+            const auto misalignment = static_cast<std::size_t>(buffer_base & (pointer_size - 1U));
+            std::size_t index = (pointer_size - misalignment) & (pointer_size - 1U);
+            for (; index + pointer_size <= buffer.size(); index += pointer_size) {
+                if (!std::equal(needle.begin(), needle.begin() + static_cast<std::ptrdiff_t>(pointer_size),
+                                buffer.begin() + static_cast<std::ptrdiff_t>(index))) {
+                    continue;
+                }
+                const auto match = buffer_base + static_cast<domain::Address>(index);
+                matches.push_back(match);
+                if (matches.size() >= query.result_limit) {
+                    limit_reached = true;
+                    next_address = match + pointer_size;
+                    stop = true;
+                    break;
+                }
+            }
+            if (stop) {
+                break;
+            }
+            const auto carry_size = std::min(pointer_size - 1U, buffer.size());
+            carry.assign(buffer.end() - static_cast<std::ptrdiff_t>(carry_size), buffer.end());
+            cursor += static_cast<domain::Address>(*read);
+        }
+    }
+
+    ReferenceReport report;
+    report.mode = ReferenceMode::live_scan;
+    report.budget = ReferenceBudget{
+        static_cast<std::uint64_t>(query.byte_budget), query.result_limit, "live_scan"
+    };
+    report.matches = std::move(matches);
+    report.coverage.bytes_scanned = bytes_scanned;
+    report.coverage.bytes_eligible = bytes_eligible;
+    report.coverage.regions_scanned = regions_scanned;
+    report.coverage.regions_eligible = regions_eligible;
+    report.coverage.truncated_by_budget = budget_exhausted;
+    report.coverage.truncated_by_result_limit = limit_reached;
+    if (budget_exhausted) report.truncation_reasons.push_back(ReferenceTruncation::byte_budget_exhausted);
+    if (limit_reached) report.truncation_reasons.push_back(ReferenceTruncation::result_limit_reached);
+    if (read_failed) report.truncation_reasons.push_back(ReferenceTruncation::region_read_failed);
+    if (next_address) {
+        report.resume_token = domain::resume_token::encode(resume_key_, binding, *next_address);
+        report.next_start_address = next_address;
+    }
+    return report;
+}
+
+domain::Result<AddressInspection> MemoryDebugService::inspect_address(
+    const domain::SessionId& id,
+    const AddressInspectionRequest& request,
+    const std::stop_token cancellation
+) const {
+    // Everything that can be rejected without touching the target is rejected
+    // here, before a single byte is allocated or read.
+    auto authorization = policy_.authorize_inspection(request.limits);
+    if (!authorization) {
+        return std::unexpected(authorization.error());
+    }
+    if (request.pointer_width == domain::TargetPointerWidth::x86 &&
+        request.address > std::numeric_limits<std::uint32_t>::max()) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument, "address does not fit in a 32-bit pointer"
+        ));
+    }
+    if (request.references.mode == ReferenceMode::index) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::unsupported,
+            "reference mode index requires the persistent pointer index, which is not implemented"
+        ));
+    }
+
+    auto session = sessions_.get(id);
+    if (!session) {
+        return std::unexpected(session.error());
+    }
+    // One snapshot of each map per inspection: nothing below re-enumerates them
+    // per candidate.
+    auto region_result = (*session)->regions();
+    if (!region_result) {
+        return std::unexpected(region_result.error());
+    }
+    auto module_result = (*session)->modules();
+    if (!module_result) {
+        return std::unexpected(module_result.error());
+    }
+    const auto regions = domain::RegionIndex::create(*region_result);
+    const auto modules = domain::ModuleIndex::create(*module_result);
+    const auto pointer_size = domain::pointer_width_bytes(request.pointer_width);
+    const auto& limits = request.limits;
+
+    AddressInspection inspection;
+    inspection.address = request.address;
+    inspection.pointer_width = request.pointer_width;
+    inspection.sampled_at_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count()
+    );
+    inspection.analysis.lookbehind_bytes_requested = limits.lookbehind_bytes;
+
+    const auto note = [&inspection, &limits](
+        const domain::InspectionLimitation limitation,
+        const bool degrades_analysis
+    ) {
+        if (inspection.analysis.limitations.size() < limits.max_limitations) {
+            inspection.analysis.limitations.push_back(limitation);
+        }
+        if (degrades_analysis) {
+            inspection.analysis.complete = false;
+        }
+    };
+
+    const auto* region = regions.find(request.address);
+    if (region != nullptr) {
+        inspection.region = *region;
+    }
+    if (const auto owner = modules.reference(request.address)) {
+        const auto* module = modules.at(owner->module_index);
+        if (module != nullptr) {
+            inspection.module = InspectedModule{module->name, module->base, owner->rva};
+        }
+    }
+
+    if (region == nullptr) {
+        note(domain::InspectionLimitation::address_not_mapped, true);
+    } else if (!region->readable) {
+        // No speculative read: an unreadable mapping is an answer, not a reason
+        // to try anyway.
+        note(domain::InspectionLimitation::region_not_readable, true);
+    } else {
+        auto window = domain::compute_lookbehind_window(
+            request.address, request.pointer_width, limits.lookbehind_bytes, *region
+        );
+        if (!window) {
+            note(domain::InspectionLimitation::region_not_readable, true);
+        } else {
+            if (window->clamped_by_region) {
+                note(domain::InspectionLimitation::lookbehind_clamped_to_region, true);
+            }
+            std::vector<std::byte> sample(static_cast<std::size_t>(window->size()));
+            auto read = (*session)->read(window->start, sample);
+            if (!read || *read == 0U) {
+                note(domain::InspectionLimitation::lookbehind_short_read, true);
+            } else if (*read > sample.size()) {
+                return std::unexpected(error(
+                    domain::DebugErrorCode::io_error, "memory backend returned an oversized read"
+                ));
+            } else {
+                if (*read < sample.size()) {
+                    // Never zero-filled: the missing tail simply removes the
+                    // bases it would have covered.
+                    note(domain::InspectionLimitation::lookbehind_short_read, true);
+                    sample.resize(*read);
+                }
+                inspection.analysis.lookbehind_bytes_read = static_cast<std::uint64_t>(sample.size());
+
+                const auto bases = domain::collect_base_candidates(
+                    request.address, request.pointer_width, window->start, sample, regions, modules, limits
+                );
+                if (bases.base_limit_reached) {
+                    note(domain::InspectionLimitation::base_scan_limit_reached, true);
+                }
+                if (bases.probe_limit_reached) {
+                    note(domain::InspectionLimitation::vtable_probe_limit_reached, true);
+                }
+
+                const auto probe_bytes = limits.vtable_entries * pointer_size;
+                std::vector<std::byte> probe_buffer(probe_bytes);
+                std::vector<domain::VtableProbe> probes;
+                probes.reserve(bases.bases.size());
+                // Distinct bases frequently store the same vptr; reading it once
+                // keeps the probe budget meaningful.
+                std::vector<std::pair<domain::Address, std::size_t>> probed;
+                probed.reserve(bases.bases.size());
+
+                for (const auto& base : bases.bases) {
+                    if (cancellation.stop_requested()) {
+                        return std::unexpected(error(domain::DebugErrorCode::cancelled, "operation cancelled"));
+                    }
+                    const auto cached = std::ranges::find(probed, base.vtable_address, &std::pair<domain::Address, std::size_t>::first);
+                    if (cached != probed.end()) {
+                        auto reused = probes[cached->second];
+                        probes.push_back(std::move(reused));
+                        continue;
+                    }
+
+                    domain::VtableProbe probe;
+                    probe.vtable_address = base.vtable_address;
+                    probe.requested_entries = static_cast<std::uint32_t>(limits.vtable_entries);
+                    const auto* vtable_region = regions.find(base.vtable_address);
+                    const std::uint64_t available = vtable_region == nullptr
+                        ? 0U
+                        : vtable_region->end - base.vtable_address;
+                    const auto want = static_cast<std::size_t>(
+                        std::min<std::uint64_t>(static_cast<std::uint64_t>(probe_bytes), available)
+                    );
+                    ++inspection.analysis.vtable_probes_attempted;
+                    if (want >= pointer_size) {
+                        auto probe_read = (*session)->read(
+                            base.vtable_address, std::span<std::byte>{probe_buffer}.first(want)
+                        );
+                        if (probe_read && *probe_read >= pointer_size && *probe_read <= want) {
+                            const auto complete_entries = *probe_read / pointer_size;
+                            probe.entries.reserve(complete_entries);
+                            for (std::size_t entry = 0; entry < complete_entries; ++entry) {
+                                probe.entries.push_back(domain::decode_target_pointer(
+                                    std::span<const std::byte>{probe_buffer}.subspan(entry * pointer_size, pointer_size),
+                                    request.pointer_width
+                                ));
+                            }
+                            if (complete_entries == limits.vtable_entries) {
+                                ++inspection.analysis.vtable_probes_complete;
+                            }
+                        }
+                    }
+                    probe.short_read = probe.entries.size() < limits.vtable_entries;
+                    probed.emplace_back(base.vtable_address, probes.size());
+                    probes.push_back(std::move(probe));
+                }
+
+                auto classified = domain::classify_object_candidates(
+                    bases.bases, probes, regions, modules, limits
+                );
+                if (classified.short_vtable_read) {
+                    note(domain::InspectionLimitation::vtable_short_read, true);
+                }
+                if (classified.truncated) {
+                    note(domain::InspectionLimitation::candidate_limit_reached, true);
+                }
+                inspection.candidates_total = classified.candidates_total;
+                inspection.candidates_truncated = classified.truncated;
+                inspection.candidates.reserve(classified.candidates.size());
+                for (auto& candidate : classified.candidates) {
+                    InspectedCandidate resolved;
+                    resolved.object_address = candidate.object_address;
+                    resolved.field_offset = candidate.field_offset;
+                    resolved.vtable.address = candidate.vtable_address;
+                    if (candidate.vtable_module) {
+                        const auto* module = modules.at(candidate.vtable_module->module_index);
+                        if (module != nullptr) {
+                            resolved.vtable.module = InspectedModule{
+                                module->name, module->base, candidate.vtable_module->rva
+                            };
+                        }
+                    }
+                    resolved.confidence = candidate.confidence;
+                    resolved.evidence = std::move(candidate.evidence);
+                    resolved.provenance = std::move(candidate.provenance);
+                    inspection.candidates.push_back(std::move(resolved));
+                }
+            }
+        }
+    }
+
+    if (request.references.mode == ReferenceMode::live_scan) {
+        auto references = scan_references(
+            id, **session, regions.all(), request.address, request.pointer_width,
+            request.references, cancellation
+        );
+        if (!references) {
+            return std::unexpected(references.error());
+        }
+        if (!references->coverage.complete()) {
+            // The references block already carries its own coverage; the
+            // limitation only makes the whole answer auditable from one place.
+            note(domain::InspectionLimitation::references_incomplete, false);
+        }
+        inspection.references = std::move(*references);
+    }
+
+    return inspection;
+}
+
+domain::RuntimeLimits MemoryDebugService::runtime_limits() const {
+    domain::RuntimeLimits limits;
+    limits.max_slots_visited = policy_.max_unreal_slots_visited;
+    limits.max_objects_stored = policy_.max_unreal_objects_stored;
+    limits.max_classes_stored = policy_.max_unreal_classes_stored;
+    limits.max_properties_per_type = policy_.max_unreal_properties_per_type;
+    limits.max_super_depth = policy_.max_unreal_super_depth;
+    limits.max_property_nodes = policy_.max_unreal_property_nodes;
+    limits.max_name_bytes = policy_.max_unreal_name_bytes;
+    limits.max_page_retries = policy_.max_unreal_page_retries;
+    return limits;
+}
+
+UnrealProvenance MemoryDebugService::provenance_of(const UnrealRuntimeContext& context) const {
+    UnrealProvenance provenance;
+    provenance.profile_id = context.profile_id;
+    provenance.process_fingerprint = context.process_fingerprint;
+    provenance.root_origin = context.roots.origin;
+    provenance.confidence = context.confidence;
+    provenance.evidence = context.evidence;
+    provenance.failed_invariants = context.failed_invariants;
+    provenance.snapshot_status = context.snapshot_status;
+    return provenance;
+}
+
+domain::Result<MemoryDebugService::RuntimeQueryScope> MemoryDebugService::open_runtime_scope(
+    const domain::SessionId& id,
+    const domain::RuntimeId& runtime_id
+) const {
+    // The gate is re-checked on every query: turning the feature off must stop
+    // contexts published while it was on.
+    if (!policy_.enable_unreal_runtime) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::unsupported, "unreal runtime reflection is disabled"
+        ));
+    }
+    auto context = unreal_contexts_.get(id, runtime_id);
+    if (!context) {
+        return std::unexpected(context.error());
+    }
+    auto session = sessions_.get(id);
+    if (!session) {
+        return std::unexpected(session.error());
+    }
+    if ((*session)->pid() != (*context)->pid) {
+        return std::unexpected(error(domain::DebugErrorCode::invalid_state, "stale_context"));
+    }
+    const auto* profile = domain::find_unreal_profile((*context)->profile_id);
+    if (profile == nullptr) {
+        return std::unexpected(error(domain::DebugErrorCode::unsupported, "unsupported_profile"));
+    }
+
+    RuntimeQueryScope scope;
+    scope.session = *session;
+    scope.context = *context;
+    scope.view = std::make_shared<SessionRuntimeMemoryView>(scope.session);
+    auto snapshot = scope.view->refresh();
+    if (!snapshot) {
+        return std::unexpected(snapshot.error());
+    }
+    scope.snapshot = *snapshot;
+    scope.profile = profile;
+    return scope;
+}
+
+domain::Result<UnrealDiscoverResult> MemoryDebugService::unreal_runtime_discover(
+    const domain::SessionId& id,
+    const UnrealDiscoverRequest& request,
+    const std::stop_token cancellation
+) {
+    auto gate = policy_.authorize_unreal_runtime(request.profile_id);
+    if (!gate) {
+        return std::unexpected(gate.error());
+    }
+    const auto* profile = domain::find_unreal_profile(request.profile_id);
+    if (profile == nullptr) {
+        return std::unexpected(error(domain::DebugErrorCode::unsupported, "unsupported_profile"));
+    }
+
+    if (request.mode == domain::DiscoveryMode::auto_discovery) {
+        // The second gate is checked first so a disabled feature reports the
+        // gate rather than the missing engine behind it.
+        auto auto_gate = policy_.authorize_unreal_auto_discovery();
+        if (!auto_gate) {
+            return std::unexpected(auto_gate.error());
+        }
+        return std::unexpected(error(
+            domain::DebugErrorCode::unsupported,
+            "auto_discovery_unavailable: multi-pattern root discovery is not implemented"
+        ));
+    }
+    if (request.mode == domain::DiscoveryMode::build_profile) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::not_found,
+            "no_build_profile: no build fingerprint is registered for this module"
+        ));
+    }
+
+    const bool has_rva = request.gu_object_array_rva.has_value() || request.fname_pool_rva.has_value();
+    const bool has_address =
+        request.gu_object_array_address.has_value() || request.fname_pool_address.has_value();
+    const bool complete_rva =
+        request.gu_object_array_rva.has_value() && request.fname_pool_rva.has_value();
+    const bool complete_address =
+        request.gu_object_array_address.has_value() && request.fname_pool_address.has_value();
+    // oneOf, not precedence: mixing the two forms or supplying half of one is
+    // rejected instead of resolved silently.
+    if (has_rva == has_address || (has_rva && !complete_rva) || (has_address && !complete_address)) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument,
+            "conflicting_roots: supply either both RVAs or both absolute addresses"
+        ));
+    }
+
+    auto session = sessions_.get(id);
+    if (!session) {
+        return std::unexpected(session.error());
+    }
+    auto view = std::make_shared<SessionRuntimeMemoryView>(*session);
+    auto snapshot = view->refresh();
+    if (!snapshot) {
+        return std::unexpected(snapshot.error());
+    }
+
+    domain::UnrealRuntimeRoots roots;
+    std::string module_name = request.module_name;
+    std::uint64_t fingerprint = resume_key_;
+    if (complete_rva) {
+        if (request.module_name.empty()) {
+            return std::unexpected(error(
+                domain::DebugErrorCode::invalid_argument, "module is required when roots are RVAs"
+            ));
+        }
+        const domain::ModuleInfo* module = nullptr;
+        for (const auto& candidate : (*snapshot)->modules.all()) {
+            if (candidate.name == request.module_name || candidate.path == request.module_name) {
+                module = &candidate;
+                break;
+            }
+        }
+        if (module == nullptr) {
+            return std::unexpected(error(domain::DebugErrorCode::not_found, "module is not loaded"));
+        }
+        const auto object_array = domain::checked_add(module->base, *request.gu_object_array_rva);
+        const auto name_pool = domain::checked_add(module->base, *request.fname_pool_rva);
+        if (!object_array || !name_pool ||
+            *request.gu_object_array_rva >= module->size || *request.fname_pool_rva >= module->size) {
+            return std::unexpected(error(
+                domain::DebugErrorCode::invalid_argument, "root RVA is outside the module"
+            ));
+        }
+        roots.gu_object_array = *object_array;
+        roots.fname_pool = *name_pool;
+        roots.origin = domain::RootOrigin::explicit_rva;
+        module_name = module->name;
+        fingerprint = domain::resume_token::digest(module->name, fingerprint);
+        fingerprint = domain::resume_token::combine(fingerprint, module->size);
+    } else {
+        roots.gu_object_array = *request.gu_object_array_address;
+        roots.fname_pool = *request.fname_pool_address;
+        // Absolute addresses are valid for this session only and are never
+        // recorded as a reusable build profile.
+        roots.origin = domain::RootOrigin::explicit_address;
+        if (const auto* owner = (*snapshot)->modules.find(roots.gu_object_array); owner != nullptr) {
+            module_name = owner->name;
+            fingerprint = domain::resume_token::digest(owner->name, fingerprint);
+            fingerprint = domain::resume_token::combine(fingerprint, owner->size);
+        }
+    }
+    fingerprint = domain::resume_token::digest((*snapshot)->process_name, fingerprint);
+    fingerprint = domain::resume_token::combine(fingerprint, (*snapshot)->pid);
+
+    const auto limits = runtime_limits();
+    const domain::UnrealRuntimeReader reader{*view, *snapshot, *profile, limits, roots};
+    auto validation = reader.validate_roots(cancellation);
+    if (!validation) {
+        return std::unexpected(validation.error());
+    }
+    auto catalog = reader.build_class_catalog(cancellation);
+    if (!catalog) {
+        return std::unexpected(catalog.error());
+    }
+
+    std::size_t retained = catalog->classes.size() * sizeof(domain::UnrealClassSummary);
+    for (const auto& summary : catalog->classes) {
+        retained += summary.name.size() + summary.super_name.value_or(std::string{}).size();
+    }
+    if (retained > policy_.max_unreal_context_bytes) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::limit_exceeded, "derived catalog exceeds the retained byte limit"
+        ));
+    }
+
+    UnrealRuntimeContext context{
+        id,
+        (*session)->pid(),
+        profile->id,
+        module_name,
+        roots,
+        validation->confidence,
+        validation->evidence,
+        validation->failed_invariants,
+        std::string{},
+        std::make_shared<const domain::ClassCatalog>(std::move(*catalog)),
+        domain::SnapshotStatus::stable,
+        std::chrono::steady_clock::now(),
+        std::chrono::steady_clock::now() + std::chrono::seconds{policy_.unreal_context_ttl_seconds},
+        retained
+    };
+    // Non-reversible and stable for comparison inside this server run; never a
+    // dump of a path or of module bytes.
+    context.process_fingerprint = "fp-" + std::to_string(fingerprint);
+
+    auto published = unreal_contexts_.publish(
+        std::move(context), policy_.max_unreal_contexts_per_session, policy_.max_unreal_contexts_total
+    );
+    if (!published) {
+        return std::unexpected(published.error());
+    }
+
+    UnrealDiscoverResult result;
+    result.runtime_id = published->id.value();
+    result.module_name = published->context->module_name;
+    result.roots = published->context->roots;
+    result.provenance = provenance_of(*published->context);
+    result.class_count = published->context->catalog->classes.size();
+    result.classes_truncated = published->context->catalog->truncated;
+    result.progress = published->context->catalog->progress;
+    result.expires_in_ms = static_cast<std::uint64_t>(policy_.unreal_context_ttl_seconds) * 1000U;
+    return result;
+}
+
+domain::Result<UnrealClassPage> MemoryDebugService::unreal_runtime_classes(
+    const domain::SessionId& id,
+    const domain::RuntimeId& runtime_id,
+    const std::string_view name_contains,
+    const std::size_t limit,
+    const std::string_view page_token
+) const {
+    if (limit == 0U || limit > policy_.max_scan_results) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::limit_exceeded, "limit exceeds the configured result limit"
+        ));
+    }
+    if (!policy_.enable_unreal_runtime) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::unsupported, "unreal runtime reflection is disabled"
+        ));
+    }
+    auto context = unreal_contexts_.get(id, runtime_id);
+    if (!context) {
+        return std::unexpected(context.error());
+    }
+
+    // The token is bound to the context and to the filter, so it cannot be
+    // replayed against a different query and is never a bare client index.
+    auto binding = domain::resume_token::digest(runtime_id.value(), resume_key_);
+    binding = domain::resume_token::digest(id.value(), binding);
+    binding = domain::resume_token::digest(name_contains, binding);
+    std::size_t offset = 0;
+    if (!page_token.empty()) {
+        const auto decoded = domain::resume_token::decode(page_token, resume_key_, binding);
+        if (!decoded) {
+            return std::unexpected(error(
+                domain::DebugErrorCode::invalid_argument, "page_token does not belong to this query"
+            ));
+        }
+        offset = static_cast<std::size_t>(*decoded);
+    }
+
+    const auto& classes = (*context)->catalog->classes;
+    UnrealClassPage page;
+    page.offset = offset;
+    page.provenance = provenance_of(**context);
+    for (std::size_t index = 0; index < classes.size(); ++index) {
+        const auto& summary = classes[index];
+        if (!name_contains.empty() && summary.name.find(name_contains) == std::string::npos) {
+            continue;
+        }
+        ++page.total_matched;
+        if (page.total_matched <= offset) {
+            continue;
+        }
+        if (page.classes.size() < limit) {
+            page.classes.push_back(summary);
+        } else if (!page.next_page_token) {
+            page.next_page_token = domain::resume_token::encode(
+                resume_key_, binding, static_cast<domain::Address>(offset + page.classes.size())
+            );
+        }
+    }
+    return page;
+}
+
+domain::Result<UnrealTypeResult> MemoryDebugService::unreal_runtime_type(
+    const domain::SessionId& id,
+    const domain::RuntimeId& runtime_id,
+    const std::optional<domain::Address> class_address,
+    const std::string_view class_name,
+    const bool include_inherited,
+    const std::size_t max_properties,
+    const std::size_t max_super_depth,
+    const std::stop_token cancellation
+) const {
+    if (class_address.has_value() == !class_name.empty()) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument, "supply either class_address or class_name"
+        ));
+    }
+    if (max_properties == 0U || max_properties > policy_.max_unreal_properties_per_type) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::limit_exceeded, "max_properties exceeds the configured limit"
+        ));
+    }
+    if (max_super_depth == 0U || max_super_depth > policy_.max_unreal_super_depth) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::limit_exceeded, "max_super_depth exceeds the configured limit"
+        ));
+    }
+    auto scope = open_runtime_scope(id, runtime_id);
+    if (!scope) {
+        return std::unexpected(scope.error());
+    }
+
+    // Only addresses that the validated catalog already contains are accepted;
+    // an arbitrary address would turn this into a generic memory parser.
+    const auto& classes = scope->context->catalog->classes;
+    domain::Address resolved = 0;
+    if (class_address) {
+        const auto found = std::ranges::find(classes, *class_address, &domain::UnrealClassSummary::class_address);
+        if (found == classes.end()) {
+            return std::unexpected(error(domain::DebugErrorCode::not_found, "class is not in the catalog"));
+        }
+        resolved = found->class_address;
+    } else {
+        std::size_t matches = 0;
+        for (const auto& summary : classes) {
+            if (summary.name == class_name) {
+                ++matches;
+                resolved = summary.class_address;
+            }
+        }
+        if (matches == 0U) {
+            return std::unexpected(error(domain::DebugErrorCode::not_found, "class is not in the catalog"));
+        }
+        if (matches > 1U) {
+            return std::unexpected(error(
+                domain::DebugErrorCode::invalid_argument, "ambiguous: class_name matches more than one class"
+            ));
+        }
+    }
+
+    const domain::UnrealRuntimeReader reader{
+        *scope->view, scope->snapshot, *scope->profile, runtime_limits(), scope->context->roots
+    };
+    auto type = reader.read_type(resolved, include_inherited, max_properties, max_super_depth, cancellation);
+    if (!type) {
+        return std::unexpected(type.error());
+    }
+
+    UnrealTypeResult result;
+    result.provenance = provenance_of(*scope->context);
+    if (!type->failed_invariants.empty()) {
+        result.provenance.failed_invariants.insert(
+            result.provenance.failed_invariants.end(),
+            type->failed_invariants.begin(), type->failed_invariants.end()
+        );
+        result.provenance.confidence = domain::RuntimeConfidence::low;
+    }
+    result.type = std::move(*type);
+    return result;
+}
+
+domain::Result<UnrealObjectsPage> MemoryDebugService::unreal_runtime_objects(
+    const domain::SessionId& id,
+    const domain::RuntimeId& runtime_id,
+    const std::string_view class_name,
+    const bool include_derived,
+    const std::size_t max_objects,
+    const std::string_view page_token,
+    const std::stop_token cancellation
+) const {
+    if (max_objects == 0U || max_objects > policy_.max_unreal_objects_stored) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::limit_exceeded, "max_objects exceeds the configured limit"
+        ));
+    }
+    auto scope = open_runtime_scope(id, runtime_id);
+    if (!scope) {
+        return std::unexpected(scope.error());
+    }
+
+    auto binding = domain::resume_token::digest(runtime_id.value(), resume_key_);
+    binding = domain::resume_token::digest(id.value(), binding);
+    binding = domain::resume_token::digest(class_name, binding);
+    binding = domain::resume_token::combine(binding, include_derived ? 1U : 0U);
+    std::uint64_t start_slot = 0;
+    if (!page_token.empty()) {
+        const auto decoded = domain::resume_token::decode(page_token, resume_key_, binding);
+        if (!decoded) {
+            return std::unexpected(error(
+                domain::DebugErrorCode::invalid_argument, "page_token does not belong to this query"
+            ));
+        }
+        start_slot = *decoded;
+    }
+
+    const domain::UnrealRuntimeReader reader{
+        *scope->view, scope->snapshot, *scope->profile, runtime_limits(), scope->context->roots
+    };
+    auto page = reader.enumerate_objects(
+        class_name, include_derived, start_slot, max_objects, cancellation
+    );
+    if (!page) {
+        return std::unexpected(page.error());
+    }
+
+    UnrealObjectsPage result;
+    result.objects = std::move(page->objects);
+    result.progress = page->progress;
+    result.truncated = page->truncated;
+    result.provenance = provenance_of(*scope->context);
+    result.provenance.snapshot_status = page->status;
+    // Continuation follows the sweep position, so a page whose filter matched
+    // nothing still advances and a page cut short does not skip slots.
+    if (page->truncated && page->next_slot > start_slot) {
+        result.next_page_token = domain::resume_token::encode(resume_key_, binding, page->next_slot);
+    }
+    return result;
+}
+
+domain::Result<void> MemoryDebugService::unreal_runtime_release(
+    const domain::SessionId& id,
+    const domain::RuntimeId& runtime_id
+) {
+    if (!policy_.enable_unreal_runtime) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::unsupported, "unreal runtime reflection is disabled"
+        ));
+    }
+    return unreal_contexts_.release(id, runtime_id);
 }
 
 }  // namespace argos::application

@@ -1,6 +1,39 @@
 # Spec 0012 — Reflexão Unreal em runtime sem PDB
 
-Status: proposto · ADR: [0019](../adr/0019-unreal-runtime-reflection.md)
+Status: implementado (entrega incremental 1–5) · ADR: [0019](../adr/0019-unreal-runtime-reflection.md)
+
+## Estado da entrega
+
+Implementado: a porta de leitura `RuntimeMemoryView`, os perfis versionados
+`ue5-fproperty-x64` (`FField`/`FProperty`) e `ue4-uproperty-x64`
+(`UField`/`UProperty`), o parser de `GUObjectArray`/`FNamePool`/`UClass`/
+`UStruct`/properties com todas as invariantes de validação, a consistência de
+snapshot por releitura com digest de tuples, o registro de contexts com quotas,
+TTL e release próprio, e as cinco tools MCP atrás de gate + allowlist de perfil.
+As fixtures sintéticas estão em `tests/unit/test_unreal_runtime.cpp`, incluindo
+o caso de regressão de um campo em `+0x590`.
+
+Diferenças em relação ao texto original, por dependência não implementada:
+
+- **Jobs.** A Spec 0008 (`AnalysisJobManager`, `job_status/results/cancel/release`)
+  não existe. `discover` e `objects` executam de forma síncrona e bounded, com
+  deadline implícito nos limites de slots/objetos. A resposta traz
+  `execution: "synchronous"` e o mesmo envelope terminal (`result` +
+  `termination`) do contrato assíncrono, e `objects` pagina por `page_token`
+  opaco vinculado ao contexto e ao filtro. Migrar para jobs continua aditivo:
+  nenhuma tool própria de controle foi criada, e não há pool, thread destacada
+  nem registry de jobs paralelo.
+- **`mode: "profile"`.** Retorna `not_found` com motivo `no_build_profile`:
+  nenhum fingerprint de build está registrado neste release. A origem
+  `build_profile` já existe no contrato e nas regras de confiança.
+- **`mode: "auto"`.** Exige o segundo gate (`ARGOS_MCP_ENABLE_UNREAL_AUTO_DISCOVERY`)
+  e, com ele ligado, retorna `unsupported`: a descoberta multipadrão da
+  [Spec 0009](0009-scan-composition-and-multi-pattern.md) não está implementada.
+  `signature_candidate` continua sem alcançar `confidence: high`.
+
+Além do texto original, nomes lidos do alvo são sanitizados para ASCII
+imprimível antes de entrarem no protocolo: um nome hostil não deve injetar
+caracteres de controle nem UTF-8 inválido no fluxo JSON-RPC.
 
 ## Objetivo
 

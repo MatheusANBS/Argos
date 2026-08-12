@@ -2,8 +2,11 @@
 
 #include "argos_mcp/application/scan_session_manager.hpp"
 #include "argos_mcp/application/session_manager.hpp"
+#include "argos_mcp/application/unreal_runtime_manager.hpp"
+#include "argos_mcp/domain/address_inspection.hpp"
 #include "argos_mcp/domain/process_memory.hpp"
 #include "argos_mcp/domain/type_metadata.hpp"
+#include "argos_mcp/domain/unreal_runtime.hpp"
 #include "argos_mcp/security/policy.hpp"
 
 #include <cstddef>
@@ -67,6 +70,156 @@ struct PointerChainScanResult {
     std::vector<PointerChainCandidate> candidates;
     std::size_t bytes_scanned{};
     bool truncated{false};
+};
+
+// --- memory_debug.inspect_address ------------------------------------------
+
+// `index` is declared here because the contract distinguishes the three modes,
+// but it stays unavailable until the persistent pointer index of Spec 0010
+// exists: asking for it returns `unsupported` rather than silently downgrading
+// to a live scan with a different cost and coverage.
+enum class ReferenceMode { none, index, live_scan };
+
+struct ReferenceQuery {
+    ReferenceMode mode{ReferenceMode::none};
+    std::size_t byte_budget{};
+    std::size_t result_limit{};
+    bool writable_only{false};
+    std::optional<domain::Address> start_address;
+    std::optional<domain::Address> end_address;
+    std::string resume_token;
+};
+
+struct ReferenceBudget {
+    std::uint64_t byte_budget{};
+    std::size_t result_limit{};
+    std::string source;
+};
+
+// Why a slice stopped early. Empty means the slice ended because it ran out of
+// address space to sweep, which is the only case where an empty match list is
+// conclusive.
+enum class ReferenceTruncation { byte_budget_exhausted, result_limit_reached, region_read_failed };
+
+[[nodiscard]] std::string_view to_string(ReferenceTruncation reason) noexcept;
+
+struct ReferenceReport {
+    ReferenceMode mode{ReferenceMode::none};
+    ReferenceBudget budget;
+    std::vector<domain::Address> matches;
+    domain::ScanCoverage coverage;
+    std::optional<std::string> resume_token;
+    // Diagnostic only: continuation always goes through resume_token, which is
+    // bound to the query. A raw address would lose that binding.
+    std::optional<domain::Address> next_start_address;
+    std::vector<ReferenceTruncation> truncation_reasons;
+};
+
+struct InspectedModule {
+    std::string name;
+    domain::Address base{};
+    std::uint64_t rva{};
+};
+
+struct InspectedVtable {
+    domain::Address address{};
+    std::optional<InspectedModule> module;
+};
+
+struct InspectedCandidate {
+    domain::Address object_address{};
+    std::uint64_t field_offset{};
+    InspectedVtable vtable;
+    domain::DerivedConfidence confidence{};
+    std::vector<domain::DerivedEvidence> evidence;
+    std::vector<domain::ProvenanceKind> provenance;
+};
+
+struct InspectionAnalysisReport {
+    std::uint64_t lookbehind_bytes_requested{};
+    std::uint64_t lookbehind_bytes_read{};
+    std::size_t vtable_probes_attempted{};
+    std::size_t vtable_probes_complete{};
+    bool complete{true};
+    std::vector<domain::InspectionLimitation> limitations;
+};
+
+struct AddressInspection {
+    domain::Address address{};
+    domain::TargetPointerWidth pointer_width{};
+    std::uint64_t sampled_at_ms{};
+    std::optional<domain::MemoryRegion> region;
+    std::optional<InspectedModule> module;
+    InspectionAnalysisReport analysis;
+    std::vector<InspectedCandidate> candidates;
+    std::size_t candidates_total{};
+    bool candidates_truncated{false};
+    std::optional<ReferenceReport> references;
+};
+
+struct AddressInspectionRequest {
+    domain::Address address{};
+    domain::TargetPointerWidth pointer_width{domain::TargetPointerWidth::x64};
+    domain::InspectionLimits limits;
+    ReferenceQuery references;
+};
+
+// --- memory_debug.unreal_runtime_* -----------------------------------------
+
+// Attached to every runtime-derived response, in success and in partial
+// results. It never claims the PDB path's confidence, and it keeps the two
+// sources comparable instead of merging them.
+struct UnrealProvenance {
+    std::string source{"unreal:runtime-reflection"};
+    std::string profile_id;
+    std::string process_fingerprint;
+    domain::RootOrigin root_origin{domain::RootOrigin::explicit_address};
+    domain::RuntimeConfidence confidence{domain::RuntimeConfidence::low};
+    std::vector<domain::RuntimeEvidence> evidence;
+    std::vector<domain::RuntimeInvariant> failed_invariants;
+    domain::SnapshotStatus snapshot_status{domain::SnapshotStatus::stable};
+};
+
+struct UnrealDiscoverRequest {
+    std::string module_name;
+    std::string profile_id;
+    domain::DiscoveryMode mode{domain::DiscoveryMode::explicit_roots};
+    std::optional<std::uint64_t> gu_object_array_rva;
+    std::optional<std::uint64_t> fname_pool_rva;
+    std::optional<domain::Address> gu_object_array_address;
+    std::optional<domain::Address> fname_pool_address;
+};
+
+struct UnrealDiscoverResult {
+    std::string runtime_id;
+    std::string module_name;
+    domain::UnrealRuntimeRoots roots;
+    UnrealProvenance provenance;
+    std::size_t class_count{};
+    bool classes_truncated{false};
+    domain::UnrealRuntimeProgress progress;
+    std::uint64_t expires_in_ms{};
+};
+
+struct UnrealClassPage {
+    std::vector<domain::UnrealClassSummary> classes;
+    std::size_t total_matched{};
+    std::size_t offset{};
+    std::optional<std::string> next_page_token;
+    UnrealProvenance provenance;
+};
+
+struct UnrealTypeResult {
+    domain::UnrealRuntimeType type;
+    UnrealProvenance provenance;
+};
+
+struct UnrealObjectsPage {
+    std::vector<domain::UnrealObjectSummary> objects;
+    domain::UnrealRuntimeProgress progress;
+    bool truncated{false};
+    std::optional<std::string> next_page_token;
+    UnrealProvenance provenance;
 };
 
 class MemoryDebugService final {
@@ -285,6 +438,58 @@ public:
 
     [[nodiscard]] domain::Result<void> scan_reset(const domain::ScanSessionId& scan_id);
 
+    // Correlates one address with its region, module, probable object/vtable
+    // shapes and -- only when asked, and only within an explicit budget --
+    // references to it. Read-only, and every classification stays probable.
+    [[nodiscard]] domain::Result<AddressInspection> inspect_address(
+        const domain::SessionId& id,
+        const AddressInspectionRequest& request,
+        std::stop_token cancellation = {}
+    ) const;
+
+    // Validates the engine roots against an explicitly enabled layout profile
+    // and publishes a runtime context plus its class catalog. Read-only: no
+    // function in the target is ever called.
+    [[nodiscard]] domain::Result<UnrealDiscoverResult> unreal_runtime_discover(
+        const domain::SessionId& id,
+        const UnrealDiscoverRequest& request,
+        std::stop_token cancellation = {}
+    );
+
+    [[nodiscard]] domain::Result<UnrealClassPage> unreal_runtime_classes(
+        const domain::SessionId& id,
+        const domain::RuntimeId& runtime_id,
+        std::string_view name_contains,
+        std::size_t limit,
+        std::string_view page_token
+    ) const;
+
+    [[nodiscard]] domain::Result<UnrealTypeResult> unreal_runtime_type(
+        const domain::SessionId& id,
+        const domain::RuntimeId& runtime_id,
+        std::optional<domain::Address> class_address,
+        std::string_view class_name,
+        bool include_inherited,
+        std::size_t max_properties,
+        std::size_t max_super_depth,
+        std::stop_token cancellation = {}
+    ) const;
+
+    [[nodiscard]] domain::Result<UnrealObjectsPage> unreal_runtime_objects(
+        const domain::SessionId& id,
+        const domain::RuntimeId& runtime_id,
+        std::string_view class_name,
+        bool include_derived,
+        std::size_t max_objects,
+        std::string_view page_token,
+        std::stop_token cancellation = {}
+    ) const;
+
+    [[nodiscard]] domain::Result<void> unreal_runtime_release(
+        const domain::SessionId& id,
+        const domain::RuntimeId& runtime_id
+    );
+
 private:
     [[nodiscard]] domain::Result<std::string> module_path(
         const domain::SessionId& id,
@@ -303,11 +508,46 @@ private:
         std::stop_token cancellation
     ) const;
 
+    [[nodiscard]] domain::Result<ReferenceReport> scan_references(
+        const domain::SessionId& id,
+        const domain::ProcessSession& session,
+        std::span<const domain::MemoryRegion> sorted_regions,
+        domain::Address target,
+        domain::TargetPointerWidth width,
+        const ReferenceQuery& query,
+        std::stop_token cancellation
+    ) const;
+
+    // Shared by every Unreal runtime query: opens the context, checks that the
+    // owning session still points at the same process, and builds a reader over
+    // a fresh address-space snapshot.
+    struct RuntimeQueryScope {
+        std::shared_ptr<domain::ProcessSession> session;
+        std::shared_ptr<const UnrealRuntimeContext> context;
+        std::shared_ptr<SessionRuntimeMemoryView> view;
+        std::shared_ptr<const domain::RuntimeAddressSpaceSnapshot> snapshot;
+        const domain::UnrealRuntimeProfile* profile{};
+    };
+
+    [[nodiscard]] domain::Result<RuntimeQueryScope> open_runtime_scope(
+        const domain::SessionId& id,
+        const domain::RuntimeId& runtime_id
+    ) const;
+
+    [[nodiscard]] domain::RuntimeLimits runtime_limits() const;
+    [[nodiscard]] UnrealProvenance provenance_of(const UnrealRuntimeContext& context) const;
+
     std::unique_ptr<domain::ProcessMemoryProvider> provider_;
     std::unique_ptr<domain::TypeMetadataProvider> metadata_provider_;
     security::SecurityPolicy policy_;
     SessionManager sessions_;
     mutable ScanSessionManager scan_sessions_;
+    mutable UnrealRuntimeManager unreal_contexts_;
+    // Per-process key for resume tokens. It never leaves the server, so a token
+    // cannot be forged or replayed against a different query, and it dies with
+    // the process -- a restarted server rejects stale continuations instead of
+    // resuming a sweep over an address space that no longer exists.
+    std::uint64_t resume_key_{};
 };
 
 }  // namespace argos::application

@@ -1,6 +1,31 @@
 # Spec 0011 — Inspeção bounded de endereço
 
-Status: proposto · ADR: [0013](../adr/0013-address-inspection-derived-evidence.md)
+Status: implementado · ADR: [0013](../adr/0013-address-inspection-derived-evidence.md)
+
+## Estado da entrega
+
+`memory_debug.inspect_address` está implementada: classificador puro no domínio
+(`domain/address_inspection.hpp`), orquestração em `MemoryDebugService` e
+contrato MCP em `protocol/mcp/tools.cpp`. Região, módulo/RVA, candidatos
+rankeados com `probable`/confidence/evidence/provenance, limites, limitações
+tipadas e referências `live_scan` com cobertura e `resume_token` seguem o
+contrato abaixo.
+
+Duas diferenças em relação ao texto original, por dependência não implementada:
+
+- `references.mode: "index"` é validado e recusado com `unsupported`. Ele
+  depende da [Spec 0010](0010-persistent-pointer-index.md); um downgrade
+  silencioso para `live_scan` mudaria custo e cobertura sem o cliente saber.
+  `next_cursor` já existe na resposta, sempre `null`, para que a forma não mude
+  quando o índice chegar;
+- `live_scan` é um slice síncrono e bounded. Ele já expõe cobertura,
+  `resume_token` autoritativo, `next_start_address` apenas diagnóstico e
+  `truncation_reasons`; o modelo de job/cancelamento assíncrono da ADR-0012
+  permanece proposto.
+
+O plano de testes está em `tests/unit/test_address_inspection.cpp`
+(`SparseFakeSession` em `tests/unit/sparse_fake_session.hpp`) e nas asserções de
+contrato em `tests/contract/test_mcp_contract.cpp`.
 
 ## Objetivo
 

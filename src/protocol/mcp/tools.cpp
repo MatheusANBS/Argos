@@ -1,5 +1,6 @@
 #include "argos_mcp/protocol/mcp/tools.hpp"
 
+#include "argos_mcp/domain/address_inspection.hpp"
 #include "argos_mcp/domain/types.hpp"
 
 #include <algorithm>
@@ -210,6 +211,18 @@ using InputResult = std::expected<T, InputError>;
         return std::unexpected(text.error());
     }
     auto id = domain::SessionId::create(std::move(*text));
+    if (!id) {
+        return std::unexpected(InputError{id.error()});
+    }
+    return *id;
+}
+
+[[nodiscard]] InputResult<domain::RuntimeId> runtime_arg(const Value& arguments) {
+    auto text = string_arg(arguments, "runtime_id", true);
+    if (!text) {
+        return std::unexpected(text.error());
+    }
+    auto id = domain::RuntimeId::create(std::move(*text));
     if (!id) {
         return std::unexpected(InputError{id.error()});
     }
@@ -555,6 +568,230 @@ using InputResult = std::expected<T, InputError>;
         {"largest_region_bytes", static_cast<std::int64_t>(summary.largest_region_bytes)},
         {"lowest_address", hex_address(summary.lowest_address)},
         {"highest_address", hex_address(summary.highest_address)}
+    });
+}
+
+[[nodiscard]] Value unsigned_json(const std::uint64_t value) {
+    return Value{static_cast<std::int64_t>(std::min<std::uint64_t>(
+        value, static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())
+    ))};
+}
+
+[[nodiscard]] Value inspected_module_to_json(const application::InspectedModule& module) {
+    return Value::object({
+        {"name", module.name},
+        {"base", hex_address(module.base)},
+        {"rva", unsigned_json(module.rva)}
+    });
+}
+
+[[nodiscard]] Value inspection_candidate_to_json(
+    const application::InspectedCandidate& candidate,
+    const std::size_t rank
+) {
+    Value::Array evidence;
+    evidence.reserve(candidate.evidence.size());
+    for (const auto& item : candidate.evidence) {
+        evidence.push_back(Value::object({
+            {"kind", std::string{domain::to_string(item.kind)}},
+            {"observed", static_cast<std::int64_t>(item.observed)},
+            {"sampled", static_cast<std::int64_t>(item.sampled)}
+        }));
+    }
+    Value::Array provenance;
+    provenance.reserve(candidate.provenance.size());
+    for (const auto kind : candidate.provenance) {
+        provenance.push_back(Value{std::string{domain::to_string(kind)}});
+    }
+
+    Value vtable = Value::object({{"address", hex_address(candidate.vtable.address)}});
+    if (candidate.vtable.module) {
+        vtable["module"] = Value{candidate.vtable.module->name};
+        vtable["module_base"] = Value{hex_address(candidate.vtable.module->base)};
+        vtable["rva"] = unsigned_json(candidate.vtable.module->rva);
+    } else {
+        // Absence is absence: no "unknown" module and no sentinel RVA.
+        vtable["module"] = Value{nullptr};
+        vtable["module_base"] = Value{nullptr};
+        vtable["rva"] = Value{nullptr};
+    }
+
+    return Value::object({
+        {"rank", static_cast<std::int64_t>(rank)},
+        // Never "confirmed", whatever the confidence says.
+        {"classification", "probable"},
+        {"object_address", hex_address(candidate.object_address)},
+        {"field_offset", unsigned_json(candidate.field_offset)},
+        {"vtable", std::move(vtable)},
+        {"confidence", std::string{domain::to_string(candidate.confidence)}},
+        {"evidence", Value{std::move(evidence)}},
+        {"provenance", Value{std::move(provenance)}}
+    });
+}
+
+[[nodiscard]] Value reference_report_to_json(const application::ReferenceReport& report) {
+    Value::Array matches;
+    matches.reserve(report.matches.size());
+    for (const auto address : report.matches) matches.push_back(Value{hex_address(address)});
+
+    Value::Array reasons;
+    reasons.reserve(report.truncation_reasons.size());
+    for (const auto reason : report.truncation_reasons) {
+        reasons.push_back(Value{std::string{application::to_string(reason)}});
+    }
+
+    Value value = Value::object({
+        {"mode", std::string{domain::to_string(
+            report.mode == application::ReferenceMode::live_scan
+                ? domain::ReferenceSource::live_scan
+                : (report.mode == application::ReferenceMode::index
+                    ? domain::ReferenceSource::index
+                    : domain::ReferenceSource::none)
+        )}},
+        {"budget", Value::object({
+            {"byte_budget", unsigned_json(report.budget.byte_budget)},
+            {"result_limit", static_cast<std::int64_t>(report.budget.result_limit)},
+            {"source", report.budget.source}
+        })},
+        {"matches", Value{std::move(matches)}},
+        {"coverage", scan_coverage_to_json(report.coverage)},
+        {"truncation_reasons", Value{std::move(reasons)}}
+    });
+    // Paging by cursor belongs to the index mode, which is not implemented yet;
+    // the field stays present and null so the shape does not change later.
+    value["next_cursor"] = Value{nullptr};
+    value["resume_token"] = report.resume_token ? Value{*report.resume_token} : Value{nullptr};
+    value["next_start_address"] = report.next_start_address
+        ? Value{hex_address(*report.next_start_address)}
+        : Value{nullptr};
+    return value;
+}
+
+[[nodiscard]] Value address_inspection_to_json(const application::AddressInspection& inspection) {
+    Value::Array limitations;
+    limitations.reserve(inspection.analysis.limitations.size());
+    for (const auto limitation : inspection.analysis.limitations) {
+        limitations.push_back(Value{std::string{domain::to_string(limitation)}});
+    }
+
+    Value::Array candidates;
+    candidates.reserve(inspection.candidates.size());
+    for (std::size_t rank = 0; rank < inspection.candidates.size(); ++rank) {
+        candidates.push_back(inspection_candidate_to_json(inspection.candidates[rank], rank));
+    }
+
+    Value value = Value::object({
+        {"address", hex_address(inspection.address)},
+        {"pointer_size", std::to_string(domain::pointer_width_bytes(inspection.pointer_width))},
+        {"sampled_at_ms", unsigned_json(inspection.sampled_at_ms)},
+        {"analysis", Value::object({
+            {"lookbehind_bytes_requested", unsigned_json(inspection.analysis.lookbehind_bytes_requested)},
+            {"lookbehind_bytes_read", unsigned_json(inspection.analysis.lookbehind_bytes_read)},
+            {"vtable_probes_attempted", static_cast<std::int64_t>(inspection.analysis.vtable_probes_attempted)},
+            {"vtable_probes_complete", static_cast<std::int64_t>(inspection.analysis.vtable_probes_complete)},
+            {"complete", inspection.analysis.complete},
+            {"limitations", Value{std::move(limitations)}}
+        })},
+        {"object_candidates", Value{std::move(candidates)}},
+        {"object_candidates_total", static_cast<std::int64_t>(inspection.candidates_total)},
+        {"object_candidates_truncated", inspection.candidates_truncated}
+    });
+    value["region"] = inspection.region ? region_to_json(*inspection.region) : Value{nullptr};
+    value["module"] = inspection.module ? inspected_module_to_json(*inspection.module) : Value{nullptr};
+    value["references"] = inspection.references
+        ? reference_report_to_json(*inspection.references)
+        : Value{nullptr};
+    return value;
+}
+
+[[nodiscard]] Value unreal_provenance_to_json(const application::UnrealProvenance& provenance) {
+    Value::Array evidence;
+    evidence.reserve(provenance.evidence.size());
+    for (const auto item : provenance.evidence) {
+        evidence.push_back(Value{std::string{domain::to_string(item)}});
+    }
+    Value::Array failed;
+    failed.reserve(provenance.failed_invariants.size());
+    for (const auto item : provenance.failed_invariants) {
+        failed.push_back(Value{std::string{domain::to_string(item)}});
+    }
+    return Value::object({
+        {"source", provenance.source},
+        {"confidence", std::string{domain::to_string(provenance.confidence)}},
+        {"profile_id", provenance.profile_id},
+        {"process_fingerprint", provenance.process_fingerprint},
+        {"root_origin", std::string{domain::to_string(provenance.root_origin)}},
+        {"evidence", Value{std::move(evidence)}},
+        {"failed_invariants", Value{std::move(failed)}},
+        {"snapshot_status", std::string{domain::to_string(provenance.snapshot_status)}}
+    });
+}
+
+[[nodiscard]] Value unreal_progress_to_json(const domain::UnrealRuntimeProgress& progress) {
+    return Value::object({
+        {"slots_visited", static_cast<std::int64_t>(progress.slots_visited)},
+        {"slots_eligible", static_cast<std::int64_t>(progress.slots_eligible)},
+        {"objects_found", static_cast<std::int64_t>(progress.objects_found)},
+        {"objects_stored", static_cast<std::int64_t>(progress.objects_stored)},
+        {"classes_validated", static_cast<std::int64_t>(progress.classes_validated)},
+        {"classes_rejected", static_cast<std::int64_t>(progress.classes_rejected)},
+        {"properties_validated", static_cast<std::int64_t>(progress.properties_validated)},
+        {"retries", static_cast<std::int64_t>(progress.retries)}
+    });
+}
+
+[[nodiscard]] Value unreal_class_to_json(const domain::UnrealClassSummary& summary) {
+    Value value = Value::object({
+        {"class_address", hex_address(summary.class_address)},
+        {"name", summary.name},
+        {"property_count", static_cast<std::int64_t>(summary.property_count)}
+    });
+    value["super_address"] = summary.super_address
+        ? Value{hex_address(*summary.super_address)}
+        : Value{nullptr};
+    value["super_name"] = summary.super_name ? Value{*summary.super_name} : Value{nullptr};
+    return value;
+}
+
+[[nodiscard]] Value unreal_property_to_json(const domain::UnrealPropertyInfo& property) {
+    return Value::object({
+        {"metadata_address", hex_address(property.metadata_address)},
+        {"name", property.name},
+        {"kind", property.reflected_kind},
+        {"offset", unsigned_json(property.offset_internal)},
+        {"element_size", unsigned_json(property.element_size)},
+        {"array_dim", unsigned_json(property.array_dim)},
+        // Hex string, not a JSON number: 64-bit property flags do not survive
+        // a double round-trip in every client.
+        {"flags", hex_address(property.flags)},
+        {"declaring_class", hex_address(property.declaring_class)},
+        {"declaring_class_name", property.declaring_class_name},
+        {"confidence", std::string{domain::to_string(property.confidence)}}
+    });
+}
+
+[[nodiscard]] Value unreal_object_to_json(const domain::UnrealObjectSummary& object) {
+    Value value = Value::object({
+        {"object_index", unsigned_json(object.object_index)},
+        {"object_address", hex_address(object.object_address)},
+        {"class_address", hex_address(object.class_address)},
+        {"object_name", object.object_name},
+        {"class_name", object.class_name}
+    });
+    value["outer_address"] = object.outer_address
+        ? Value{hex_address(*object.outer_address)}
+        : Value{nullptr};
+    return value;
+}
+
+[[nodiscard]] Value termination_to_json(const bool complete, const bool truncated, Value::Array reasons) {
+    return Value::object({
+        {"stop_reason", complete ? "operation_completed" : "limit_reached"},
+        {"coverage_complete", complete},
+        {"results_complete", !truncated},
+        {"complete", complete && !truncated},
+        {"truncated", truncated},
+        {"truncation_reasons", Value{std::move(reasons)}}
     });
 }
 
@@ -939,6 +1176,63 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
         read_only_annotations()
     });
 
+    tools.push_back(ToolDefinition{
+        "memory_debug.inspect_address",
+        "Correlate one address with its region, protections, owning module/RVA and ranked probable object/vtable candidates in a single read-only response, optionally with references to it within an explicit budget. Every candidate is probable, never a confirmed type or field.",
+        object_schema({
+            {"session_id", session},
+            {"address", address},
+            {"pointer_size", enum_string_schema({"4", "8"})},
+            {"lookbehind_bytes", integer_schema(
+                0, static_cast<std::int64_t>(service_.policy().max_inspect_lookbehind_bytes)
+            )},
+            {"max_object_candidates", integer_schema(
+                1, static_cast<std::int64_t>(service_.policy().max_inspect_object_candidates)
+            )},
+            {"vtable_entries", integer_schema(
+                1, static_cast<std::int64_t>(service_.policy().max_inspect_vtable_entries)
+            )},
+            {"vtable_probes", integer_schema(
+                1, static_cast<std::int64_t>(service_.policy().max_inspect_vtable_probes)
+            )},
+            {"min_executable_entries", integer_schema(
+                1, static_cast<std::int64_t>(service_.policy().max_inspect_vtable_entries)
+            )},
+            {"references", Value::object({
+                {"description",
+                 "Optional reference lookup. Absent means mode none. index requires the persistent "
+                 "pointer index and is currently unsupported; live_scan needs an explicit budget."},
+                {"oneOf", Value::array({
+                    object_schema({{"mode", enum_string_schema({"none"})}}, {"mode"}),
+                    object_schema({
+                        {"mode", enum_string_schema({"index"})},
+                        {"index_id", string_schema("Opaque pointer index id owned by the same session.")},
+                        {"result_limit", integer_schema(
+                            1, static_cast<std::int64_t>(service_.policy().max_scan_results)
+                        )},
+                        {"cursor", string_schema("Opaque page cursor bound to the index and query.")}
+                    }, {"mode", "index_id"}),
+                    object_schema({
+                        {"mode", enum_string_schema({"live_scan"})},
+                        {"byte_budget", integer_schema(
+                            1, static_cast<std::int64_t>(service_.policy().max_scan_bytes)
+                        )},
+                        {"result_limit", integer_schema(
+                            1, static_cast<std::int64_t>(service_.policy().max_scan_results)
+                        )},
+                        {"writable_only", boolean_schema()},
+                        {"start_address", address},
+                        {"end_address", address},
+                        {"resume_token", string_schema(
+                            "Opaque continuation returned by a previous slice of the same query."
+                        )}
+                    }, {"mode", "byte_budget", "result_limit"})
+                })}
+            })}
+        }, {"session_id", "address", "pointer_size"}),
+        read_only_annotations()
+    });
+
     const auto value_type_schema = enum_string_schema({
         "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64"
     });
@@ -1037,6 +1331,115 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
         }, {"session_id", "base_address", "offsets"}),
         read_only_annotations()
     });
+
+    // The runtime reflection surface only exists when the operator enabled the
+    // feature *and* allowlisted at least one layout profile that this build
+    // actually ships. A client can never turn either on through a request.
+    Value::Array enabled_profiles;
+    for (const auto& profile : domain::builtin_unreal_profiles()) {
+        const auto allowed = std::ranges::any_of(
+            service_.policy().unreal_profile_allowlist,
+            [&profile](const std::string& entry) { return entry == profile.id; }
+        );
+        if (allowed) {
+            enabled_profiles.push_back(Value{profile.id});
+        }
+    }
+    if (service_.policy().enable_unreal_runtime && !enabled_profiles.empty()) {
+        const auto runtime_id_schema = string_schema(
+            "Opaque runtime_id returned by memory_debug.unreal_runtime_discover."
+        );
+        const auto profile_schema = Value::object({
+            {"type", "string"},
+            {"enum", Value{enabled_profiles}},
+            {"description", "Layout profile enabled server-side for this build family."}
+        });
+
+        tools.push_back(ToolDefinition{
+            "memory_debug.unreal_runtime_discover",
+            "Validate GUObjectArray and FNamePool roots against an enabled Unreal layout profile and publish a read-only runtime context with its class catalog. Complements, and never replaces, the PDB path: results carry their own provenance and confidence.",
+            object_schema({
+                {"session_id", session},
+                {"profile_id", profile_schema},
+                {"mode", enum_string_schema({"explicit", "profile", "auto"})},
+                {"module", string_schema("Loaded module name, required when roots are RVAs.")},
+                {"roots", Value::object({
+                    {"description",
+                     "Either both RVAs (with module) or both absolute addresses. The two forms are "
+                     "mutually exclusive; absolute addresses are valid for the current session only."},
+                    {"oneOf", Value::array({
+                        object_schema({
+                            {"gu_object_array_rva", address},
+                            {"fname_pool_rva", address}
+                        }, {"gu_object_array_rva", "fname_pool_rva"}),
+                        object_schema({
+                            {"gu_object_array_address", address},
+                            {"fname_pool_address", address}
+                        }, {"gu_object_array_address", "fname_pool_address"})
+                    })}
+                })}
+            }, {"session_id", "profile_id"}),
+            stateful_annotations()
+        });
+
+        tools.push_back(ToolDefinition{
+            "memory_debug.unreal_runtime_classes",
+            "Page through the validated class catalog of a runtime context, filtered by name.",
+            object_schema({
+                {"session_id", session},
+                {"runtime_id", runtime_id_schema},
+                {"name_contains", string_schema("Case-sensitive substring filter over class names.")},
+                {"limit", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_scan_results))},
+                {"page_token", string_schema("Opaque token bound to this context and filter.")}
+            }, {"session_id", "runtime_id"}),
+            read_only_annotations()
+        });
+
+        tools.push_back(ToolDefinition{
+            "memory_debug.unreal_runtime_type",
+            "Read declared and inherited FProperty/UProperty metadata for one class in the catalog. Returns offsets and sizes, never instance values.",
+            object_schema({
+                {"session_id", session},
+                {"runtime_id", runtime_id_schema},
+                {"class_address", address},
+                {"class_name", string_schema("Exact class name; ambiguous names are rejected.")},
+                {"include_inherited", boolean_schema()},
+                {"max_properties", integer_schema(
+                    1, static_cast<std::int64_t>(service_.policy().max_unreal_properties_per_type)
+                )},
+                {"max_super_depth", integer_schema(
+                    1, static_cast<std::int64_t>(service_.policy().max_unreal_super_depth)
+                )}
+            }, {"session_id", "runtime_id"}),
+            read_only_annotations()
+        });
+
+        tools.push_back(ToolDefinition{
+            "memory_debug.unreal_runtime_objects",
+            "Enumerate live UObject summaries filtered by class, page by page. Summaries only: reading a field value still requires an explicit memory_debug read.",
+            object_schema({
+                {"session_id", session},
+                {"runtime_id", runtime_id_schema},
+                {"class_name", string_schema("Exact class name; empty enumerates every live object.")},
+                {"include_derived", boolean_schema()},
+                {"max_objects", integer_schema(
+                    1, static_cast<std::int64_t>(service_.policy().max_unreal_objects_stored)
+                )},
+                {"page_token", string_schema("Opaque token bound to this context and filter.")}
+            }, {"session_id", "runtime_id"}),
+            read_only_annotations()
+        });
+
+        tools.push_back(ToolDefinition{
+            "memory_debug.unreal_runtime_release",
+            "Release a runtime context and its derived catalogs. Idempotent for the owning session during a short window after release.",
+            object_schema({
+                {"session_id", session},
+                {"runtime_id", runtime_id_schema}
+            }, {"session_id", "runtime_id"}),
+            destructive_annotations()
+        });
+    }
 
     tools.push_back(ToolDefinition{
         "memory_debug.write",
@@ -1585,6 +1988,93 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         }));
     }
 
+    if (name == "memory_debug.inspect_address") {
+        auto session = session_arg(arguments);
+        auto address = address_arg(arguments, "address");
+        auto pointer_size_text = string_arg(arguments, "pointer_size", true);
+        auto lookbehind = optional_unsigned_arg(arguments, "lookbehind_bytes");
+        auto max_candidates = optional_unsigned_arg(arguments, "max_object_candidates");
+        auto vtable_entries = optional_unsigned_arg(arguments, "vtable_entries");
+        auto vtable_probes = optional_unsigned_arg(arguments, "vtable_probes");
+        auto min_executable = optional_unsigned_arg(arguments, "min_executable_entries");
+        if (!session) return input_error(session.error().message);
+        if (!address) return input_error(address.error().message);
+        if (!pointer_size_text) return input_error(pointer_size_text.error().message);
+        if (!lookbehind) return input_error(lookbehind.error().message);
+        if (!max_candidates) return input_error(max_candidates.error().message);
+        if (!vtable_entries) return input_error(vtable_entries.error().message);
+        if (!vtable_probes) return input_error(vtable_probes.error().message);
+        if (!min_executable) return input_error(min_executable.error().message);
+
+        // Never inherited from the host: a 32-bit target read with the host
+        // width produces plausible garbage instead of an error.
+        const auto width = domain::pointer_width_from_string(*pointer_size_text);
+        if (!width) return input_error("pointer_size must be \"4\" or \"8\"");
+
+        application::AddressInspectionRequest request;
+        request.address = *address;
+        request.pointer_width = *width;
+        if (*lookbehind) request.limits.lookbehind_bytes = **lookbehind;
+        if (*max_candidates) request.limits.max_candidates = static_cast<std::size_t>(**max_candidates);
+        if (*vtable_entries) request.limits.vtable_entries = static_cast<std::size_t>(**vtable_entries);
+        if (*vtable_probes) request.limits.max_vtable_probes = static_cast<std::size_t>(**vtable_probes);
+        request.limits.min_executable_entries = min_executable->has_value()
+            ? static_cast<std::size_t>(**min_executable)
+            // A smaller sample cannot satisfy the standard minimum, so the
+            // default follows the sample instead of rejecting the request.
+            : std::min(domain::inspection_default_min_executable_entries, request.limits.vtable_entries);
+
+        if (const Value* references = arguments.find("references"); references != nullptr) {
+            if (!references->is_object()) return input_error("references must be an object");
+            auto mode_text = string_arg(*references, "mode", false, "none");
+            if (!mode_text) return input_error(mode_text.error().message);
+            const bool has_index_id = references->contains("index_id");
+            const bool has_cursor = references->contains("cursor");
+            const bool has_budget = references->contains("byte_budget");
+            const bool has_resume = references->contains("resume_token");
+            if (*mode_text == "none") {
+                if (has_index_id || has_budget || has_cursor || has_resume) {
+                    return input_error("reference mode none does not accept index or live_scan fields");
+                }
+            } else if (*mode_text == "index") {
+                // Rejected explicitly rather than resolved by precedence: a
+                // silently ignored budget would hide the real cost of the call.
+                if (has_budget) return input_error("byte_budget is not accepted with reference mode index");
+                if (has_resume) return input_error("resume_token is not accepted with reference mode index");
+                if (!has_index_id) return input_error("reference mode index requires index_id");
+                request.references.mode = application::ReferenceMode::index;
+            } else if (*mode_text == "live_scan") {
+                if (has_index_id) return input_error("index_id is not accepted with reference mode live_scan");
+                if (has_cursor) return input_error("cursor is not accepted with reference mode live_scan");
+                auto budget = unsigned_arg(*references, "byte_budget", true);
+                auto limit = unsigned_arg(*references, "result_limit", true);
+                auto writable_only = bool_arg(*references, "writable_only", false, false);
+                auto start_address = optional_address_arg(*references, "start_address");
+                auto end_address = optional_address_arg(*references, "end_address");
+                auto resume = string_arg(*references, "resume_token", false, "");
+                if (!budget) return input_error(budget.error().message);
+                if (!limit) return input_error(limit.error().message);
+                if (!writable_only) return input_error(writable_only.error().message);
+                if (!start_address) return input_error(start_address.error().message);
+                if (!end_address) return input_error(end_address.error().message);
+                if (!resume) return input_error(resume.error().message);
+                request.references.mode = application::ReferenceMode::live_scan;
+                request.references.byte_budget = static_cast<std::size_t>(*budget);
+                request.references.result_limit = static_cast<std::size_t>(*limit);
+                request.references.writable_only = *writable_only;
+                request.references.start_address = *start_address;
+                request.references.end_address = *end_address;
+                request.references.resume_token = *resume;
+            } else {
+                return input_error("references.mode must be none, index or live_scan");
+            }
+        }
+
+        auto result = service_.inspect_address(*session, request, cancellation);
+        if (!result) return domain_error(result.error());
+        return success(address_inspection_to_json(*result));
+    }
+
     if (name == "memory_debug.strings") {
         auto session = session_arg(arguments);
         auto start_address = optional_address_arg(arguments, "start_address");
@@ -1625,6 +2115,194 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         auto result = service_.resolve_pointer_chain(*session, *base, *offsets, pointer_size);
         if (!result) return domain_error(result.error());
         return success(Value::object({{"address", hex_address(*result)}}));
+    }
+
+    if (name == "memory_debug.unreal_runtime_discover") {
+        auto session = session_arg(arguments);
+        auto profile_id = string_arg(arguments, "profile_id", true);
+        auto mode_text = string_arg(arguments, "mode", false, "explicit");
+        auto module_name = string_arg(arguments, "module", false, "");
+        if (!session) return input_error(session.error().message);
+        if (!profile_id) return input_error(profile_id.error().message);
+        if (!mode_text) return input_error(mode_text.error().message);
+        if (!module_name) return input_error(module_name.error().message);
+        const auto mode = domain::discovery_mode_from_string(*mode_text);
+        if (!mode) return input_error("mode must be explicit, profile or auto");
+
+        application::UnrealDiscoverRequest request;
+        request.module_name = *module_name;
+        request.profile_id = *profile_id;
+        request.mode = *mode;
+        if (const Value* roots = arguments.find("roots"); roots != nullptr) {
+            if (!roots->is_object()) return input_error("roots must be an object");
+            auto object_array_rva = optional_address_arg(*roots, "gu_object_array_rva");
+            auto name_pool_rva = optional_address_arg(*roots, "fname_pool_rva");
+            auto object_array_address = optional_address_arg(*roots, "gu_object_array_address");
+            auto name_pool_address = optional_address_arg(*roots, "fname_pool_address");
+            if (!object_array_rva) return input_error(object_array_rva.error().message);
+            if (!name_pool_rva) return input_error(name_pool_rva.error().message);
+            if (!object_array_address) return input_error(object_array_address.error().message);
+            if (!name_pool_address) return input_error(name_pool_address.error().message);
+            request.gu_object_array_rva = *object_array_rva;
+            request.fname_pool_rva = *name_pool_rva;
+            request.gu_object_array_address = *object_array_address;
+            request.fname_pool_address = *name_pool_address;
+        }
+
+        auto result = service_.unreal_runtime_discover(*session, request, cancellation);
+        if (!result) return domain_error(result.error());
+
+        Value published = Value::object({
+            {"runtime_id", result->runtime_id},
+            {"profile_id", result->provenance.profile_id},
+            {"module", result->module_name},
+            {"roots", Value::object({
+                {"gu_object_array", hex_address(result->roots.gu_object_array)},
+                {"fname_pool", hex_address(result->roots.fname_pool)},
+                {"origin", std::string{domain::to_string(result->roots.origin)}}
+            })},
+            {"class_count", static_cast<std::int64_t>(result->class_count)},
+            {"classes_truncated", result->classes_truncated},
+            {"expires_in_ms", unsigned_json(result->expires_in_ms)},
+            {"progress", unreal_progress_to_json(result->progress)},
+            {"provenance", unreal_provenance_to_json(result->provenance)}
+        });
+        Value::Array reasons;
+        if (result->classes_truncated) reasons.push_back(Value{"class_catalog_limit"});
+        return success(Value::object({
+            {"operation", "discover"},
+            // No job manager exists yet, so the work is done inline. The
+            // terminal envelope matches the asynchronous contract so moving to
+            // jobs later stays additive for clients.
+            {"execution", "synchronous"},
+            {"result", std::move(published)},
+            {"termination", termination_to_json(true, result->classes_truncated, std::move(reasons))}
+        }));
+    }
+
+    if (name == "memory_debug.unreal_runtime_classes") {
+        auto session = session_arg(arguments);
+        auto runtime_id = runtime_arg(arguments);
+        auto name_contains = string_arg(arguments, "name_contains", false, "");
+        auto limit = unsigned_arg(arguments, "limit", false, 100U);
+        auto page_token = string_arg(arguments, "page_token", false, "");
+        if (!session) return input_error(session.error().message);
+        if (!runtime_id) return input_error(runtime_id.error().message);
+        if (!name_contains) return input_error(name_contains.error().message);
+        if (!limit) return input_error(limit.error().message);
+        if (!page_token) return input_error(page_token.error().message);
+        auto result = service_.unreal_runtime_classes(
+            *session, *runtime_id, *name_contains, static_cast<std::size_t>(*limit), *page_token
+        );
+        if (!result) return domain_error(result.error());
+        Value::Array classes;
+        classes.reserve(result->classes.size());
+        for (const auto& summary : result->classes) classes.push_back(unreal_class_to_json(summary));
+        Value value = Value::object({
+            {"classes", Value{std::move(classes)}},
+            {"total_matched", static_cast<std::int64_t>(result->total_matched)},
+            {"offset", static_cast<std::int64_t>(result->offset)},
+            {"returned", static_cast<std::int64_t>(result->classes.size())},
+            {"provenance", unreal_provenance_to_json(result->provenance)}
+        });
+        value["next_page_token"] = result->next_page_token
+            ? Value{*result->next_page_token}
+            : Value{nullptr};
+        return success(std::move(value));
+    }
+
+    if (name == "memory_debug.unreal_runtime_type") {
+        auto session = session_arg(arguments);
+        auto runtime_id = runtime_arg(arguments);
+        auto class_address = optional_address_arg(arguments, "class_address");
+        auto class_name = string_arg(arguments, "class_name", false, "");
+        auto include_inherited = bool_arg(arguments, "include_inherited", false, true);
+        auto max_properties = unsigned_arg(
+            arguments, "max_properties", false, service_.policy().max_unreal_properties_per_type
+        );
+        auto max_super_depth = unsigned_arg(
+            arguments, "max_super_depth", false, service_.policy().max_unreal_super_depth
+        );
+        if (!session) return input_error(session.error().message);
+        if (!runtime_id) return input_error(runtime_id.error().message);
+        if (!class_address) return input_error(class_address.error().message);
+        if (!class_name) return input_error(class_name.error().message);
+        if (!include_inherited) return input_error(include_inherited.error().message);
+        if (!max_properties) return input_error(max_properties.error().message);
+        if (!max_super_depth) return input_error(max_super_depth.error().message);
+        auto result = service_.unreal_runtime_type(
+            *session, *runtime_id, *class_address, *class_name, *include_inherited,
+            static_cast<std::size_t>(*max_properties), static_cast<std::size_t>(*max_super_depth),
+            cancellation
+        );
+        if (!result) return domain_error(result.error());
+        Value::Array declared;
+        declared.reserve(result->type.declared_properties.size());
+        for (const auto& property : result->type.declared_properties) {
+            declared.push_back(unreal_property_to_json(property));
+        }
+        Value::Array inherited;
+        inherited.reserve(result->type.inherited_properties.size());
+        for (const auto& property : result->type.inherited_properties) {
+            inherited.push_back(unreal_property_to_json(property));
+        }
+        return success(Value::object({
+            {"type", unreal_class_to_json(result->type.type)},
+            {"declared_properties", Value{std::move(declared)}},
+            {"inherited_properties", Value{std::move(inherited)}},
+            {"truncated", result->type.truncated},
+            {"provenance", unreal_provenance_to_json(result->provenance)}
+        }));
+    }
+
+    if (name == "memory_debug.unreal_runtime_objects") {
+        auto session = session_arg(arguments);
+        auto runtime_id = runtime_arg(arguments);
+        auto class_name = string_arg(arguments, "class_name", false, "");
+        auto include_derived = bool_arg(arguments, "include_derived", false, false);
+        auto max_objects = unsigned_arg(arguments, "max_objects", false, 256U);
+        auto page_token = string_arg(arguments, "page_token", false, "");
+        if (!session) return input_error(session.error().message);
+        if (!runtime_id) return input_error(runtime_id.error().message);
+        if (!class_name) return input_error(class_name.error().message);
+        if (!include_derived) return input_error(include_derived.error().message);
+        if (!max_objects) return input_error(max_objects.error().message);
+        if (!page_token) return input_error(page_token.error().message);
+        auto result = service_.unreal_runtime_objects(
+            *session, *runtime_id, *class_name, *include_derived,
+            static_cast<std::size_t>(*max_objects), *page_token, cancellation
+        );
+        if (!result) return domain_error(result.error());
+        Value::Array objects;
+        objects.reserve(result->objects.size());
+        for (const auto& object : result->objects) objects.push_back(unreal_object_to_json(object));
+        Value::Array reasons;
+        if (result->truncated) reasons.push_back(Value{"object_limit"});
+        Value value = Value::object({
+            {"operation", "objects"},
+            {"execution", "synchronous"},
+            {"objects", Value{std::move(objects)}},
+            {"progress", unreal_progress_to_json(result->progress)},
+            {"provenance", unreal_provenance_to_json(result->provenance)},
+            {"termination", termination_to_json(!result->truncated, result->truncated, std::move(reasons))}
+        });
+        value["next_page_token"] = result->next_page_token
+            ? Value{*result->next_page_token}
+            : Value{nullptr};
+        return success(std::move(value));
+    }
+
+    if (name == "memory_debug.unreal_runtime_release") {
+        auto session = session_arg(arguments);
+        auto runtime_id = runtime_arg(arguments);
+        if (!session) return input_error(session.error().message);
+        if (!runtime_id) return input_error(runtime_id.error().message);
+        auto result = service_.unreal_runtime_release(*session, *runtime_id);
+        if (!result) return domain_error(result.error());
+        return success(Value::object({
+            {"runtime_id", runtime_id->value()},
+            {"released", true}
+        }));
     }
 
     if (name == "memory_debug.write") {

@@ -23,17 +23,23 @@ e mensuráveis, mas não encerram honestamente o roadmap inteiro.
 ## Pacote de propostas formalizado em 2026-08-09
 
 Uma auditoria posterior da implementação e do contrato MCP transformou sete
-melhorias prioritárias em specs e ADRs próprios. Todos os itens desta tabela
-estão **propostos, não implementados**; README e `docs/api/tools.md` só devem
-anunciá-los como disponíveis depois da entrega de código e testes.
+melhorias prioritárias em specs e ADRs próprios. README e `docs/api/tools.md` só
+anunciam uma capacidade como disponível depois da entrega de código e testes.
 
-| Capacidade | Spec | Decisão | Dependência principal |
+| Capacidade | Spec | Decisão | Estado |
 |---|---|---|---|
-| Scan completo assíncrono, progresso, cancelamento, continuação e motivo de término | [Spec 0008](0008-async-scan-operations.md) | [ADR-0012](../adr/0012-async-scan-progress-resumption.md) | contrato de cobertura |
-| Importação arbitrária de candidatos e multipadrão em uma passagem | [Spec 0009](0009-scan-composition-and-multi-pattern.md) | [ADR-0017](../adr/0017-scan-composition-and-multi-pattern.md) | jobs assíncronos |
-| Índice reutilizável/persistente para pointer chains | [Spec 0010](0010-persistent-pointer-index.md) | [ADR-0018](../adr/0018-persistent-pointer-index.md) | jobs e identidade do processo |
-| Inspeção derivada de endereço, vtable provável e referências | [Spec 0011](0011-inspect-address.md) | [ADR-0013](../adr/0013-address-inspection-derived-evidence.md) | cobertura e pointer index |
-| Reflexão Unreal em runtime sem PDB | [Spec 0012](0012-unreal-runtime-reflection.md) | [ADR-0019](../adr/0019-unreal-runtime-reflection.md) | jobs, multipadrão e perfis |
+| Scan completo assíncrono, progresso, cancelamento, continuação e motivo de término | [Spec 0008](0008-async-scan-operations.md) | [ADR-0012](../adr/0012-async-scan-progress-resumption.md) | proposto |
+| Importação arbitrária de candidatos e multipadrão em uma passagem | [Spec 0009](0009-scan-composition-and-multi-pattern.md) | [ADR-0017](../adr/0017-scan-composition-and-multi-pattern.md) | proposto |
+| Índice reutilizável/persistente para pointer chains | [Spec 0010](0010-persistent-pointer-index.md) | [ADR-0018](../adr/0018-persistent-pointer-index.md) | proposto |
+| Inspeção derivada de endereço, vtable provável e referências | [Spec 0011](0011-inspect-address.md) | [ADR-0013](../adr/0013-address-inspection-derived-evidence.md) | **implementado**; referências por índice aguardam a Spec 0010 |
+| Reflexão Unreal em runtime sem PDB | [Spec 0012](0012-unreal-runtime-reflection.md) | [ADR-0019](../adr/0019-unreal-runtime-reflection.md) | **implementado** de forma síncrona; jobs e descoberta `auto` aguardam as Specs 0008/0009 |
+
+As duas capacidades entregues foram construídas sem antecipar o contrato de
+jobs: `inspect_address` expõe cobertura e `resume_token` no próprio slice, e as
+tools Unreal usam o envelope terminal `result` + `termination` com
+`execution: "synchronous"`. Nenhuma delas criou pool, thread destacada ou
+registry de jobs próprio, de modo que a Fase 3 continua sendo uma migração
+aditiva em vez de uma reescrita.
 
 O contrato de jobs é deliberadamente genérico: scans, construção do índice e
 enumerações Unreal compartilham lifecycle, backpressure, progresso, paginação,

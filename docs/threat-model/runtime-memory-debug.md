@@ -79,6 +79,67 @@ intermediário. Este recurso não ajuda contra um processo de terceiros já em
 execução — só é útil para alvos de teste/desenvolvimento que o próprio
 operador controla (ver `docs/specs/0000-roadmap-introspeccao-runtime.md`).
 
+## Inspeção derivada de endereço
+
+`memory_debug.inspect_address` é somente leitura e substitui um fluxo que hoje
+transfere bytes crus por metadados derivados pequenos — uma **redução** de
+exposição, não um aumento. Ela lê apenas regiões marcadas como legíveis, nunca
+dereferencia uma função da possível vtable e valida `address + size`, a
+subtração do lookbehind, `módulo + RVA` e `vtable + K * pointer_size` antes de
+qualquer I/O. Todo limite (janela, bases examinadas, probes, entradas,
+candidatos, evidências, proveniências, referências) é aplicado antes de alocar
+ou ler, e a memória auxiliar é proporcional a esses limites, não ao tamanho do
+processo.
+
+O risco específico é epistemológico: uma heurística apresentada como fato leva o
+operador a escrever no lugar errado. O contrato responde com
+`classification: "probable"` obrigatório, confiança/evidência/proveniência
+auditáveis, múltiplos candidatos preservados em vez de uma verdade escolhida em
+silêncio, e ausência representada como `null`/vazio em vez de sentinela.
+
+O `resume_token` é assinado por uma chave aleatória do processo servidor e
+vinculado a sessão, alvo, largura de ponteiro e filtros. Ele não atravessa
+sessões nem consultas, e um servidor reiniciado recusa continuações antigas em
+vez de retomar uma varredura sobre um espaço de endereçamento que já não existe.
+Endereços, bytes, nomes de módulo/região, `session_id`, cursores e tokens não
+entram no log.
+
+## Reflexão Unreal em runtime
+
+Esta capacidade lê estruturas de reflexão que o próprio runtime mantém. Ela não
+chama `StaticClass`/`ProcessEvent` nem qualquer função do alvo, não injeta
+DLL/código, não cria thread remota, não altera proteção e não escreve. Ela não
+contorna nem descriptografa proteção/ofuscação, e não percorre arquivos nem
+módulos indicados por path arbitrário — apenas módulos da sessão autorizada.
+
+Três controles server-side, todos aplicados antes de I/O ou alocação:
+
+- `ARGOS_MCP_ENABLE_UNREAL_RUNTIME=0` por padrão. Com o gate desligado, as tools
+  nem aparecem em `tools/list`;
+- allowlist de `profile_id` (`ARGOS_MCP_UNREAL_PROFILES`). Allowlist vazia
+  significa **nenhum** perfil habilitado, não todos;
+- `ARGOS_MCP_ENABLE_UNREAL_AUTO_DISCOVERY=0`, independente do gate geral.
+
+Uma requisição nunca liga um gate. O parser trata a memória do alvo como
+hostil: contagens do alvo são validadas antes de dimensionar qualquer loop ou
+leitura; toda lista encadeada tem detecção de ciclo, limite de nós e deadline;
+ponteiros precisam estar alinhados e cair em região legível; `offset +
+element_size * array_dim` é verificado contra overflow; short read é tratado
+como instabilidade, nunca como bytes zerados.
+
+O aumento de exposição é o catálogo em si: nomes de classes, objetos e
+propriedades do processo autorizado passam a caber numa resposta. Isso é
+mitigado por paginação, quotas por sessão e globais, teto de bytes retidos, TTL
+de contexto, e pela regra de que **valores de instância ficam fora**: ler um
+campo continua exigindo uma tool de leitura explícita sob a policy normal. Um
+`runtime_id` não é capability bearer — toda query exige `session_id` +
+`runtime_id`, e um dono divergente recebe `not_found`. Nenhuma assinatura, nome,
+endereço, propriedade ou byte do processo entra no log.
+
+Nomes lidos do alvo são sanitizados para ASCII imprimível antes de entrarem no
+protocolo, para que um nome hostil não injete caracteres de controle nem
+sequências UTF-8 inválidas no fluxo JSON-RPC.
+
 ## Riscos residuais
 
 ## Metadados de tipos e PDB
@@ -96,4 +157,15 @@ DLL/codigo para obter reflexao de Unity ou Unreal.
   para executar; a allowlist de diretório é um controle adicional opcional,
   não uma sandbox — o operador continua responsável por escolher
   executáveis confiáveis;
+- candidatos de `inspect_address` continuam sendo heurística: falsos positivos
+  são possíveis e explicitados por `probable`/`confidence`/`evidence`, não
+  eliminados;
+- snapshots de memória, regiões e módulos não são atômicos; `sampled_at_ms`,
+  `limitations` e `snapshot_status` tornam essa condição visível em vez de
+  removê-la;
+- habilitar a reflexão Unreal expõe nomes de classes, objetos e propriedades do
+  processo autorizado ao cliente MCP;
+- um perfil de layout habilitado para uma build incompatível falha de modo
+  seguro pelas invariantes, mas habilitar perfis é decisão do operador e novos
+  perfis exigem fixtures e revisão de segurança antes de serem oferecidos;
 - permissões do SO e políticas corporativas continuam sendo responsabilidade do operador.

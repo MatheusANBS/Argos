@@ -1,6 +1,6 @@
 # ADR-0019 — Reflexão Unreal em runtime sem PDB
 
-Status: proposto
+Status: aceito e implementado (execução síncrona; jobs e descoberta automática permanecem propostos)
 
 ## Contexto
 
