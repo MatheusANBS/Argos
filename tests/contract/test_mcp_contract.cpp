@@ -380,6 +380,8 @@ int main() {
     if (init_response) {
         const auto& result = init_response->at("result");
         check(result.at("protocolVersion").as_string() == "2025-11-25", "stable protocol version is negotiated");
+        check(result.at("serverInfo").at("version").as_string() == "0.2.0",
+              "initialize advertises the release version");
     }
 
     const auto legacy_2025_06 = argos::protocol::json::Value::object({
@@ -959,6 +961,202 @@ int main() {
                   "resume_token continuation is a well-defined unsupported extension point, not a crash or a fake success");
         } else {
             check(false, "scan_start with only resume_token receives a response");
+        }
+    }
+
+    if (!session_id.empty()) {
+        auto inspected = call_tool(server, 20, "memory_debug.inspect_address", JsonValue::object({
+            {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
+            {"lookbehind_bytes", 0}
+        }));
+        const auto* data = successful_tool_data(inspected);
+        check(data != nullptr, "inspect_address returns data");
+        if (data != nullptr) {
+            check(data->at("pointer_size").as_string() == "8",
+                  "inspect_address echoes the target pointer width as a string");
+            check(data->at("region").at("name").as_string() == "heap-main",
+                  "inspect_address reports the region containing the address");
+            check(data->at("region").at("writable").as_bool(), "inspect_address reports protections");
+            // The contract target loads no modules, so the honest answer is
+            // null and an empty candidate list -- not a synthesized module.
+            check(data->at("module").is_null(), "an address with no owning module serializes as null");
+            check(data->at("object_candidates").as_array().empty(),
+                  "no module means no probable vtable shape");
+            check(data->at("object_candidates_total").as_integer() == 0,
+                  "the candidate total stays zero");
+            check(!data->at("object_candidates_truncated").as_bool(), "nothing was truncated");
+            check(data->at("references").is_null(), "references are absent unless requested");
+            check(data->at("analysis").at("complete").as_bool(),
+                  "a fully readable window reports a complete analysis");
+            check(data->at("analysis").at("limitations").as_array().empty(),
+                  "a complete analysis lists no limitation");
+            check(data->at("sampled_at_ms").as_integer() > 0,
+                  "the response carries the sampling timestamp");
+        }
+
+        // A window the region cannot supply in full is a partial analysis, and
+        // saying so is what keeps an absent candidate from reading as absence
+        // of the thing itself.
+        auto clamped = call_tool(server, 210, "memory_debug.inspect_address", JsonValue::object({
+            {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
+            {"lookbehind_bytes", 4096}
+        }));
+        data = successful_tool_data(clamped);
+        check(data != nullptr, "inspect_address answers when the lookbehind exceeds the region");
+        if (data != nullptr) {
+            check(!data->at("analysis").at("complete").as_bool(),
+                  "a clamped lookbehind reports an incomplete analysis");
+            const auto& limitations = data->at("analysis").at("limitations").as_array();
+            check(!limitations.empty() &&
+                      limitations.front().as_string() == "lookbehind_clamped_to_region",
+                  "the limitation names the clamping");
+            check(data->at("analysis").at("lookbehind_bytes_requested").as_integer() == 4096,
+                  "the requested window is echoed");
+            check(data->at("analysis").at("lookbehind_bytes_read").as_integer() < 4096,
+                  "the window actually read is reported separately");
+        }
+
+        auto guarded = call_tool(server, 21, "memory_debug.inspect_address", JsonValue::object({
+            {"session_id", session_id}, {"address", "0x3004"}, {"pointer_size", "8"}
+        }));
+        data = successful_tool_data(guarded);
+        check(data != nullptr, "inspect_address answers for an unreadable region");
+        if (data != nullptr) {
+            check(!data->at("region").at("readable").as_bool(),
+                  "an unreadable region is described, not hidden");
+            check(!data->at("analysis").at("complete").as_bool(),
+                  "an unreadable region makes the analysis incomplete");
+            const auto& limitations = data->at("analysis").at("limitations").as_array();
+            check(!limitations.empty() && limitations.front().as_string() == "region_not_readable",
+                  "the limitation names the unreadable region");
+        }
+
+        auto references = call_tool(server, 22, "memory_debug.inspect_address", JsonValue::object({
+            {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
+            {"references", JsonValue::object({
+                {"mode", "live_scan"}, {"byte_budget", 65536}, {"result_limit", 8},
+                {"start_address", "0x1000"}, {"end_address", "0x1010"}
+            })}
+        }));
+        data = successful_tool_data(references);
+        check(data != nullptr, "inspect_address runs a budgeted live reference slice");
+        if (data != nullptr) {
+            const auto& report = data->at("references");
+            check(report.at("mode").as_string() == "live_scan", "the reference mode is echoed");
+            check(report.at("budget").at("byte_budget").as_integer() == 65536,
+                  "the reference budget is reported back");
+            check(report.at("matches").as_array().empty(), "no reference exists in the swept range");
+            check(report.at("coverage").at("complete").as_bool(),
+                  "a fully swept range reports complete coverage");
+            check(report.at("resume_token").is_null(), "a complete sweep offers no continuation");
+            check(report.at("next_start_address").is_null(), "the diagnostic address is null when done");
+            check(report.at("next_cursor").is_null(), "the index cursor stays null in live_scan mode");
+            check(report.at("truncation_reasons").as_array().empty(), "nothing truncated the slice");
+        }
+
+        // The same query over a range the backend cannot fully read must stay
+        // distinguishable from the conclusive empty result above.
+        auto partial_references = call_tool(server, 220, "memory_debug.inspect_address", JsonValue::object({
+            {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
+            {"references", JsonValue::object({
+                {"mode", "live_scan"}, {"byte_budget", 65536}, {"result_limit", 8}
+            })}
+        }));
+        data = successful_tool_data(partial_references);
+        check(data != nullptr, "inspect_address answers when a region cannot be read");
+        if (data != nullptr) {
+            const auto& report = data->at("references");
+            check(report.at("matches").as_array().empty(), "no reference was found");
+            check(!report.at("coverage").at("complete").as_bool(),
+                  "an empty result over incomplete coverage is not conclusive");
+            check(report.at("coverage").at("coverage_ratio").as_number() < 1.0,
+                  "the coverage ratio shows how much was actually swept");
+            const auto& reasons = report.at("truncation_reasons").as_array();
+            check(!reasons.empty() && reasons.front().as_string() == "region_read_failed",
+                  "the reason names the unreadable region");
+        }
+
+        check(is_invalid_arguments(call_tool(server, 23, "memory_debug.inspect_address", JsonValue::object({
+                  {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "6"}
+              }))),
+              "inspect_address rejects a pointer size that is not 4 or 8");
+
+        check(is_invalid_arguments(call_tool(server, 24, "memory_debug.inspect_address", JsonValue::object({
+                  {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
+                  {"references", JsonValue::object({
+                      {"mode", "live_scan"}, {"byte_budget", 4096}, {"result_limit", 8},
+                      {"index_id", "idx"}
+                  })}
+              }))),
+              "index_id is rejected with reference mode live_scan");
+
+        check(is_invalid_arguments(call_tool(server, 25, "memory_debug.inspect_address", JsonValue::object({
+                  {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
+                  {"references", JsonValue::object({
+                      {"mode", "index"}, {"index_id", "idx"}, {"byte_budget", 4096}
+                  })}
+              }))),
+              "byte_budget is rejected with reference mode index");
+
+        auto impossible = call_tool(server, 26, "memory_debug.inspect_address", JsonValue::object({
+            {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
+            {"min_executable_entries", 9}, {"vtable_entries", 4}
+        }));
+        check(impossible.has_value() && impossible->at("result").at("isError").as_bool(),
+              "a minimum larger than the vtable sample is rejected");
+
+        auto unsupported_index = call_tool(server, 27, "memory_debug.inspect_address", JsonValue::object({
+            {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
+            {"references", JsonValue::object({{"mode", "index"}, {"index_id", "idx"}})}
+        }));
+        check(unsupported_index.has_value() &&
+                  unsupported_index->at("result").at("structuredContent").at("error")
+                      .at("code").as_string() == "unsupported",
+              "an unimplemented reference source reports unsupported instead of downgrading");
+    }
+
+    // The Unreal runtime surface must not exist at all under default policy,
+    // and a request can never be what turns it on.
+    {
+        const auto& tools = catalog.definitions();
+        const bool advertises_runtime = std::ranges::any_of(tools, [](const auto& tool) {
+            return tool.name.starts_with("memory_debug.unreal_runtime_");
+        });
+        check(!advertises_runtime, "unreal runtime tools are absent while the feature gate is off");
+
+        auto refused = call_tool(server, 30, "memory_debug.unreal_runtime_discover", JsonValue::object({
+            {"session_id", session_id}, {"profile_id", "ue5-fproperty-x64"}
+        }));
+        // An unadvertised tool is not dispatchable at all, so this arrives as a
+        // JSON-RPC error rather than as a tool result.
+        const bool rejected = !refused.has_value() || refused->find("error") != nullptr ||
+            refused->at("result").at("isError").as_bool();
+        check(rejected, "calling a gated tool without the gate fails");
+
+        argos::security::SecurityPolicy enabled;
+        enabled.enable_unreal_runtime = true;
+        enabled.unreal_profile_allowlist = {"ue5-fproperty-x64"};
+        argos::application::MemoryDebugService enabled_service{
+            std::make_unique<ContractProvider>(), enabled
+        };
+        argos::protocol::mcp::ToolCatalog enabled_catalog{enabled_service, logger};
+        std::size_t runtime_tools = 0;
+        const argos::protocol::mcp::ToolDefinition* discover = nullptr;
+        for (const auto& tool : enabled_catalog.definitions()) {
+            if (tool.name.starts_with("memory_debug.unreal_runtime_")) {
+                ++runtime_tools;
+                if (tool.name == "memory_debug.unreal_runtime_discover") discover = &tool;
+            }
+        }
+        check(runtime_tools == 5U, "enabling the feature advertises the full runtime surface");
+        if (discover != nullptr) {
+            const auto& profiles = discover->input_schema.at("properties").at("profile_id")
+                .at("enum").as_array();
+            check(profiles.size() == 1U && profiles.front().as_string() == "ue5-fproperty-x64",
+                  "only allowlisted profiles are offered to the client");
+            const auto& roots = discover->input_schema.at("properties").at("roots");
+            check(roots.at("oneOf").as_array().size() == 2U,
+                  "root forms are declared as mutually exclusive alternatives");
         }
     }
 

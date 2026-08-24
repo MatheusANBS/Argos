@@ -69,6 +69,21 @@ private:
     std::string value_;
 };
 
+// Handle to a validated engine-runtime context. It is not a capability on its
+// own: every query also carries the owning SessionId, and a mismatch is
+// not_found rather than a hint that the id exists elsewhere.
+class RuntimeId final {
+public:
+    static std::expected<RuntimeId, std::string> create(std::string value);
+
+    [[nodiscard]] const std::string& value() const noexcept { return value_; }
+    [[nodiscard]] bool operator==(const RuntimeId&) const = default;
+
+private:
+    explicit RuntimeId(std::string value) : value_(std::move(value)) {}
+    std::string value_;
+};
+
 enum class AccessMode {
     read_only,
     read_write,

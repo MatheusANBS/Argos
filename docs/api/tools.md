@@ -15,7 +15,8 @@
 3. `memory_debug.address_space_summary` para dimensionar o alvo antes de varrer
 4. `memory_debug.regions` (com filtro) e/ou `memory_debug.modules`
 5. `memory_debug.read`, `read_typed`, `read_batch`, `scan_exact`, `scan_pointer_chains` ou `resolve_pointer_chain`
-6. `memory_debug.detach`
+6. `memory_debug.inspect_address` para classificar um endereço encontrado
+7. `memory_debug.detach`
 
 ## Operações básicas
 
@@ -352,6 +353,144 @@ layout nativo enriquecido.
 `memory_debug.unreal_reflection` enumera simbolos UHT `StaticClass` e
 `StaticStruct` e seus RVAs relativos. Nenhuma dessas tools injeta ou executa
 codigo no processo alvo.
+
+## Inspeção de endereço
+
+`memory_debug.inspect_address` responde, numa única chamada somente-leitura,
+"o que é este endereço": região e proteções, módulo/RVA quando houver,
+candidatos rankeados de início de objeto/vtable e, opcionalmente, referências a
+ele dentro de um orçamento explícito.
+
+`pointer_size` é **obrigatório** e nunca herdado do host: `"4"` ou `"8"`. Um
+endereço de 64 bits com `pointer_size: "4"` é rejeitado, não truncado.
+
+```json
+{
+  "name": "memory_debug.inspect_address",
+  "arguments": {
+    "session_id": "...",
+    "address": "0x1FE44726C90",
+    "pointer_size": "8",
+    "lookbehind_bytes": 2048,
+    "vtable_entries": 8,
+    "min_executable_entries": 3,
+    "max_object_candidates": 8
+  }
+}
+```
+
+Todo candidato é `classification: "probable"`, inclusive com
+`confidence: "high"`. `field_offset` é a distância derivada entre o endereço
+inspecionado e o início candidato — não um offset de propriedade confirmado.
+`evidence` lista fatos observados com `observed`/`sampled`, e `provenance`
+lista de onde cada fato veio, para que o ranking seja auditável em vez de um
+número opaco.
+
+Ausência é representada explicitamente: `region: null`, `module: null`,
+`object_candidates: []`. Não existem sentinelas como endereço zero, RVA `-1`,
+módulo `"unknown"` ou vtable fabricada. Quando a análise não pôde ser completa,
+`analysis.complete` é `false` e `analysis.limitations` diz por quê
+(`region_not_readable`, `lookbehind_clamped_to_region`, `lookbehind_short_read`,
+`vtable_short_read`, `candidate_limit_reached`, …).
+
+### Referências
+
+`references` é opt-in e usa `oneOf` entre `none`, `index` e `live_scan`.
+`index_id` é proibido em `live_scan` e `byte_budget` é proibido em `index` —
+rejeitados, não resolvidos por precedência.
+
+```json
+{
+  "references": {
+    "mode": "live_scan",
+    "byte_budget": 33554432,
+    "result_limit": 64,
+    "writable_only": false
+  }
+}
+```
+
+O slice devolve `budget`, `coverage`, `truncation_reasons` e, quando ainda há
+espaço a varrer, um `resume_token` opaco. **Uma lista vazia de referências só é
+conclusiva com `coverage.complete: true`.** A continuação usa exclusivamente o
+`resume_token`, que é assinado por uma chave do processo servidor e vinculado a
+sessão, alvo, largura de ponteiro e filtros: um token de outra consulta é
+recusado, e `next_start_address` é apenas diagnóstico.
+
+`mode: "index"` faz parte do contrato mas retorna `unsupported` nesta versão: o
+índice persistente de ponteiros ([Spec 0010](../specs/0010-persistent-pointer-index.md))
+não está implementado, e um downgrade silencioso para `live_scan` mudaria custo
+e cobertura sem o cliente saber.
+
+## Reflexão Unreal em runtime
+
+Desligada por padrão. As cinco tools `memory_debug.unreal_runtime_*` só entram
+em `tools/list` quando `ARGOS_MCP_ENABLE_UNREAL_RUNTIME=1` **e** ao menos um
+perfil embutido está em `ARGOS_MCP_UNREAL_PROFILES`. O schema de `profile_id`
+oferece apenas os perfis já habilitados; uma requisição nunca liga um gate.
+
+```json
+{
+  "name": "memory_debug.unreal_runtime_discover",
+  "arguments": {
+    "session_id": "...",
+    "profile_id": "ue5-fproperty-x64",
+    "mode": "explicit",
+    "module": "Game-Win64-Shipping.exe",
+    "roots": {
+      "gu_object_array_rva": "0x01234560",
+      "fname_pool_rva": "0x02345670"
+    }
+  }
+}
+```
+
+`roots` usa `oneOf`: o par de RVAs (que exige `module`) ou o par de endereços
+absolutos (válidos só na sessão corrente, `root_origin: "explicit_address"`).
+Misturar as duas formas, ou enviar metade de uma, retorna `invalid_argument`.
+
+Antes de publicar um `runtime_id`, o servidor valida alinhamento das raízes,
+região legível, coerência de `num_elements`/`max_elements`/chunks, uma amostra
+limitada de slots vivos, resolução de nomes por `FNamePool` e uma classe com sua
+lista de properties. `confidence: "high"` exige raízes vinculadas ao módulo e
+todas as invariantes; falhas aparecem em `failed_invariants`.
+
+Cada página de slots é lida, parseada e **relida**: o cabeçalho e um digest dos
+tuples `(slot, object, serial)` precisam bater antes e depois. Comparar apenas
+contagens não bastaria — um slot pode ser reciclado com a contagem intacta. Se o
+alvo continuar mudando após os retries, a operação termina com `io_error` e
+`unstable_snapshot`, e **nenhum catálogo parcial é publicado**.
+
+- `unreal_runtime_classes`: pagina o catálogo; o `page_token` é opaco e
+  vinculado ao contexto e ao filtro que o produziu;
+- `unreal_runtime_type`: aceita `class_address` (que precisa estar no catálogo
+  validado) **ou** `class_name` (`ambiguous` se houver mais de uma), e separa
+  properties declaradas de herdadas, informando a classe declarante;
+- `unreal_runtime_objects`: devolve apenas summaries — endereço, índice, nome,
+  classe e outer. Ler o valor de um campo continua exigindo uma tool de leitura
+  explícita e a policy normal da sessão;
+- `unreal_runtime_release`: invalida o contexto; é idempotente para o dono
+  durante uma janela curta após a liberação. `detach` e o TTL fazem o mesmo.
+
+Toda resposta derivada carrega `source: "unreal:runtime-reflection"`,
+`profile_id`, `process_fingerprint` (identificador não reversível para
+comparação, não um dump de path ou de bytes), `root_origin`, `evidence`,
+`failed_invariants` e `snapshot_status`. PDB e runtime permanecem fontes
+distintas e comparáveis.
+
+Limites desta entrega, explícitos por serem escopo e não defeito:
+
+- `mode: "profile"` retorna `not_found` — nenhum fingerprint de build está
+  registrado neste release;
+- `mode: "auto"` exige o segundo gate e então retorna `unsupported`: a descoberta
+  multipadrão ([Spec 0009](../specs/0009-scan-composition-and-multi-pattern.md))
+  não está implementada;
+- `discover` e `objects` executam de forma síncrona e bounded. A resposta traz
+  `execution: "synchronous"` e o mesmo envelope terminal
+  (`result` + `termination`) do contrato assíncrono, para que a migração para
+  jobs ([Spec 0008](../specs/0008-async-scan-operations.md)) seja aditiva;
+- nomes vindos do alvo são sanitizados para ASCII imprimível antes de entrar no
+  protocolo.
 
 ## Histórico
 

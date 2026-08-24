@@ -42,7 +42,10 @@ namespace {
     return domain::DebugError{code, std::move(message)};
 }
 
-[[nodiscard]] std::vector<std::string> env_dir_list(std::string_view name) {
+// Semicolon-separated list, used for both launch directories and the Unreal
+// profile allowlist. Empty entries are dropped so a trailing separator does not
+// become an entry that matches nothing -- or everything.
+[[nodiscard]] std::vector<std::string> env_string_list(std::string_view name) {
     std::vector<std::string> output;
     const char* value = std::getenv(std::string{name}.c_str());
     if (value == nullptr) {
@@ -85,7 +88,7 @@ SecurityPolicy SecurityPolicy::from_environment() {
     policy.max_pointer_chain_depth = env_size("ARGOS_MCP_MAX_POINTER_CHAIN_DEPTH", 8U, 16U);
     policy.max_pointer_chain_fanout = env_size("ARGOS_MCP_MAX_POINTER_CHAIN_FANOUT", 16U, 64U);
     policy.allow_launch = env_flag("ARGOS_MCP_ALLOW_LAUNCH");
-    policy.launch_allowed_dirs = env_dir_list("ARGOS_MCP_LAUNCH_ALLOWED_DIRS");
+    policy.launch_allowed_dirs = env_string_list("ARGOS_MCP_LAUNCH_ALLOWED_DIRS");
     policy.max_launched_processes = env_size("ARGOS_MCP_MAX_LAUNCHED_PROCESSES", 4U, 64U);
     policy.max_captured_output_bytes = env_size(
         "ARGOS_MCP_MAX_CAPTURED_OUTPUT_BYTES", 1U * 1024U * 1024U, 64U * 1024U * 1024U
@@ -104,6 +107,44 @@ SecurityPolicy SecurityPolicy::from_environment() {
     );
     policy.async_results_ttl_ms = env_size("ARGOS_MCP_ASYNC_RESULTS_TTL_MS", 300'000U, 3'600'000U);
     policy.async_tombstone_ttl_ms = env_size("ARGOS_MCP_ASYNC_TOMBSTONE_TTL_MS", 60'000U, 600'000U);
+    policy.max_inspect_lookbehind_bytes = env_size(
+        "ARGOS_MCP_MAX_INSPECT_LOOKBEHIND_BYTES",
+        static_cast<std::size_t>(domain::inspection_max_lookbehind_bytes),
+        static_cast<std::size_t>(domain::inspection_max_lookbehind_bytes)
+    );
+    policy.max_inspect_vtable_probes = env_size(
+        "ARGOS_MCP_MAX_INSPECT_VTABLE_PROBES",
+        domain::inspection_max_vtable_probes,
+        domain::inspection_max_vtable_probes
+    );
+    policy.max_inspect_vtable_entries = env_size(
+        "ARGOS_MCP_MAX_INSPECT_VTABLE_ENTRIES",
+        domain::inspection_max_vtable_entries,
+        domain::inspection_max_vtable_entries
+    );
+    policy.max_inspect_object_candidates = env_size(
+        "ARGOS_MCP_MAX_INSPECT_OBJECT_CANDIDATES",
+        domain::inspection_max_object_candidates,
+        domain::inspection_max_object_candidates
+    );
+    policy.enable_unreal_runtime = env_flag("ARGOS_MCP_ENABLE_UNREAL_RUNTIME");
+    policy.enable_unreal_auto_discovery = env_flag("ARGOS_MCP_ENABLE_UNREAL_AUTO_DISCOVERY");
+    policy.unreal_profile_allowlist = env_string_list("ARGOS_MCP_UNREAL_PROFILES");
+    policy.max_unreal_contexts_per_session = env_size("ARGOS_MCP_MAX_UNREAL_CONTEXTS_PER_SESSION", 2U, 16U);
+    policy.max_unreal_contexts_total = env_size("ARGOS_MCP_MAX_UNREAL_CONTEXTS", 8U, 64U);
+    policy.max_unreal_slots_visited = env_size("ARGOS_MCP_MAX_UNREAL_SLOTS", 1000000U, 8000000U);
+    policy.max_unreal_objects_stored = env_size("ARGOS_MCP_MAX_UNREAL_OBJECTS", 10000U, 100000U);
+    policy.max_unreal_classes_stored = env_size("ARGOS_MCP_MAX_UNREAL_CLASSES", 20000U, 200000U);
+    policy.max_unreal_properties_per_type = env_size("ARGOS_MCP_MAX_UNREAL_PROPERTIES", 1024U, 8192U);
+    policy.max_unreal_super_depth = env_size("ARGOS_MCP_MAX_UNREAL_SUPER_DEPTH", 64U, 256U);
+    policy.max_unreal_property_nodes = env_size("ARGOS_MCP_MAX_UNREAL_PROPERTY_NODES", 4096U, 32768U);
+    policy.max_unreal_name_bytes = env_size("ARGOS_MCP_MAX_UNREAL_NAME_BYTES", 1024U, 4096U);
+    policy.max_unreal_page_retries = env_size("ARGOS_MCP_MAX_UNREAL_PAGE_RETRIES", 2U, 8U);
+    policy.max_unreal_root_candidates = env_size("ARGOS_MCP_MAX_UNREAL_ROOT_CANDIDATES", 64U, 256U);
+    policy.max_unreal_context_bytes = env_size(
+        "ARGOS_MCP_MAX_UNREAL_CONTEXT_BYTES", 64U * 1024U * 1024U, 256U * 1024U * 1024U
+    );
+    policy.unreal_context_ttl_seconds = env_size("ARGOS_MCP_UNREAL_CONTEXT_TTL_SECONDS", 900U, 3600U);
     return policy;
 }
 
@@ -277,6 +318,75 @@ domain::Result<std::size_t> SecurityPolicy::clamp_async_deadline_ms(
         return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "deadline_ms must be positive"));
     }
     return std::min(requested.value_or(max_async_job_deadline_ms), max_async_job_deadline_ms);
+}
+
+domain::Result<void> SecurityPolicy::authorize_inspection(const domain::InspectionLimits& limits) const {
+    // Domain caps first: they are the invariant. The configured ceilings can
+    // only narrow them further.
+    auto structural = limits.validate();
+    if (!structural) {
+        return structural;
+    }
+    if (limits.lookbehind_bytes > max_inspect_lookbehind_bytes) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::limit_exceeded, "lookbehind_bytes exceeds the configured limit"
+        ));
+    }
+    if (limits.max_vtable_probes > max_inspect_vtable_probes) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::limit_exceeded, "vtable probe count exceeds the configured limit"
+        ));
+    }
+    if (limits.vtable_entries > max_inspect_vtable_entries) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::limit_exceeded, "vtable_entries exceeds the configured limit"
+        ));
+    }
+    if (limits.max_candidates > max_inspect_object_candidates) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::limit_exceeded, "max_object_candidates exceeds the configured limit"
+        ));
+    }
+    return {};
+}
+
+domain::Result<void> SecurityPolicy::authorize_unreal_runtime(const std::string_view profile_id) const {
+    if (!enable_unreal_runtime) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::unsupported,
+            "unreal runtime reflection is disabled; set ARGOS_MCP_ENABLE_UNREAL_RUNTIME=1 before starting the server"
+        ));
+    }
+    if (profile_id.empty()) {
+        return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "profile_id is required"));
+    }
+    // An empty allowlist means "no profile enabled", not "every profile
+    // enabled": the operator has to name what a client may select.
+    const auto allowed = std::ranges::any_of(
+        unreal_profile_allowlist,
+        [profile_id](const std::string& entry) { return entry == profile_id; }
+    );
+    if (!allowed) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::unsupported, "profile_id is not in ARGOS_MCP_UNREAL_PROFILES"
+        ));
+    }
+    return {};
+}
+
+domain::Result<void> SecurityPolicy::authorize_unreal_auto_discovery() const {
+    if (!enable_unreal_runtime) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::unsupported, "unreal runtime reflection is disabled"
+        ));
+    }
+    if (!enable_unreal_auto_discovery) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::unsupported,
+            "unreal automatic root discovery is disabled; set ARGOS_MCP_ENABLE_UNREAL_AUTO_DISCOVERY=1"
+        ));
+    }
+    return {};
 }
 
 }  // namespace argos::security

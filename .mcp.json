@@ -2,7 +2,7 @@
   "mcpServers": {
     "argos-memory": {
       "type": "stdio",
-      "command": "E:\\Projetos\\Argos\\build\\release\\argos_runtime_memory_mcp.exe",
+      "command": "E:\\Projetos\\Argos\\install\\bin\\argos_runtime_memory_mcp.exe",
       "args": [],
       "env": {
         "ARGOS_MCP_LOG_LEVEL": "info",
@@ -11,7 +11,10 @@
         "ARGOS_MCP_MAX_SCAN_BYTES": "268435456",
         "ARGOS_MCP_MAX_SCAN_RESULTS": "4096",
         "ARGOS_MCP_MAX_SCAN_SESSION_CANDIDATES": "4194304",
-        "ARGOS_MCP_MAX_SCAN_SESSIONS_PER_SESSION": "64"
+        "ARGOS_MCP_MAX_SCAN_SESSIONS_PER_SESSION": "64",
+        "ARGOS_MCP_ENABLE_UNREAL_RUNTIME": "1",
+        "ARGOS_MCP_ENABLE_UNREAL_AUTO_DISCOVERY": "0",
+        "ARGOS_MCP_UNREAL_PROFILES": "ue5-fproperty-x64"
       }
     }
   }

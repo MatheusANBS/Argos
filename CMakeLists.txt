@@ -1,7 +1,22 @@
 cmake_minimum_required(VERSION 3.25)
-project(argos_runtime_memory_mcp VERSION 0.1.0 LANGUAGES CXX)
+project(argos_runtime_memory_mcp VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Ninja tracks header dependencies on MSVC by parsing /showIncludes, whose
+# prefix is localized. CMake probes it from cl.exe at configure time. If this
+# build directory was configured without a working cl.exe on PATH, the probe
+# falls back to the English default, ninja stops recognizing the lines, and
+# header changes silently stop triggering rebuilds. That surfaces much later as
+# a stale object linked against a changed ABI -- an access violation in a test
+# that prints nothing -- instead of as a build error. Fail loudly here instead.
+if(MSVC AND CMAKE_GENERATOR MATCHES "Ninja" AND NOT CMAKE_CL_SHOWINCLUDES_PREFIX)
+    message(FATAL_ERROR
+        "cl.exe /showIncludes prefix was not detected, so header dependency "
+        "tracking would be silently broken. Configure this build directory "
+        "from a Developer Command Prompt, or run tools/build.ps1, which sets "
+        "the MSVC environment up first.")
+endif()
 
 option(ARGOS_BUILD_TESTS "Build tests" ON)
 option(ARGOS_ENABLE_ASAN "Enable AddressSanitizer" OFF)
@@ -27,6 +42,8 @@ include(StaticAnalysis)
 
 add_library(argos_domain
     src/domain/types.cpp
+    src/domain/address_inspection.cpp
+    src/domain/unreal_runtime.cpp
 )
 target_include_directories(argos_domain PUBLIC include)
 target_compile_features(argos_domain PUBLIC cxx_std_23)
@@ -52,6 +69,7 @@ endif()
 add_library(argos_application
     src/application/session_manager.cpp
     src/application/scan_session_manager.cpp
+    src/application/unreal_runtime_manager.cpp
     src/application/memory_debug_service.cpp
     src/application/analysis_job_manager.cpp
     src/security/policy.cpp
@@ -108,6 +126,26 @@ if(ARGOS_BUILD_TESTS)
     argos_set_warnings(argos_unit_tests)
     argos_enable_sanitizers(argos_unit_tests)
     add_test(NAME argos_unit_tests COMMAND argos_unit_tests)
+
+    add_executable(argos_address_inspection_tests
+        tests/unit/test_address_inspection.cpp
+    )
+    target_include_directories(argos_address_inspection_tests PRIVATE tests/unit)
+    target_link_libraries(argos_address_inspection_tests PRIVATE argos_protocol)
+    target_compile_features(argos_address_inspection_tests PRIVATE cxx_std_23)
+    argos_set_warnings(argos_address_inspection_tests)
+    argos_enable_sanitizers(argos_address_inspection_tests)
+    add_test(NAME argos_address_inspection_tests COMMAND argos_address_inspection_tests)
+
+    add_executable(argos_unreal_runtime_tests
+        tests/unit/test_unreal_runtime.cpp
+    )
+    target_include_directories(argos_unreal_runtime_tests PRIVATE tests/unit)
+    target_link_libraries(argos_unreal_runtime_tests PRIVATE argos_protocol)
+    target_compile_features(argos_unreal_runtime_tests PRIVATE cxx_std_23)
+    argos_set_warnings(argos_unreal_runtime_tests)
+    argos_enable_sanitizers(argos_unreal_runtime_tests)
+    add_test(NAME argos_unreal_runtime_tests COMMAND argos_unreal_runtime_tests)
 
     add_executable(argos_contract_tests
         tests/contract/test_mcp_contract.cpp

@@ -159,6 +159,17 @@ std::expected<ScanResumeToken, std::string> ScanResumeToken::create(std::string 
     return ScanResumeToken{std::move(value)};
 }
 
+std::expected<RuntimeId, std::string> RuntimeId::create(std::string value) {
+    const auto valid = !value.empty() && value.size() <= 128U &&
+        std::ranges::all_of(value, [](const unsigned char ch) {
+            return std::isalnum(ch) != 0 || ch == '-' || ch == '_';
+        });
+    if (!valid) {
+        return std::unexpected("invalid runtime id");
+    }
+    return RuntimeId{std::move(value)};
+}
+
 std::string_view to_string(const AccessMode mode) noexcept {
     switch (mode) {
         case AccessMode::read_only: return "read_only";

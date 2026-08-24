@@ -42,6 +42,7 @@ assinaturas permanecem candidatos e não são promovidos a layout confirmado.
 | `memory_debug.scan_pointers_to` | Busca ponteiros que referenciam um endereço conhecido. |
 | `memory_debug.scan_pointer_chains` | Descobre cadeias reversas estáveis com uma única passagem multi-alvo por profundidade. |
 | `memory_debug.scan_first` / `scan_next` / `scan_results` / `scan_reset` | Scan incremental (first scan/next scan) para localizar offsets de campos dinâmicos sem PDB/RTTI. `scan_first` e `scan_next` aceitam decimal; cobertura e páginas trazem metadados completos. |
+| `memory_debug.inspect_address` | Correlaciona um endereço com região, proteções, módulo/RVA e candidatos **prováveis** de objeto/vtable, com referências opcionais dentro de orçamento explícito. |
 | `memory_debug.resolve_pointer_chain` | Resolve pointer chains de 32 ou 64 bits. |
 | `memory_debug.write` | Escreve bytes somente quando habilitado e confirmado. |
 | `memory_debug.launch` / `read_output` | Inicia um executável escolhido pelo operador e captura `stdout`/`stderr`. Desligado por padrão (`ARGOS_MCP_ALLOW_LAUNCH`). |
@@ -51,21 +52,31 @@ assinaturas permanecem candidatos e não são promovidos a layout confirmado.
 | `memory_debug.job_cancel` | Pede cancelamento cooperativo de um job em fila ou em execução; idempotente após terminal. |
 | `memory_debug.job_release` | Libera resultados e estado retido de um job terminal. |
 
-## Roadmap proposto
+Atrás de gate, desligadas por padrão (`ARGOS_MCP_ENABLE_UNREAL_RUNTIME` mais
+uma allowlist de perfis) e ausentes de `tools/list` enquanto isso:
 
-`docs/specs/` contém tanto specs já implementadas quanto propostas. As
-seguintes estão **especificadas mas não implementadas** — nenhuma tool acima as
-expõe:
+| Tool | Função |
+|---|---|
+| `memory_debug.unreal_runtime_discover` | Valida as raízes `GUObjectArray`/`FNamePool` contra um perfil de layout habilitado e publica um contexto somente-leitura com o catálogo de classes. |
+| `memory_debug.unreal_runtime_classes` | Pagina o catálogo de classes validado, com filtro por nome. |
+| `memory_debug.unreal_runtime_type` | Lê `FProperty`/`UProperty` declaradas e herdadas de uma classe do catálogo: offsets e tamanhos, nunca valores de instância. |
+| `memory_debug.unreal_runtime_objects` | Enumera summaries de `UObject` vivos filtrados por classe, página a página. |
+| `memory_debug.unreal_runtime_release` | Libera o contexto e os catálogos derivados. |
 
-| Proposta | Spec | ADR |
-|---|---|---|
-| Composição de scan e multipadrão | [0009](docs/specs/0009-scan-composition-and-multi-pattern.md) | [0017](docs/adr/0017-scan-composition-and-multi-pattern.md) |
-| Índice persistente de ponteiros | [0010](docs/specs/0010-persistent-pointer-index.md) | [0018](docs/adr/0018-persistent-pointer-index.md) |
-| `inspect_address` e evidência derivada | [0011](docs/specs/0011-inspect-address.md) | [0013](docs/adr/0013-address-inspection-derived-evidence.md) |
-| Reflexão Unreal em runtime sem PDB | [0012](docs/specs/0012-unreal-runtime-reflection.md) | [0019](docs/adr/0019-unreal-runtime-reflection.md) |
+## Roadmap
 
-Riscos, ordem de implementação e o protocolo de teste com valor mutável estão
-no [roadmap de eficiência do agente](docs/specs/0007-roadmap-eficiencia-agente.md).
+`inspect_address`, a reflexão Unreal em runtime e o scan assíncrono estão
+implementados ([Spec 0011](docs/specs/0011-inspect-address.md),
+[Spec 0012](docs/specs/0012-unreal-runtime-reflection.md),
+[Spec 0008](docs/specs/0008-async-scan-operations.md)), com os limites de
+escopo descritos em cada spec — em particular, retomada por `resume_token`
+na Spec 0008 é um ponto de extensão ainda não implementado. Continuam
+**propostas e fora das tools acima**: importação/multipadrão ([Spec
+0009](docs/specs/0009-scan-composition-and-multi-pattern.md)) e índice
+persistente de pointer chains ([Spec
+0010](docs/specs/0010-persistent-pointer-index.md)). Contratos, decisões,
+riscos e ordem de implementação estão no [roadmap de eficiência do
+agente](docs/specs/0007-roadmap-eficiencia-agente.md).
 
 ## Plataformas
 
@@ -88,6 +99,24 @@ cmake --preset dev
 cmake --build --preset dev
 ctest --preset dev
 ```
+
+### Windows (MSVC + Ninja)
+
+Use o script, que prepara o ambiente antes de tocar no CMake:
+
+```powershell
+.\tools\build.ps1 -Preset dev
+```
+
+O diretório de build **precisa ser configurado** com `cl.exe` no `PATH`. O Ninja
+rastreia dependências de header lendo o `/showIncludes` do MSVC, cujo prefixo é
+localizado; o CMake descobre esse prefixo perguntando ao compilador durante o
+configure. Configurar fora de um Developer Command Prompt grava o prefixo errado
+e **mudanças em header deixam de disparar rebuild** — o sintoma aparece bem
+depois, como um objeto obsoleto linkado contra uma ABI que mudou, e não como
+erro de build. O `CMakeLists.txt` falha no configure se o prefixo não for
+detectado, e `tools/build.ps1` compara o prefixo gravado com o que o compilador
+realmente imprime, reconfigurando do zero quando divergem.
 
 Release:
 
@@ -132,6 +161,18 @@ pid=12345 address=0x7FFD12340000 pattern=4152474f532d4d43502d544553542100
 ```
 
 ## Configuração do cliente MCP
+
+Aponte o cliente para uma cópia **instalada**, não para a árvore de build. O
+servidor mantém o executável aberto enquanto roda, então um cliente apontado
+para `build/release` faz o próximo link falhar com `LNK1104`:
+
+```powershell
+.\tools\build.ps1 -Preset release -Install
+```
+
+Isso publica em `install\bin\argos_runtime_memory_mcp.exe` — o caminho usado por
+`.mcp.json`. Rebuilds deixam de disputar o arquivo com o servidor; reinstale e
+reinicie o cliente quando quiser que ele passe a usar o código novo.
 
 Exemplo genérico:
 
@@ -197,7 +238,33 @@ Depois disso, o `attach` deve solicitar `access: "read_write"`, e cada chamada d
 | `ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES` | 64 MiB | 1 GiB |
 | `ARGOS_MCP_ASYNC_RESULTS_TTL_MS` | 300.000 (5 min) | 3.600.000 (1 h) |
 | `ARGOS_MCP_ASYNC_TOMBSTONE_TTL_MS` | 60.000 (1 min) | 600.000 (10 min) |
+| `ARGOS_MCP_MAX_INSPECT_LOOKBEHIND_BYTES` | 16 KiB | 16 KiB |
+| `ARGOS_MCP_MAX_INSPECT_VTABLE_PROBES` | 128 | 128 |
+| `ARGOS_MCP_MAX_INSPECT_VTABLE_ENTRIES` | 64 | 64 |
+| `ARGOS_MCP_MAX_INSPECT_OBJECT_CANDIDATES` | 64 | 64 |
+| `ARGOS_MCP_ENABLE_UNREAL_RUNTIME` | `0` | booleano |
+| `ARGOS_MCP_ENABLE_UNREAL_AUTO_DISCOVERY` | `0` | booleano |
+| `ARGOS_MCP_UNREAL_PROFILES` | (vazio = nenhum perfil habilitado) | lista separada por `;` |
+| `ARGOS_MCP_MAX_UNREAL_CONTEXTS_PER_SESSION` | 2 | 16 |
+| `ARGOS_MCP_MAX_UNREAL_CONTEXTS` | 8 | 64 |
+| `ARGOS_MCP_MAX_UNREAL_SLOTS` | 1.000.000 | 8.000.000 |
+| `ARGOS_MCP_MAX_UNREAL_OBJECTS` | 10.000 | 100.000 |
+| `ARGOS_MCP_MAX_UNREAL_CLASSES` | 20.000 | 200.000 |
+| `ARGOS_MCP_MAX_UNREAL_PROPERTIES` | 1.024 | 8.192 |
+| `ARGOS_MCP_MAX_UNREAL_SUPER_DEPTH` | 64 | 256 |
+| `ARGOS_MCP_MAX_UNREAL_PROPERTY_NODES` | 4.096 | 32.768 |
+| `ARGOS_MCP_MAX_UNREAL_NAME_BYTES` | 1.024 | 4.096 |
+| `ARGOS_MCP_MAX_UNREAL_PAGE_RETRIES` | 2 | 8 |
+| `ARGOS_MCP_MAX_UNREAL_CONTEXT_BYTES` | 64 MiB | 256 MiB |
+| `ARGOS_MCP_UNREAL_CONTEXT_TTL_SECONDS` | 900 | 3.600 |
 | `ARGOS_MCP_LOG_LEVEL` | `info` | `debug`, `info`, `warning`, `error` |
+
+Os limites de `inspect_address` só podem ser **reduzidos** pelo operador: o teto
+rígido do domínio continua sendo o limite superior.
+
+`ARGOS_MCP_ENABLE_UNREAL_RUNTIME=1` sozinho não habilita nada. Um perfil precisa
+ser nomeado em `ARGOS_MCP_UNREAL_PROFILES` (allowlist vazia = nenhum perfil), e
+`mode: "auto"` exige o segundo gate. Uma requisição nunca liga um gate.
 
 `ARGOS_MCP_ALLOW_FOREIGN_USER=1` remove somente a validação interna de proprietário. Ele não contorna permissões do sistema operacional e deve ser usado apenas em ambientes de laboratório controlados.
 
@@ -248,9 +315,13 @@ Scans e assinaturas continuam sendo candidatos e nao sao promovidos a layout
 confirmado.
 
 Uma extensão somente-leitura por perfis de runtime (`GUObjectArray`,
-`FNamePool`, classes e `FProperty`) está documentada como proposta na
-[Spec 0012](docs/specs/0012-unreal-runtime-reflection.md). Ela não está
-implementada e não altera a proveniência das tools PDB atuais.
+`FNamePool`, classes e `FProperty`) está implementada conforme a
+[Spec 0012](docs/specs/0012-unreal-runtime-reflection.md) e nasce desligada.
+Ela **não** altera a proveniência das tools PDB atuais: `unreal:runtime-reflection`
+é uma fonte separada, com confiança e evidências próprias, e o PDB continua
+sendo o caminho preferido para layout nativo completo. Perfis embutidos:
+`ue5-fproperty-x64` (`FField`/`FProperty`) e `ue4-uproperty-x64`
+(`UField`/`UProperty`), selecionados explicitamente e sem fallback entre si.
 
 ## Licença
 

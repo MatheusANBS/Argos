@@ -64,7 +64,7 @@ enum class LineReadStatus {
     return Value::object({
         {"name", "argos-runtime-memory-mcp"},
         {"title", "Argos Runtime Memory Debug MCP"},
-        {"version", "0.1.0"}
+        {"version", "0.2.0"}
     });
 }
 

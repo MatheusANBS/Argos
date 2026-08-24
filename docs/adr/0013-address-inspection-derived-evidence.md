@@ -1,6 +1,6 @@
 # ADR-0013 — Inspeção de endereço por evidência derivada
 
-Status: proposto
+Status: aceito e implementado (referências por índice permanecem propostas)
 
 ## Contexto
 

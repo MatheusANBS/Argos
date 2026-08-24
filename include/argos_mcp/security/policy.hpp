@@ -1,8 +1,10 @@
 #pragma once
 
+#include "argos_mcp/domain/address_inspection.hpp"
 #include "argos_mcp/domain/types.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -39,6 +41,33 @@ struct SecurityPolicy {
     std::size_t max_async_results_retained_bytes{64U * 1024U * 1024U};
     std::size_t async_results_ttl_ms{300'000U};
     std::size_t async_tombstone_ttl_ms{60'000U};
+
+    // Ceilings for memory_debug.inspect_address. The operator can only lower
+    // them: the domain hard caps remain the upper bound.
+    std::uint64_t max_inspect_lookbehind_bytes{domain::inspection_max_lookbehind_bytes};
+    std::size_t max_inspect_vtable_probes{domain::inspection_max_vtable_probes};
+    std::size_t max_inspect_vtable_entries{domain::inspection_max_vtable_entries};
+    std::size_t max_inspect_object_candidates{domain::inspection_max_object_candidates};
+
+    // Unreal runtime reflection is gated off by default, and automatic root
+    // discovery needs a second, independent gate. A request can never turn
+    // either on; only server configuration can.
+    bool enable_unreal_runtime{false};
+    bool enable_unreal_auto_discovery{false};
+    std::vector<std::string> unreal_profile_allowlist;
+    std::size_t max_unreal_contexts_per_session{2U};
+    std::size_t max_unreal_contexts_total{8U};
+    std::size_t max_unreal_slots_visited{1000000U};
+    std::size_t max_unreal_objects_stored{10000U};
+    std::size_t max_unreal_classes_stored{20000U};
+    std::size_t max_unreal_properties_per_type{1024U};
+    std::size_t max_unreal_super_depth{64U};
+    std::size_t max_unreal_property_nodes{4096U};
+    std::size_t max_unreal_name_bytes{1024U};
+    std::size_t max_unreal_page_retries{2U};
+    std::size_t max_unreal_root_candidates{64U};
+    std::size_t max_unreal_context_bytes{64U * 1024U * 1024U};
+    std::size_t unreal_context_ttl_seconds{900U};
 
     [[nodiscard]] static SecurityPolicy from_environment();
 
@@ -87,6 +116,15 @@ struct SecurityPolicy {
     [[nodiscard]] domain::Result<std::size_t> clamp_async_deadline_ms(
         std::optional<std::size_t> requested
     ) const;
+
+    // Applied before the first process read, so an oversized request never
+    // allocates a buffer or touches the target.
+    [[nodiscard]] domain::Result<void> authorize_inspection(
+        const domain::InspectionLimits& limits
+    ) const;
+
+    [[nodiscard]] domain::Result<void> authorize_unreal_runtime(std::string_view profile_id) const;
+    [[nodiscard]] domain::Result<void> authorize_unreal_auto_discovery() const;
 };
 
 }  // namespace argos::security

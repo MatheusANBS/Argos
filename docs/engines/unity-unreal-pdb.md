@@ -121,12 +121,13 @@ PDB compativel, retorna `not_found`/`unsupported`. A implementacao atual extrai
 metadados e layouts comprovados; ela nao injeta codigo nem resolve objetos por
 varredura cega.
 
-Uma extensão futura, ainda não implementada, está especificada em
+Uma extensão somente-leitura por perfis de runtime está implementada conforme
 [Reflexão Unreal em runtime sem PDB](../specs/0012-unreal-runtime-reflection.md)
-e decidida de forma proposta em
-[ADR-0019](../adr/0019-unreal-runtime-reflection.md). Ela usa perfis explícitos,
-validação estrutural, proveniência e confiança; não transforma signatures em
-layout confirmado nem modifica o comportamento descrito nesta página.
+e [ADR-0019](../adr/0019-unreal-runtime-reflection.md), desligada por padrão
+atrás de gate e allowlist de perfil. Ela usa perfis explícitos, validação
+estrutural, proveniência e confiança; não transforma signatures em layout
+confirmado nem modifica o comportamento descrito nesta página. Quando as duas
+fontes existirem, PDB e runtime permanecem separados e comparáveis.
 
 ## Nivel de confianca
 
@@ -136,4 +137,6 @@ layout confirmado nem modifica o comportamento descrito nesta página.
 | Unity `global-metadata.dat` validado | tipos, nomes e indices de campo | Media; offsets dependem de PDB |
 | Unity metadata + PDB correspondente | tipo, campos e offsets nativos | Alta |
 | Unreal UHT `StaticClass`/`StaticStruct` no PDB | simbolos de reflexao e RVAs | Alta |
+| Unreal runtime com perfil vinculado ao modulo e todas as invariantes | classes, heranca e offsets de `FProperty` | Alta para o perfil validado; fonte separada do PDB |
+| Unreal runtime com raiz apenas plausivel ou amostra parcial | candidato com `failed_invariants` | Baixa/media; nunca promovido a layout confirmado |
 | Scan de bytes, assinatura ou offset heuristico | candidato | Baixa; nao e reportado como tipo confirmado |
