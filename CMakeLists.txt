@@ -71,6 +71,7 @@ add_library(argos_application
     src/application/scan_session_manager.cpp
     src/application/unreal_runtime_manager.cpp
     src/application/memory_debug_service.cpp
+    src/application/analysis_job_manager.cpp
     src/security/policy.cpp
 )
 target_include_directories(argos_application PUBLIC include)

@@ -1,6 +1,7 @@
 # ADR-0012 — Scans assíncronos, progresso e retomada
 
-Status: proposto
+Status: aceito (retomada por `resume_token` permanece como extensão futura —
+ver a "Nota de implementação" na [Spec 0008](../specs/0008-async-scan-operations.md))
 
 ## Contexto
 
@@ -30,8 +31,9 @@ O desenho precisa preservar:
   [threat model](../threat-model/runtime-memory-debug.md).
 
 O contrato detalhado está na
-[Spec 0008](../specs/0008-async-scan-operations.md). Esta decisão é proposta e
-não descreve funcionalidade já implementada.
+[Spec 0008](../specs/0008-async-scan-operations.md). `AnalysisJobManager` e as
+cinco tools estão implementados; a retomada por `resume_token` descrita nesta
+decisão é a exceção documentada — ver a "Nota de implementação" da spec.
 
 ## Decisão
 

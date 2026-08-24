@@ -17,12 +17,8 @@ Por padrão:
 
 ## Tools MCP
 
-`memory_debug.pdb_type` consulta o layout de um tipo no PDB correspondente ao
-modulo carregado, com origem e nivel de confianca explicitos.
-
-`memory_debug.unity_type` extrai tipos de `global-metadata.dat` IL2CPP e usa
-PDB para completar offsets. `memory_debug.unreal_type` e
-`memory_debug.unreal_reflection` extraem tipos e simbolos UHT do PDB nativo.
+Tipos e layouts vêm sempre com origem e nível de confiança explícitos; scans e
+assinaturas permanecem candidatos e não são promovidos a layout confirmado.
 
 | Tool | Função |
 |---|---|
@@ -34,6 +30,10 @@ PDB para completar offsets. `memory_debug.unreal_type` e
 | `memory_debug.address_space_summary` | Agrega tamanho e contagem do espaço de endereçamento por classe; dimensiona o alvo antes de varrer. |
 | `memory_debug.modules` | Lista módulos carregados/mapeamentos de arquivo. |
 | `memory_debug.pdb_list_types` | Enumera tipos disponíveis no PDB de um módulo carregado. |
+| `memory_debug.pdb_type` | Consulta o layout de um tipo no PDB correspondente ao módulo carregado. |
+| `memory_debug.unity_type` | Extrai tipos de `global-metadata.dat` IL2CPP e usa PDB para completar offsets. |
+| `memory_debug.unreal_type` | Extrai tipos UHT do PDB nativo. |
+| `memory_debug.unreal_reflection` | Extrai símbolos de reflexão UHT do PDB nativo. |
 | `memory_debug.read` | Lê bytes limitados e retorna hexadecimal. |
 | `memory_debug.read_batch` | Executa múltiplas leituras limitadas, coalescendo intervalos adjacentes/sobrepostos em uma única leitura nativa. |
 | `memory_debug.read_typed` | Decodifica inteiros, floats e UTF-8 little-endian. |
@@ -46,6 +46,11 @@ PDB para completar offsets. `memory_debug.unreal_type` e
 | `memory_debug.resolve_pointer_chain` | Resolve pointer chains de 32 ou 64 bits. |
 | `memory_debug.write` | Escreve bytes somente quando habilitado e confirmado. |
 | `memory_debug.launch` / `read_output` | Inicia um executável escolhido pelo operador e captura `stdout`/`stderr`. Desligado por padrão (`ARGOS_MCP_ALLOW_LAUNCH`). |
+| `memory_debug.scan_start` | Inicia `scan_exact`/`strings`/`scan_pointers_to`/`scan_pointer_chains`/`scan_first`/`scan_next` como job em background que sobrevive à chamada MCP ([Spec 0008](docs/specs/0008-async-scan-operations.md)). |
+| `memory_debug.job_status` | Consulta estado, progresso monotônico e motivo de término de um job em background. |
+| `memory_debug.job_results` | Pagina o resultado imutável de um job terminal. |
+| `memory_debug.job_cancel` | Pede cancelamento cooperativo de um job em fila ou em execução; idempotente após terminal. |
+| `memory_debug.job_release` | Libera resultados e estado retido de um job terminal. |
 
 Atrás de gate, desligadas por padrão (`ARGOS_MCP_ENABLE_UNREAL_RUNTIME` mais
 uma allowlist de perfis) e ausentes de `tools/list` enquanto isso:
@@ -60,13 +65,18 @@ uma allowlist de perfis) e ausentes de `tools/list` enquanto isso:
 
 ## Roadmap
 
-`inspect_address` e a reflexão Unreal em runtime estão implementadas
-([Spec 0011](docs/specs/0011-inspect-address.md),
-[Spec 0012](docs/specs/0012-unreal-runtime-reflection.md)), com os limites de
-escopo descritos em cada spec. Continuam **propostos e fora das tools acima**:
-jobs assíncronos, importação/multipadrão e índice persistente de pointer
-chains. Contratos, decisões, riscos e ordem de implementação estão no
-[roadmap de eficiência do agente](docs/specs/0007-roadmap-eficiencia-agente.md).
+`inspect_address`, a reflexão Unreal em runtime e o scan assíncrono estão
+implementados ([Spec 0011](docs/specs/0011-inspect-address.md),
+[Spec 0012](docs/specs/0012-unreal-runtime-reflection.md),
+[Spec 0008](docs/specs/0008-async-scan-operations.md)), com os limites de
+escopo descritos em cada spec — em particular, retomada por `resume_token`
+na Spec 0008 é um ponto de extensão ainda não implementado. Continuam
+**propostas e fora das tools acima**: importação/multipadrão ([Spec
+0009](docs/specs/0009-scan-composition-and-multi-pattern.md)) e índice
+persistente de pointer chains ([Spec
+0010](docs/specs/0010-persistent-pointer-index.md)). Contratos, decisões,
+riscos e ordem de implementação estão no [roadmap de eficiência do
+agente](docs/specs/0007-roadmap-eficiencia-agente.md).
 
 ## Plataformas
 
@@ -218,6 +228,16 @@ Depois disso, o `attach` deve solicitar `access: "read_write"`, e cada chamada d
 | `ARGOS_MCP_LAUNCH_ALLOWED_DIRS` | (vazio = sem allowlist) | lista separada por `;` |
 | `ARGOS_MCP_MAX_LAUNCHED_PROCESSES` | 4 | 64 |
 | `ARGOS_MCP_MAX_CAPTURED_OUTPUT_BYTES` | 1 MiB | 64 MiB |
+| `ARGOS_MCP_MAX_ASYNC_JOBS_TOTAL` | 64 | 1.024 |
+| `ARGOS_MCP_MAX_ASYNC_JOBS_PER_SESSION` | 8 | 128 |
+| `ARGOS_MCP_MAX_ASYNC_QUEUE_DEPTH` | 32 | 512 |
+| `ARGOS_MCP_MAX_ASYNC_WORKERS` | 2 | 16 |
+| `ARGOS_MCP_MAX_ASYNC_JOB_BYTE_BUDGET` | 256 MiB | 4 GiB |
+| `ARGOS_MCP_MAX_ASYNC_JOB_DEADLINE_MS` | 600.000 (10 min) | 3.600.000 (1 h) |
+| `ARGOS_MCP_MAX_ASYNC_JOB_RESULT_ITEMS` | 4.096 | 65.536 |
+| `ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES` | 64 MiB | 1 GiB |
+| `ARGOS_MCP_ASYNC_RESULTS_TTL_MS` | 300.000 (5 min) | 3.600.000 (1 h) |
+| `ARGOS_MCP_ASYNC_TOMBSTONE_TTL_MS` | 60.000 (1 min) | 600.000 (10 min) |
 | `ARGOS_MCP_MAX_INSPECT_LOOKBEHIND_BYTES` | 16 KiB | 16 KiB |
 | `ARGOS_MCP_MAX_INSPECT_VTABLE_PROBES` | 128 | 128 |
 | `ARGOS_MCP_MAX_INSPECT_VTABLE_ENTRIES` | 64 | 64 |
@@ -249,6 +269,8 @@ ser nomeado em `ARGOS_MCP_UNREAL_PROFILES` (allowlist vazia = nenhum perfil), e
 `ARGOS_MCP_ALLOW_FOREIGN_USER=1` remove somente a validação interna de proprietário. Ele não contorna permissões do sistema operacional e deve ser usado apenas em ambientes de laboratório controlados.
 
 `ARGOS_MCP_ALLOW_LAUNCH=1` habilita `memory_debug.launch` (o servidor cria um processo em vez de apenas ler um já existente). Desligado por padrão; útil apenas para alvos de teste/desenvolvimento controlados pelo próprio operador, não para anexar a processos de terceiros já em execução. Ver o threat model para os controles completos.
+
+As variáveis `ARGOS_MCP_MAX_ASYNC_*` e `ARGOS_MCP_ASYNC_*` limitam `AnalysisJobManager` (jobs em background da Spec 0008): fila global/por sessão, pool de workers, orçamento de bytes e deadline por job, itens de resultado por página e TTL de resultado/tombstone. Nenhum valor pedido pelo cliente em `execution` ultrapassa esses limites — apenas reduz. `ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES` é um limite **agregado**, somado sobre os resultados retidos de todos os jobs simultaneamente (não por job): a contabilidade inclui o conteúdo alocado no heap de cada match (texto de `strings`, offsets de `scan_pointer_chains`), não só `size() * sizeof(T)`. Quando um job termina e a retenção de seus resultados estouraria o agregado, o job mantém o quanto couber (a cobertura do scan pode continuar `coverage_complete: true`) e o excedente é descartado com `termination.truncated: true`, `results_complete: false` e `truncation_reasons` incluindo `"retained_bytes_budget"` — nunca um descarte silencioso. `job_release`, a expiração do TTL de resultados e `detach_session` devolvem os bytes ao orçamento agregado.
 
 ## Skills instaladas
 
