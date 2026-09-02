@@ -96,7 +96,7 @@ allowlist) são validados na infraestrutura antes de `CreateProcessW`.
 
 ```json
 {
-  "executable": "C:\\Users\\matheuss\\Desktop\\Sistemas\\Yggdrasil\\build\\dev\\Debug\\argos_debug_target_game.exe",
+  "executable": "C:\\Users\\matheuss\\Desktop\\Sistemas\\Argos\\build\\dev\\Debug\\argos_debug_target_game.exe",
   "arguments": [],
   "access": "read_only",
   "authorized": true,

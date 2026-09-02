@@ -1,6 +1,6 @@
 # Spec 0008 — Operações assíncronas de scan
 
-Status: proposto · ADR: [0012](../adr/0012-async-scan-progress-resumption.md)
+Status: aceito · ADR: [0012](../adr/0012-async-scan-progress-resumption.md)
 
 ## Objetivo
 
@@ -16,8 +16,32 @@ o ownership de candidatos da [ADR-0009](../adr/0009-value-diff-scan-sessions.md)
 e os envelopes das duas eras MCP definidos na
 [ADR-0016](../adr/0016-mcp-dual-era-2026.md).
 
-Esta spec é uma proposta. As tools, os tipos e os limites descritos abaixo
-**não estão implementados**.
+## Nota de implementação
+
+`AnalysisJobManager` e as cinco tools (`scan_start`, `job_status`,
+`job_results`, `job_cancel`, `job_release`) estão implementados e cobertos por
+teste para os seis operações elegíveis. O lifecycle completo (estados,
+progresso monotônico, cancelamento cooperativo, backpressure, TTL de
+resultado e de tombstone, paginação imutável, `detach`/shutdown
+determinísticos) reusa o mesmo motor de scan que as tools síncronas, sem
+duplicá-lo.
+
+**`resume_token` não está implementado nesta versão.** A seção "Retomada
+correta" desta spec descreve um cursor autoritativo com fingerprint de
+região, CAS de admissão e estado de overlap serializado por operação — um
+subsistema à parte, do tamanho de uma spec própria. Implementá-lo apressado
+arriscava perder ou duplicar matches na fronteira, exatamente o defeito que a
+spec existe para evitar. `scan_start` aceita a forma `resume_token` no
+schema e responde de forma segura e explícita
+(`unsupported`/`resume_not_supported`) em vez de simular suporte; nenhum
+token é emitido em `job_status`/`job_results` (`resume_token` sempre `null`).
+`next_start_address` é preenchido de forma best-effort para `scan_exact` e
+`scan_pointers_to` quando o job é truncado por `byte_budget`/`result_limit` —
+permanece diagnóstico, nunca aceito como cursor. Esta lacuna é o ponto de
+extensão prioritário para um passe futuro; ver o relatório de implementação
+para os detalhes de design que ele deve preservar (motor compartilhado,
+progresso via callback aditivo, guarda de exclusão mútua bypassável apenas
+pelo próprio worker).
 
 ## Escopo
 
@@ -135,6 +159,16 @@ mas o sweep continuou para os demais. Gaps de leitura são expostos por
 `read_error_count` e por uma lista bounded de intervalos/erros seguros; não são
 silenciosamente convertidos em ausência de match.
 
+`truncation_reasons` também inclui `retained_bytes_budget` quando
+`AnalysisJobManager` não consegue reter todos os matches encontrados dentro de
+`ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES` — um orçamento agregado somado
+sobre os resultados retidos de todos os jobs, não por job. Diferente dos
+demais motivos, esse corte acontece depois que o sweep já terminou: um job
+pode chegar com `coverage_complete: true` (o scan cobriu tudo) e ainda assim
+`results_complete: false` porque o excedente de resultados foi descartado
+para caber no orçamento agregado. `job_release`, a expiração do TTL de
+resultados e `detach_session` devolvem os bytes ao orçamento.
+
 Falhas não fatais de leitura continuam registradas em `regions_skipped` e
 `bytes_skipped`. Assim, um job pode chegar a `range_exhausted` com
 `complete: false`; essa diferença deve permanecer visível em vez de promover
@@ -185,7 +219,8 @@ enum class AnalysisTruncationReason {
     result_limit,
     deadline,
     max_depth,
-    max_fanout
+    max_fanout,
+    retained_bytes_budget  // ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES, aggregate across all retained jobs.
 };
 
 struct ScanProgress {

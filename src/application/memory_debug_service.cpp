@@ -1,5 +1,7 @@
 #include "argos_mcp/application/memory_debug_service.hpp"
 
+#include "argos_mcp/application/analysis_job_manager.hpp"
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -182,7 +184,8 @@ enum class Ordering { less, equal, greater };
     const bool writable_only,
     const std::optional<domain::Address> start_address,
     const std::optional<domain::Address> end_address,
-    const std::stop_token cancellation
+    const std::stop_token cancellation,
+    const ScanProgressSink& progress_sink = {}
 ) {
     constexpr std::size_t chunk_size = 64U * 1024U;
     ScanResult result;
@@ -192,6 +195,23 @@ enum class Ordering { less, equal, greater };
     buffer.reserve(chunk_size + pattern.size());
     std::vector<std::byte> carry;
     carry.reserve(pattern.size() - 1U);
+
+    const auto [bytes_eligible, regions_eligible] =
+        domain::eligible_scan_bytes(regions, writable_only, start_address, end_address);
+    std::uint64_t progress_sequence = 0;
+    std::size_t regions_scanned = 0;
+    const auto publish_progress = [&] {
+        if (!progress_sink) return;
+        domain::ScanProgress snapshot;
+        snapshot.sequence = ++progress_sequence;
+        snapshot.bytes_scanned = result.bytes_scanned;
+        snapshot.bytes_eligible = bytes_eligible;
+        snapshot.regions_scanned = regions_scanned;
+        snapshot.regions_eligible = regions_eligible;
+        snapshot.matches_found = result.matches.size();
+        snapshot.matches_retained = result.matches.size();
+        progress_sink(snapshot);
+    };
 
     for (const auto& region : regions) {
         if (cancellation.stop_requested()) {
@@ -243,6 +263,8 @@ enum class Ordering { less, equal, greater };
                         result.matches.push_back(domain::ScanMatch{candidate});
                         if (result.matches.size() >= result_limit) {
                             result.truncated = true;
+                            result.stopped_at = candidate + static_cast<domain::Address>(pattern.size());
+                            publish_progress();
                             return result;
                         }
                     }
@@ -252,12 +274,17 @@ enum class Ordering { less, equal, greater };
             const std::size_t carry_size = std::min(pattern.size() - 1U, buffer.size());
             carry.assign(buffer.end() - static_cast<std::ptrdiff_t>(carry_size), buffer.end());
             cursor += static_cast<domain::Address>(*read);
+            publish_progress();
         }
+        ++regions_scanned;
         if (result.bytes_scanned >= byte_budget) {
             result.truncated = true;
+            result.stopped_at = cursor;
+            publish_progress();
             break;
         }
     }
+    publish_progress();
     return result;
 }
 
@@ -372,7 +399,8 @@ MemoryDebugService::MemoryDebugService(
     std::unique_ptr<domain::ProcessMemoryProvider> provider,
     security::SecurityPolicy policy,
     std::unique_ptr<domain::TypeMetadataProvider> metadata_provider
-) : provider_(std::move(provider)), metadata_provider_(std::move(metadata_provider)), policy_(policy) {
+) : provider_(std::move(provider)), metadata_provider_(std::move(metadata_provider)), policy_(policy),
+    analysis_jobs_(std::make_unique<AnalysisJobManager>(*this, policy_)) {
     std::random_device device;
     resume_key_ = (static_cast<std::uint64_t>(device()) << 32U) ^ static_cast<std::uint64_t>(device());
     // A zero key would make every token forgeable by anyone who knows the
@@ -380,6 +408,20 @@ MemoryDebugService::MemoryDebugService(
     if (resume_key_ == 0U) {
         resume_key_ = 0x9E3779B97F4A7C15ULL;
     }
+}
+
+MemoryDebugService::~MemoryDebugService() = default;
+
+domain::Result<void> MemoryDebugService::reject_if_analysis_job_active(const domain::SessionId& id) const {
+    if (analysis_jobs_->has_running_job(id)) {
+        return std::unexpected(domain::DebugError{
+            domain::DebugErrorCode::invalid_state,
+            "a background scan job is already running for this session; "
+            "poll it with memory_debug.job_status or use the async API to queue another",
+            "analysis_job_active"
+        });
+    }
+    return {};
 }
 
 domain::Result<std::vector<domain::ProcessInfo>> MemoryDebugService::list_processes(
@@ -429,6 +471,11 @@ domain::Result<void> MemoryDebugService::detach(const domain::SessionId& id, con
             return std::unexpected(terminated.error());
         }
     }
+    // Cancel/drain background jobs before the session (and the native handle
+    // it owns) goes away: a worker mid-read must never observe a torn-down
+    // ProcessSession (Spec 0008 "detach").
+    analysis_jobs_->detach_session(id);
+
     auto removed = sessions_.remove(id);
     if (!removed) {
         return removed;
@@ -847,7 +894,9 @@ domain::Result<ScanResult> MemoryDebugService::scan_exact(
     const bool writable_only,
     const std::optional<domain::Address> start_address,
     const std::optional<domain::Address> end_address,
-    const std::stop_token cancellation
+    const std::stop_token cancellation,
+    ScanProgressSink progress_sink,
+    const bool bypass_active_job_guard
 ) const {
     if (pattern.empty() || pattern.size() > 4096U) {
         return std::unexpected(error(
@@ -863,7 +912,7 @@ domain::Result<ScanResult> MemoryDebugService::scan_exact(
     }
     return scan_pattern(
         id, pattern, alignment, byte_budget, result_limit, writable_only,
-        start_address, end_address, cancellation
+        start_address, end_address, cancellation, progress_sink, bypass_active_job_guard
     );
 }
 
@@ -876,7 +925,9 @@ domain::Result<ScanResult> MemoryDebugService::scan_pointers_to(
     const bool writable_only,
     const std::optional<domain::Address> start_address,
     const std::optional<domain::Address> end_address,
-    const std::stop_token cancellation
+    const std::stop_token cancellation,
+    ScanProgressSink progress_sink,
+    const bool bypass_active_job_guard
 ) const {
     if (pointer_size != 4U && pointer_size != 8U) {
         return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "pointer_size must be 4 or 8"));
@@ -895,7 +946,8 @@ domain::Result<ScanResult> MemoryDebugService::scan_pointers_to(
     }
     return scan_pattern(
         id, std::span<const std::byte>{pattern_bytes}.first(pointer_size), pointer_size,
-        byte_budget, result_limit, writable_only, start_address, end_address, cancellation
+        byte_budget, result_limit, writable_only, start_address, end_address, cancellation, progress_sink,
+        bypass_active_job_guard
     );
 }
 
@@ -908,7 +960,9 @@ domain::Result<ScanResult> MemoryDebugService::scan_pattern(
     const bool writable_only,
     const std::optional<domain::Address> start_address,
     const std::optional<domain::Address> end_address,
-    const std::stop_token cancellation
+    const std::stop_token cancellation,
+    const ScanProgressSink& progress_sink,
+    const bool bypass_active_job_guard
 ) const {
     if (start_address && end_address && *end_address <= *start_address) {
         return std::unexpected(error(
@@ -920,6 +974,12 @@ domain::Result<ScanResult> MemoryDebugService::scan_pattern(
     if (!authorization) {
         return std::unexpected(authorization.error());
     }
+    if (!bypass_active_job_guard) {
+        auto active = reject_if_analysis_job_active(id);
+        if (!active) {
+            return std::unexpected(active.error());
+        }
+    }
     auto session = sessions_.get(id);
     if (!session) {
         return std::unexpected(session.error());
@@ -930,7 +990,7 @@ domain::Result<ScanResult> MemoryDebugService::scan_pattern(
     }
     return scan_pattern_over_regions(
         **session, *region_result, pattern, alignment, byte_budget, result_limit, writable_only,
-        start_address, end_address, cancellation
+        start_address, end_address, cancellation, progress_sink
     );
 }
 
@@ -945,7 +1005,9 @@ domain::Result<PointerChainScanResult> MemoryDebugService::scan_pointer_chains(
     const bool writable_only,
     const std::optional<domain::Address> start_address,
     const std::optional<domain::Address> end_address,
-    const std::stop_token cancellation
+    const std::stop_token cancellation,
+    const ScanProgressSink progress_sink,
+    const bool bypass_active_job_guard
 ) const {
     if (pointer_size != 4U && pointer_size != 8U) {
         return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "pointer_size must be 4 or 8"));
@@ -967,6 +1029,12 @@ domain::Result<PointerChainScanResult> MemoryDebugService::scan_pointer_chains(
     auto authorization = policy_.authorize_pointer_chain_scan(byte_budget, result_limit, max_depth, max_fanout);
     if (!authorization) {
         return std::unexpected(authorization.error());
+    }
+    if (!bypass_active_job_guard) {
+        auto active = reject_if_analysis_job_active(id);
+        if (!active) {
+            return std::unexpected(active.error());
+        }
     }
     auto session = sessions_.get(id);
     if (!session) {
@@ -1024,6 +1092,18 @@ domain::Result<PointerChainScanResult> MemoryDebugService::scan_pointer_chains(
         }
         total_bytes += partial->bytes_scanned;
         result.truncated = result.truncated || partial->truncated;
+
+        if (progress_sink) {
+            domain::ScanProgress snapshot;
+            snapshot.sequence = static_cast<std::uint64_t>(depth);
+            snapshot.bytes_scanned = total_bytes;
+            snapshot.bytes_eligible = byte_budget;
+            snapshot.regions_scanned = depth;
+            snapshot.regions_eligible = max_depth;
+            snapshot.matches_found = result.candidates.size() + partial->matches.size();
+            snapshot.matches_retained = result.candidates.size();
+            progress_sink(snapshot);
+        }
 
         std::vector<domain::Address> next_frontier;
         next_frontier.reserve(partial->matches.size());
@@ -1121,7 +1201,9 @@ domain::Result<StringScanResult> MemoryDebugService::extract_strings(
     const bool writable_only,
     const std::optional<domain::Address> start_address,
     const std::optional<domain::Address> end_address,
-    const std::stop_token cancellation
+    const std::stop_token cancellation,
+    const ScanProgressSink progress_sink,
+    const bool bypass_active_job_guard
 ) const {
     if (min_length == 0U) {
         return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "min_length must be positive"));
@@ -1139,6 +1221,12 @@ domain::Result<StringScanResult> MemoryDebugService::extract_strings(
     auto authorization = policy_.authorize_scan(byte_budget, result_limit);
     if (!authorization) {
         return std::unexpected(authorization.error());
+    }
+    if (!bypass_active_job_guard) {
+        auto active = reject_if_analysis_job_active(id);
+        if (!active) {
+            return std::unexpected(active.error());
+        }
     }
     auto session = sessions_.get(id);
     if (!session) {
@@ -1159,6 +1247,23 @@ domain::Result<StringScanResult> MemoryDebugService::extract_strings(
     buffer.reserve(chunk_size + unit - 1U);
     std::vector<std::byte> carry;
     carry.reserve(unit - 1U);
+
+    const auto [bytes_eligible, regions_eligible] =
+        domain::eligible_scan_bytes(*region_result, writable_only, start_address, end_address);
+    std::uint64_t progress_sequence = 0;
+    std::size_t regions_scanned = 0;
+    const auto publish_progress = [&] {
+        if (!progress_sink) return;
+        domain::ScanProgress snapshot;
+        snapshot.sequence = ++progress_sequence;
+        snapshot.bytes_scanned = result.bytes_scanned;
+        snapshot.bytes_eligible = bytes_eligible;
+        snapshot.regions_scanned = regions_scanned;
+        snapshot.regions_eligible = regions_eligible;
+        snapshot.matches_found = result.matches.size();
+        snapshot.matches_retained = result.matches.size();
+        progress_sink(snapshot);
+    };
 
     for (const auto& region : *region_result) {
         if (cancellation.stop_requested()) {
@@ -1258,16 +1363,23 @@ domain::Result<StringScanResult> MemoryDebugService::extract_strings(
             const std::size_t leftover = buffer.size() - index;
             carry.assign(buffer.end() - static_cast<std::ptrdiff_t>(leftover), buffer.end());
             cursor += static_cast<domain::Address>(*read);
+            publish_progress();
         }
         flush_run();
+        ++regions_scanned;
         if (truncated_by_limit) {
+            result.stopped_at = cursor;
+            publish_progress();
             return result;
         }
         if (result.bytes_scanned >= byte_budget) {
             result.truncated = true;
+            result.stopped_at = cursor;
+            publish_progress();
             break;
         }
     }
+    publish_progress();
     return result;
 }
 
@@ -1282,7 +1394,9 @@ domain::Result<MemoryDebugService::ScanFirstResult> MemoryDebugService::scan_fir
     const bool writable_only,
     const std::optional<domain::Address> start_address,
     const std::optional<domain::Address> end_address,
-    const std::stop_token cancellation
+    const std::stop_token cancellation,
+    const ScanProgressSink progress_sink,
+    const bool bypass_active_job_guard
 ) const {
     if (comparison != domain::ScanComparison::exact && comparison != domain::ScanComparison::unknown &&
         comparison != domain::ScanComparison::in_range) {
@@ -1314,6 +1428,12 @@ domain::Result<MemoryDebugService::ScanFirstResult> MemoryDebugService::scan_fir
     auto authorization = policy_.authorize_scan_session(byte_budget, result_limit);
     if (!authorization) {
         return std::unexpected(authorization.error());
+    }
+    if (!bypass_active_job_guard) {
+        auto active = reject_if_analysis_job_active(id);
+        if (!active) {
+            return std::unexpected(active.error());
+        }
     }
     auto session = sessions_.get(id);
     if (!session) {
@@ -1355,6 +1475,7 @@ domain::Result<MemoryDebugService::ScanFirstResult> MemoryDebugService::scan_fir
     std::vector<std::byte> buffer;
     buffer.reserve(chunk_size + value_size - 1U);
     std::size_t regions_scanned = 0;
+    std::uint64_t progress_sequence = 0;
 
     for (const auto& region : *region_result) {
         if (truncated_by_limit) {
@@ -1434,6 +1555,17 @@ domain::Result<MemoryDebugService::ScanFirstResult> MemoryDebugService::scan_fir
             const std::size_t carry_size = std::min(value_size - 1U, buffer.size());
             carry.assign(buffer.end() - static_cast<std::ptrdiff_t>(carry_size), buffer.end());
             cursor += static_cast<domain::Address>(*read);
+            if (progress_sink) {
+                domain::ScanProgress snapshot;
+                snapshot.sequence = ++progress_sequence;
+                snapshot.bytes_scanned = bytes_scanned;
+                snapshot.bytes_eligible = bytes_eligible;
+                snapshot.regions_scanned = regions_scanned;
+                snapshot.regions_eligible = regions_eligible;
+                snapshot.matches_found = candidates.size();
+                snapshot.matches_retained = candidates.size();
+                progress_sink(snapshot);
+            }
         }
     }
 
@@ -1463,7 +1595,9 @@ domain::Result<domain::ScanSessionInfo> MemoryDebugService::scan_next(
     const domain::ScanComparison comparison,
     std::optional<std::vector<std::byte>> value,
     std::optional<std::vector<std::byte>> delta,
-    const std::stop_token cancellation
+    const std::stop_token cancellation,
+    const ScanProgressSink progress_sink,
+    const bool bypass_active_job_guard
 ) const {
     if (comparison == domain::ScanComparison::unknown || comparison == domain::ScanComparison::in_range) {
         return std::unexpected(error(
@@ -1474,6 +1608,12 @@ domain::Result<domain::ScanSessionInfo> MemoryDebugService::scan_next(
     auto snapshot = scan_sessions_.snapshot(scan_id);
     if (!snapshot) {
         return std::unexpected(snapshot.error());
+    }
+    if (!bypass_active_job_guard) {
+        auto active = reject_if_analysis_job_active(snapshot->owner());
+        if (!active) {
+            return std::unexpected(active.error());
+        }
     }
     const auto value_type = snapshot->value_type();
     const auto candidates = snapshot->candidates();
@@ -1548,9 +1688,21 @@ domain::Result<domain::ScanSessionInfo> MemoryDebugService::scan_next(
     std::array<std::byte, 8> single_buffer{};
 
     std::size_t run_begin = 0U;
+    std::uint64_t progress_sequence = 0;
     while (run_begin < candidates.size()) {
         if (cancellation.stop_requested()) {
             return std::unexpected(error(domain::DebugErrorCode::cancelled, "operation cancelled"));
+        }
+        if (progress_sink) {
+            domain::ScanProgress progress;
+            progress.sequence = ++progress_sequence;
+            progress.bytes_scanned = run_begin * value_size;
+            progress.bytes_eligible = candidates.size() * value_size;
+            progress.regions_scanned = run_begin;
+            progress.regions_eligible = candidates.size();
+            progress.matches_found = survivors.size();
+            progress.matches_retained = survivors.size();
+            progress_sink(progress);
         }
 
         std::size_t run_end = run_begin + 1U;

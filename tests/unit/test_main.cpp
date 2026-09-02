@@ -1,3 +1,4 @@
+﻿#include "argos_mcp/application/analysis_job_manager.hpp"
 #include "argos_mcp/application/memory_debug_service.hpp"
 #include "argos_mcp/application/scan_session_manager.hpp"
 #include "argos_mcp/domain/process_memory.hpp"
@@ -9,6 +10,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -18,6 +21,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <string>
@@ -2091,6 +2095,630 @@ void test_region_page_service() {
     check(!inverted_size.has_value(), "regions_page rejects max_size below min_size");
 }
 
+// ---------------------------------------------------------------------------
+// Spec 0008 -- AnalysisJobManager.
+//
+// ReadGate/GatedFakeSession let a test deterministically prove a worker
+// thread is blocked inside native I/O (via wait_until_blocked_at_least) and
+// then release it in controlled steps, without ever sleeping for a fixed
+// duration. This is the fixture the spec's test plan calls for: proof that
+// start returns before I/O completes and that status/cancel remain
+// responsive while a reader is blocked.
+// ---------------------------------------------------------------------------
+
+struct ReadGate {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::size_t permits{0U};
+    std::size_t blocked{0U};
+    bool open{false};
+
+    void wait_turn() {
+        std::unique_lock lock(mutex);
+        if (open) return;
+        ++blocked;
+        cv.notify_all();
+        cv.wait(lock, [&] { return open || permits > 0U; });
+        --blocked;
+        if (!open) --permits;
+    }
+
+    void wait_until_blocked_at_least(const std::size_t n) {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return blocked >= n; });
+    }
+
+    void grant(const std::size_t n) {
+        std::scoped_lock lock(mutex);
+        permits += n;
+        cv.notify_all();
+    }
+
+    void open_gate() {
+        std::scoped_lock lock(mutex);
+        open = true;
+        cv.notify_all();
+    }
+};
+
+class GatedFakeSession final : public argos::domain::ProcessSession {
+public:
+    GatedFakeSession(std::shared_ptr<std::vector<std::byte>> memory, std::shared_ptr<ReadGate> gate)
+        : memory_(std::move(memory)), gate_(std::move(gate)) {}
+
+    [[nodiscard]] argos::domain::ProcessId pid() const noexcept override { return 42U; }
+    [[nodiscard]] std::string_view process_name() const noexcept override { return "fake-gated-target"; }
+    [[nodiscard]] argos::domain::AccessMode access_mode() const noexcept override {
+        return argos::domain::AccessMode::read_only;
+    }
+
+    [[nodiscard]] argos::domain::Result<std::size_t> read(
+        const argos::domain::Address address,
+        const std::span<std::byte> output
+    ) const override {
+        gate_->wait_turn();
+        constexpr argos::domain::Address base = 0x1000U;
+        if (address < base) {
+            return std::unexpected(argos::domain::DebugError{
+                argos::domain::DebugErrorCode::io_error, "address below fake region"
+            });
+        }
+        const auto offset = static_cast<std::size_t>(address - base);
+        if (offset > memory_->size() || output.size() > memory_->size() - offset) {
+            return std::unexpected(argos::domain::DebugError{
+                argos::domain::DebugErrorCode::io_error, "read outside fake region"
+            });
+        }
+        std::copy_n(memory_->begin() + static_cast<std::ptrdiff_t>(offset), output.size(), output.begin());
+        return output.size();
+    }
+
+    [[nodiscard]] argos::domain::Result<std::size_t> write(
+        argos::domain::Address,
+        std::span<const std::byte>
+    ) override {
+        return std::unexpected(argos::domain::DebugError{
+            argos::domain::DebugErrorCode::access_denied, "gated fake session is read-only"
+        });
+    }
+
+    [[nodiscard]] argos::domain::Result<std::vector<argos::domain::MemoryRegion>> regions() const override {
+        return std::vector<argos::domain::MemoryRegion>{argos::domain::MemoryRegion{
+            0x1000U, 0x1000U + memory_->size(), true, false, false, true, "gated"
+        }};
+    }
+
+    [[nodiscard]] argos::domain::Result<std::vector<argos::domain::ModuleInfo>> modules() const override {
+        return std::vector<argos::domain::ModuleInfo>{};
+    }
+
+private:
+    std::shared_ptr<std::vector<std::byte>> memory_;
+    std::shared_ptr<ReadGate> gate_;
+};
+
+// Bounded, sleep-free spin: the condition below is guaranteed to become true
+// quickly once a test opens/grants its gate, since nothing else throttles the
+// worker at that point. This is polling a real condition to completion, not
+// waiting out a fixed duration.
+[[nodiscard]] argos::domain::AnalysisJobInfo poll_until_terminal(
+    argos::application::AnalysisJobManager& manager,
+    const argos::domain::SessionId& owner,
+    const argos::domain::AnalysisJobId& job_id,
+    bool* sequence_monotonic = nullptr
+) {
+    std::optional<argos::domain::AnalysisJobInfo> status;
+    std::uint64_t last_sequence = 0U;
+    bool first = true;
+    for (int iterations = 0; iterations < 4'000'000; ++iterations) {
+        auto polled = manager.status(owner, job_id);
+        if (!polled) break;
+        if (sequence_monotonic != nullptr) {
+            if (!first && polled->progress.sequence < last_sequence) *sequence_monotonic = false;
+            last_sequence = polled->progress.sequence;
+            first = false;
+        }
+        status = *polled;
+        if (status->state == argos::domain::AnalysisJobState::completed ||
+            status->state == argos::domain::AnalysisJobState::failed ||
+            status->state == argos::domain::AnalysisJobState::cancelled) {
+            break;
+        }
+    }
+    if (status) return *status;
+    // Never reachable in practice (status() only fails for a missing job,
+    // which none of these tests submit-then-immediately-lose); constructing
+    // a placeholder needs an id/owner since neither type default-constructs.
+    return argos::domain::AnalysisJobInfo{job_id, owner};
+}
+
+void test_analysis_job_manager_lifecycle_progress_and_pagination() {
+    using namespace argos;
+    security::SecurityPolicy policy{};
+
+    // 200 KiB of zero bytes with a 4-byte pattern at the very end: the sweep
+    // needs several 64 KiB chunks (several session->read() calls, several
+    // progress publications) to reach it.
+    auto memory = std::make_shared<std::vector<std::byte>>(200U * 1024U, std::byte{0x00});
+    const std::array<std::byte, 4> pattern{std::byte{0xDE}, std::byte{0xAD}, std::byte{0xBE}, std::byte{0xEF}};
+    std::copy(pattern.begin(), pattern.end(), memory->end() - 4);
+
+    auto gate = std::make_shared<ReadGate>();
+    gate->open_gate();  // No blocking needed for this test.
+
+    auto provider = std::make_unique<SingleSessionFakeProvider>(
+        [memory, gate]() -> std::unique_ptr<domain::ProcessSession> {
+            return std::make_unique<GatedFakeSession>(memory, gate);
+        }
+    );
+    application::MemoryDebugService service{std::move(provider), policy};
+    auto session = service.attach(42U, domain::AccessMode::read_only, true);
+    check(session.has_value(), "async lifecycle test attaches");
+    if (!session) return;
+
+    application::AnalysisJobManager manager{service, policy};
+
+    application::AnalysisJobManager::ExactScanRequest request;
+    request.pattern.assign(pattern.begin(), pattern.end());
+    request.alignment = 1U;
+    request.result_limit = 16U;
+
+    auto submitted = manager.submit(
+        session->id, domain::AsyncScanOperation::scan_exact, request,
+        application::AnalysisJobManager::ExecutionLimits{memory->size() + 4096U, 60'000U}
+    );
+    check(submitted.has_value(), "submit accepts a well-formed scan_exact job");
+    if (!submitted) return;
+    check(submitted->state == domain::AnalysisJobState::queued, "job starts queued");
+    check(!submitted->cancel_requested, "cancel_requested starts false");
+    check(submitted->operation == domain::AsyncScanOperation::scan_exact, "job records its operation");
+
+    bool sequence_monotonic = true;
+    const auto status = poll_until_terminal(manager, session->id, submitted->id, &sequence_monotonic);
+    check(sequence_monotonic, "ScanProgress::sequence never decreases across polls");
+    check(status.state == domain::AnalysisJobState::completed, "job reaches completed");
+    check(status.results_available, "results_available once terminal");
+    if (status.termination) {
+        check(status.termination->reason == domain::AnalysisStopReason::range_exhausted,
+              "a full untruncated sweep terminates as range_exhausted");
+        check(status.termination->coverage_complete && status.termination->results_complete,
+              "full sweep reports complete coverage and results");
+        check(!status.termination->truncated, "full sweep is not truncated");
+        check(!status.termination->resume_token.has_value(),
+              "no resume_token is issued in this version (deferred extension point)");
+    } else {
+        check(false, "terminal job carries a termination block");
+    }
+
+    auto page = manager.results(session->id, submitted->id, 0U, 1U);
+    check(page.has_value() && page->address_matches.size() == 1U, "results page respects the requested limit");
+    if (page) {
+        check(page->total == 1U, "exactly one match for the fixture pattern");
+        check(!page->has_more, "single match with limit>=total reports no further pages");
+    }
+
+    auto other_owner = domain::SessionId::create("someone-else-session");
+    check(other_owner.has_value(), "fixture session id is well-formed");
+    if (other_owner) {
+        auto wrong_owner = manager.results(*other_owner, submitted->id, 0U, 10U);
+        check(!wrong_owner.has_value() && wrong_owner.error().code == domain::DebugErrorCode::not_found,
+              "results() from a different owner is not_found, never leaking that the job exists");
+    }
+
+    auto release_ok = manager.release(session->id, submitted->id);
+    check(release_ok.has_value(), "release succeeds on a terminal job");
+    auto after_release = manager.status(session->id, submitted->id);
+    check(!after_release.has_value() && after_release.error().code == domain::DebugErrorCode::not_found,
+          "job is not_found after release");
+}
+
+void test_analysis_job_manager_cancel_running_job() {
+    using namespace argos;
+    security::SecurityPolicy policy{};
+    auto memory = std::make_shared<std::vector<std::byte>>(200U * 1024U, std::byte{0x41});
+    auto gate = std::make_shared<ReadGate>();  // starts closed: the first read blocks.
+
+    auto provider = std::make_unique<SingleSessionFakeProvider>(
+        [memory, gate]() -> std::unique_ptr<domain::ProcessSession> {
+            return std::make_unique<GatedFakeSession>(memory, gate);
+        }
+    );
+    application::MemoryDebugService service{std::move(provider), policy};
+    auto session = service.attach(42U, domain::AccessMode::read_only, true);
+    check(session.has_value(), "cancel-running test attaches");
+    if (!session) return;
+
+    application::AnalysisJobManager manager{service, policy};
+    application::AnalysisJobManager::StringScanRequest request;
+    request.min_length = 4U;
+    request.encoding = "ascii";
+    request.result_limit = 16U;
+
+    auto submitted = manager.submit(
+        session->id, domain::AsyncScanOperation::strings, request,
+        application::AnalysisJobManager::ExecutionLimits{memory->size() + 4096U, 60'000U}
+    );
+    check(submitted.has_value(), "submit accepts a strings job");
+    if (!submitted) return;
+
+    // Deterministic sync point: proves the worker reached native I/O.
+    gate->wait_until_blocked_at_least(1U);
+
+    auto status_while_blocked = manager.status(session->id, submitted->id);
+    check(status_while_blocked.has_value() && status_while_blocked->state == domain::AnalysisJobState::running,
+          "status() is responsive and reports running while the worker is blocked in I/O");
+
+    auto cancelled = manager.cancel(session->id, submitted->id);
+    check(cancelled.has_value() && cancelled->cancel_requested,
+          "job_cancel is responsive while the worker is blocked in I/O");
+    check(cancelled.has_value() && cancelled->state == domain::AnalysisJobState::running,
+          "cancel_requested precedes the terminal state, it does not jump to it");
+
+    gate->open_gate();  // Let the worker observe the stop request cooperatively.
+    const auto final_status = poll_until_terminal(manager, session->id, submitted->id);
+    check(final_status.state == domain::AnalysisJobState::cancelled, "job reaches cancelled");
+    if (final_status.termination) {
+        check(final_status.termination->reason == domain::AnalysisStopReason::client_cancelled,
+              "stop_reason is client_cancelled");
+        check(!final_status.termination->coverage_complete && !final_status.termination->results_complete,
+              "a cancelled job never reports complete coverage or results");
+    }
+
+    auto second_cancel = manager.cancel(session->id, submitted->id);
+    check(second_cancel.has_value() && second_cancel->state == domain::AnalysisJobState::cancelled,
+          "cancelling an already-terminal job is idempotent");
+
+    auto release_ok = manager.release(session->id, submitted->id);
+    check(release_ok.has_value(), "release succeeds once the cancelled job is terminal");
+}
+
+void test_analysis_job_manager_queued_cancel_and_backpressure() {
+    using namespace argos;
+    security::SecurityPolicy policy{};
+    policy.max_async_jobs_per_session = 2U;
+    policy.max_async_queue_depth = 5U;
+    policy.max_async_workers = 1U;
+
+    auto memory = std::make_shared<std::vector<std::byte>>(64U * 1024U, std::byte{0x00});
+    auto gate = std::make_shared<ReadGate>();  // starts closed
+
+    auto provider = std::make_unique<SingleSessionFakeProvider>(
+        [memory, gate]() -> std::unique_ptr<domain::ProcessSession> {
+            return std::make_unique<GatedFakeSession>(memory, gate);
+        }
+    );
+    application::MemoryDebugService service{std::move(provider), policy};
+    auto session = service.attach(42U, domain::AccessMode::read_only, true);
+    check(session.has_value(), "backpressure test attaches");
+    if (!session) return;
+
+    application::AnalysisJobManager manager{service, policy};
+    application::AnalysisJobManager::ExactScanRequest request;
+    request.pattern = {std::byte{0xAA}};
+    request.result_limit = 16U;
+    const application::AnalysisJobManager::ExecutionLimits limits{memory->size(), 60'000U};
+
+    auto job1 = manager.submit(session->id, domain::AsyncScanOperation::scan_exact, request, limits);
+    check(job1.has_value(), "first job for the session is accepted");
+    if (!job1) return;
+    gate->wait_until_blocked_at_least(1U);  // job1 is now provably running.
+
+    auto job1_again_check = manager.status(session->id, job1->id);
+    check(job1_again_check.has_value() && job1_again_check->state == domain::AnalysisJobState::running,
+          "job1 is running while holding the session's one-running-job slot");
+
+    // job2 targets the same session: it must queue behind job1, never run
+    // concurrently with it (Spec 0008: at most one running job per session).
+    auto job2 = manager.submit(session->id, domain::AsyncScanOperation::scan_exact, request, limits);
+    check(job2.has_value() && job2->state == domain::AnalysisJobState::queued,
+          "a second job for a session that already has one running stays queued");
+
+    // The session is now at its per-session job cap (2): a third submission
+    // must be rejected before any buffer is allocated or any I/O happens.
+    auto job3 = manager.submit(session->id, domain::AsyncScanOperation::scan_exact, request, limits);
+    check(!job3.has_value() &&
+              job3.error().code == domain::DebugErrorCode::limit_exceeded &&
+              job3.error().reason == "job_queue_full",
+          "a session at its job quota is rejected with limit_exceeded/job_queue_full");
+
+    // Cancelling a queued job is immediate: it never touches the target.
+    auto cancel_queued = manager.cancel(session->id, job2->id);
+    check(cancel_queued.has_value() && cancel_queued->state == domain::AnalysisJobState::cancelled,
+          "cancelling a queued job completes immediately");
+    if (cancel_queued && cancel_queued->termination) {
+        check(cancel_queued->termination->reason == domain::AnalysisStopReason::client_cancelled,
+              "a queued cancel reports client_cancelled");
+    }
+    auto release_queued = manager.release(session->id, job2->id);
+    check(release_queued.has_value(), "a queued-then-cancelled job can be released immediately");
+
+    // A running/queued job cannot be released or read before it is terminal.
+    auto early_results = manager.results(session->id, job1->id, 0U, 10U);
+    check(!early_results.has_value() &&
+              early_results.error().code == domain::DebugErrorCode::invalid_state &&
+              early_results.error().reason == "job_not_terminal",
+          "job_results on a running job is invalid_state/job_not_terminal");
+    auto early_release = manager.release(session->id, job1->id);
+    check(!early_release.has_value() && early_release.error().code == domain::DebugErrorCode::invalid_state,
+          "release on a running job is rejected");
+
+    gate->open_gate();
+    const auto final_status = poll_until_terminal(manager, session->id, job1->id);
+    check(final_status.state == domain::AnalysisJobState::completed, "job1 eventually completes");
+    (void)manager.release(session->id, job1->id);
+}
+
+void test_analysis_job_manager_ttl_and_tombstone() {
+    using namespace argos;
+    security::SecurityPolicy policy{};
+    policy.async_results_ttl_ms = 100U;
+    policy.async_tombstone_ttl_ms = 50U;
+
+    auto memory = std::make_shared<std::vector<std::byte>>(4U * 1024U, std::byte{0xAA});
+    auto gate = std::make_shared<ReadGate>();
+    gate->open_gate();
+
+    auto provider = std::make_unique<SingleSessionFakeProvider>(
+        [memory, gate]() -> std::unique_ptr<domain::ProcessSession> {
+            return std::make_unique<GatedFakeSession>(memory, gate);
+        }
+    );
+    application::MemoryDebugService service{std::move(provider), policy};
+    auto session = service.attach(42U, domain::AccessMode::read_only, true);
+    check(session.has_value(), "TTL test attaches");
+    if (!session) return;
+
+    // Fake, test-controlled clock: no test in this suite sleeps for a fixed
+    // duration to cross a TTL boundary. Time only moves when the test moves
+    // it explicitly.
+    auto fake_now_ms = std::make_shared<std::atomic<std::int64_t>>(0);
+    application::AnalysisJobManager::ClockFn clock = [fake_now_ms]() {
+        return application::AnalysisJobManager::Clock::time_point{} +
+            std::chrono::milliseconds(fake_now_ms->load());
+    };
+    application::AnalysisJobManager manager{service, policy, clock};
+
+    application::AnalysisJobManager::ExactScanRequest request;
+    request.pattern = {std::byte{0xAA}};
+    request.result_limit = 4U;
+    auto submitted = manager.submit(
+        session->id, domain::AsyncScanOperation::scan_exact, request,
+        application::AnalysisJobManager::ExecutionLimits{memory->size() + 4096U, 60'000U}
+    );
+    check(submitted.has_value(), "TTL test job is accepted");
+    if (!submitted) return;
+    const auto status = poll_until_terminal(manager, session->id, submitted->id);
+    check(status.state == domain::AnalysisJobState::completed, "TTL test job completes");
+
+    auto fresh_results = manager.results(session->id, submitted->id, 0U, 10U);
+    check(fresh_results.has_value(), "results are available immediately after completion");
+
+    fake_now_ms->store(150);  // past async_results_ttl_ms (100)
+    auto expired_status = manager.status(session->id, submitted->id);
+    check(expired_status.has_value() && expired_status->results_expired && !expired_status->results_available,
+          "status() reports results_expired once past the results TTL");
+    auto expired_results = manager.results(session->id, submitted->id, 0U, 10U);
+    check(!expired_results.has_value() &&
+              expired_results.error().code == domain::DebugErrorCode::invalid_state &&
+              expired_results.error().reason == "results_expired",
+          "job_results answers invalid_state/results_expired once results have expired");
+
+    // Past results_ttl_ms + tombstone_ttl_ms (150): reaping is an
+    // opportunistic side effect of the *next* status() call, not of the
+    // clock alone -- the first call at this instant still finds (and then
+    // reaps) the tombstone, so it observes it one final time before it goes.
+    fake_now_ms->store(300);
+    auto last_look_at_tombstone = manager.status(session->id, submitted->id);
+    check(last_look_at_tombstone.has_value(), "a tombstone is still observable exactly at its expiry instant");
+    auto after_tombstone_reaped = manager.status(session->id, submitted->id);
+    check(!after_tombstone_reaped.has_value() && after_tombstone_reaped.error().code == domain::DebugErrorCode::not_found,
+          "the tombstone is reaped after its own TTL and later polls see not_found");
+}
+
+void test_analysis_job_manager_detach_session() {
+    using namespace argos;
+    security::SecurityPolicy policy{};
+    auto memory = std::make_shared<std::vector<std::byte>>(64U * 1024U, std::byte{0x00});
+    auto gate = std::make_shared<ReadGate>();  // starts closed
+
+    auto provider = std::make_unique<SingleSessionFakeProvider>(
+        [memory, gate]() -> std::unique_ptr<domain::ProcessSession> {
+            return std::make_unique<GatedFakeSession>(memory, gate);
+        }
+    );
+    application::MemoryDebugService service{std::move(provider), policy};
+    auto session = service.attach(42U, domain::AccessMode::read_only, true);
+    check(session.has_value(), "detach test attaches");
+    if (!session) return;
+
+    application::AnalysisJobManager manager{service, policy};
+    application::AnalysisJobManager::ExactScanRequest request;
+    request.pattern = {std::byte{0xAA}};
+    request.result_limit = 4U;
+    const application::AnalysisJobManager::ExecutionLimits limits{memory->size(), 60'000U};
+
+    auto job1 = manager.submit(session->id, domain::AsyncScanOperation::scan_exact, request, limits);
+    check(job1.has_value(), "detach test job1 accepted");
+    if (!job1) return;
+    gate->wait_until_blocked_at_least(1U);  // job1 is running.
+
+    auto job2 = manager.submit(session->id, domain::AsyncScanOperation::scan_exact, request, limits);
+    check(job2.has_value() && job2->state == domain::AnalysisJobState::queued, "job2 stays queued behind job1");
+
+    // Open the gate first: detach_session() blocks the calling thread until
+    // the worker actually releases the session, so the worker must be free
+    // to observe the stop request and unwind on its own thread.
+    gate->open_gate();
+    manager.detach_session(session->id);
+
+    auto status1 = manager.status(session->id, job1->id);
+    check(!status1.has_value() && status1.error().code == domain::DebugErrorCode::not_found,
+          "job1 is gone after detach_session");
+    auto status2 = manager.status(session->id, job2->id);
+    check(!status2.has_value() && status2.error().code == domain::DebugErrorCode::not_found,
+          "the queued job2 is also gone after detach_session");
+    // detach_session() clears the owner's closing marker once fully drained
+    // (it is a one-shot drain barrier, not a permanent tombstone of the
+    // owner id): a *new* submit for the same id is accepted by the manager
+    // in isolation. In production this is moot -- MemoryDebugService::detach
+    // has already removed the session from SessionManager by this point, so
+    // a real scan_start for it fails earlier with not_found regardless; see
+    // test_memory_debug_service_rejects_sync_scan_while_job_running for the
+    // wired end-to-end path.
+}
+
+void test_memory_debug_service_rejects_sync_scan_while_job_running() {
+    using namespace argos;
+    security::SecurityPolicy policy{};
+    auto memory = std::make_shared<std::vector<std::byte>>(64U * 1024U, std::byte{0x00});
+    auto gate = std::make_shared<ReadGate>();  // starts closed
+
+    auto provider = std::make_unique<SingleSessionFakeProvider>(
+        [memory, gate]() -> std::unique_ptr<domain::ProcessSession> {
+            return std::make_unique<GatedFakeSession>(memory, gate);
+        }
+    );
+    application::MemoryDebugService service{std::move(provider), policy};
+    auto session = service.attach(42U, domain::AccessMode::read_only, true);
+    check(session.has_value(), "mutual-exclusion test attaches");
+    if (!session) return;
+
+    // This is service.async_jobs(): the *same* manager instance
+    // MemoryDebugService's own scan_* methods consult, unlike the
+    // standalone managers the other tests construct.
+    auto& jobs = service.async_jobs();
+    application::AnalysisJobManager::ExactScanRequest request;
+    request.pattern = {std::byte{0xAA}};
+    request.result_limit = 4U;
+    auto submitted = jobs.submit(
+        session->id, domain::AsyncScanOperation::scan_exact, request,
+        application::AnalysisJobManager::ExecutionLimits{memory->size() + 4096U, 60'000U}
+    );
+    check(submitted.has_value(), "wired async job is accepted");
+    if (!submitted) return;
+    gate->wait_until_blocked_at_least(1U);
+
+    std::array<std::byte, 1> sync_pattern{std::byte{0xAA}};
+    auto sync_attempt = service.scan_exact(session->id, sync_pattern, 1U, 4096U, 16U, false);
+    check(!sync_attempt.has_value() &&
+              sync_attempt.error().code == domain::DebugErrorCode::invalid_state &&
+              sync_attempt.error().reason == "analysis_job_active",
+          "a synchronous scan_exact call is rejected while an async job owns the session's scan slot "
+          "(and the async worker calling the very same engine is not rejected by its own guard)");
+
+    gate->open_gate();
+    (void)poll_until_terminal(jobs, session->id, submitted->id);
+    (void)jobs.release(session->id, submitted->id);
+
+    // Once the job is gone, the sync path is available again.
+    auto sync_after = service.scan_exact(session->id, sync_pattern, 1U, 4096U, 16U, false);
+    check(sync_after.has_value(), "the sync scan path recovers once no job is running for the session");
+}
+
+void test_analysis_job_manager_retained_bytes_budget() {
+    using namespace argos;
+    security::SecurityPolicy policy{};
+    // Only enough room, globally, for 6 ScanMatch entries. One job's worth
+    // (4 matches) fits; a second identical job cannot fit its own 4 on top,
+    // proving the cap is a single aggregate summed across every retained
+    // job, not a per-job allowance -- ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES
+    // was declared and clamped by SecurityPolicy but never enforced before
+    // this test (it would pass trivially either way otherwise).
+    policy.max_async_results_retained_bytes = 6U * sizeof(domain::ScanMatch);
+
+    // 4 KiB of zero bytes with the same 4-byte pattern planted at 4
+    // non-overlapping, 4-byte-aligned offsets: scan_exact (alignment 4)
+    // finds exactly 4 matches -- an untruncated, range_exhausted sweep from
+    // the scan engine's own point of view, so any truncation observed below
+    // comes only from the new retained-bytes accounting.
+    auto memory = std::make_shared<std::vector<std::byte>>(4U * 1024U, std::byte{0x00});
+    const std::array<std::byte, 4> pattern{std::byte{0xDE}, std::byte{0xAD}, std::byte{0xBE}, std::byte{0xEF}};
+    const std::array<std::size_t, 4> offsets{0U, 1024U, 2048U, 3072U};
+    for (const auto offset : offsets) {
+        std::copy(pattern.begin(), pattern.end(), memory->begin() + static_cast<std::ptrdiff_t>(offset));
+    }
+
+    auto gate = std::make_shared<ReadGate>();
+    gate->open_gate();  // No blocking needed for this test.
+
+    auto provider = std::make_unique<SingleSessionFakeProvider>(
+        [memory, gate]() -> std::unique_ptr<domain::ProcessSession> {
+            return std::make_unique<GatedFakeSession>(memory, gate);
+        }
+    );
+    application::MemoryDebugService service{std::move(provider), policy};
+    auto session = service.attach(42U, domain::AccessMode::read_only, true);
+    check(session.has_value(), "retained-bytes test attaches");
+    if (!session) return;
+
+    application::AnalysisJobManager manager{service, policy};
+
+    application::AnalysisJobManager::ExactScanRequest request;
+    request.pattern.assign(pattern.begin(), pattern.end());
+    request.alignment = 4U;
+    request.result_limit = 16U;
+    const application::AnalysisJobManager::ExecutionLimits limits{memory->size() + 4096U, 60'000U};
+
+    // job1: budget has room for all 4 matches (4 * sizeof <= 6 * sizeof).
+    auto job1 = manager.submit(session->id, domain::AsyncScanOperation::scan_exact, request, limits);
+    check(job1.has_value(), "job1 is accepted");
+    if (!job1) return;
+    const auto status1 = poll_until_terminal(manager, session->id, job1->id);
+    check(status1.state == domain::AnalysisJobState::completed, "job1 completes");
+    if (status1.termination) {
+        check(!status1.termination->truncated, "job1 fits the retained-bytes budget untruncated");
+        check(status1.termination->coverage_complete && status1.termination->results_complete,
+              "job1's scan and retention both report complete");
+    }
+    auto page1 = manager.results(session->id, job1->id, 0U, 10U);
+    check(page1.has_value() && page1->total == 4U, "job1 retains all 4 matches it found");
+
+    // job2: identical request, but only 2 * sizeof(ScanMatch) of budget
+    // remains globally (6 already spent, 4 held by job1). This is only
+    // possible to observe if the cap is a global aggregate, not per job --
+    // with a per-job cap job2 would fit exactly like job1 did.
+    auto job2 = manager.submit(session->id, domain::AsyncScanOperation::scan_exact, request, limits);
+    check(job2.has_value(), "job2 is accepted");
+    if (!job2) return;
+    const auto status2 = poll_until_terminal(manager, session->id, job2->id);
+    check(status2.state == domain::AnalysisJobState::completed,
+          "job2's scan completes even though retention is short on room");
+    if (status2.termination) {
+        check(status2.termination->coverage_complete,
+              "job2 still swept every eligible byte -- scan coverage is independent of result retention");
+        check(!status2.termination->results_complete,
+              "job2 could not retain every match it found, so results_complete is false");
+        check(status2.termination->truncated, "job2's termination is marked truncated, never silently dropped");
+        const auto& reasons = status2.termination->truncation_reasons;
+        check(std::ranges::find(reasons, domain::AnalysisTruncationReason::retained_bytes_budget) != reasons.end(),
+              "retained_bytes_budget names the global retained-bytes cap as the truncation cause");
+    }
+    auto page2 = manager.results(session->id, job2->id, 0U, 10U);
+    check(page2.has_value() && page2->total == 2U,
+          "job2 keeps only as many matches as the remaining global budget allows (2 of the 4 it found)");
+
+    // Releasing job1 gives its 4 * sizeof(ScanMatch) share back to the
+    // global budget. A third, identical job should now fit fully again --
+    // proving release() (not just TTL expiry) frees the aggregate correctly.
+    auto release1 = manager.release(session->id, job1->id);
+    check(release1.has_value(), "job1 releases cleanly");
+
+    auto job3 = manager.submit(session->id, domain::AsyncScanOperation::scan_exact, request, limits);
+    check(job3.has_value(), "job3 is accepted");
+    if (!job3) return;
+    const auto status3 = poll_until_terminal(manager, session->id, job3->id);
+    check(status3.state == domain::AnalysisJobState::completed, "job3 completes");
+    if (status3.termination) {
+        check(!status3.termination->truncated,
+              "job3 fits fully once releasing job1 restored the global retained-bytes budget");
+    }
+    auto page3 = manager.results(session->id, job3->id, 0U, 10U);
+    check(page3.has_value() && page3->total == 4U, "job3 retains all 4 matches after budget was freed by release");
+
+    (void)manager.release(session->id, job2->id);
+    (void)manager.release(session->id, job3->id);
+}
+
 int main() {
     test_json();
     test_policy();
@@ -2112,6 +2740,13 @@ int main() {
     test_region_queries();
     test_scan_coverage();
     test_region_page_service();
+    test_analysis_job_manager_lifecycle_progress_and_pagination();
+    test_analysis_job_manager_cancel_running_job();
+    test_analysis_job_manager_queued_cancel_and_backpressure();
+    test_analysis_job_manager_ttl_and_tombstone();
+    test_analysis_job_manager_detach_session();
+    test_analysis_job_manager_retained_bytes_budget();
+    test_memory_debug_service_rejects_sync_scan_while_job_running();
     if (failures == 0) {
         std::cout << "All unit tests passed\n";
         return 0;

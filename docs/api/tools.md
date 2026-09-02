@@ -221,6 +221,84 @@ Scan sessions morrem junto com o `detach` da sessão de depuração dona. Limite
 {"name": "memory_debug.scan_reset", "arguments": {"scan_id": "..."}}
 ```
 
+## Jobs assíncronos de scan (Spec 0008)
+
+`memory_debug.scan_start` inicia `scan_exact`, `strings`, `scan_pointers_to`, `scan_pointer_chains`, `scan_first` ou `scan_next` como um job em background que continua depois que a chamada MCP retorna. `memory_debug.job_status`, `memory_debug.job_results`, `memory_debug.job_cancel` e `memory_debug.job_release` são genéricas e servem qualquer job. Elas reusam o mesmo motor de scan e os mesmos limites das tools síncronas de mesmo nome — os resultados nunca divergem entre os dois caminhos. No máximo um scan longo (síncrono ou assíncrono) roda por sessão de depuração por vez; uma segunda tentativa síncrona enquanto um job está `running` recebe `invalid_state`/`analysis_job_active`.
+
+1. `memory_debug.scan_start` valida `operation` e converte `request` no mesmo tipo C++ usado pela tool síncrona correspondente antes de qualquer I/O; `execution.byte_budget`/`execution.deadline_ms` só podem reduzir os limites do servidor, nunca ampliá-los. Responde imediatamente com o job em `queued` (ou já `running`/`completed` para alvos pequenos).
+2. `memory_debug.job_status` faz polling do estado, do progresso monotônico (`sequence`, bytes/regiões varridas, matches) e, uma vez terminal, do bloco `termination` com `stop_reason`, `coverage_complete`, `results_complete` e `truncated`.
+3. `memory_debug.job_results` pagina o resultado imutável (`offset`/`limit`) uma vez que o job seja terminal; antes disso responde `invalid_state`/`job_not_terminal`, e depois do TTL de retenção responde `invalid_state`/`results_expired`.
+4. `memory_debug.job_cancel` pede parada cooperativa; em `queued` o job termina imediatamente, em `running` fica `cancel_requested: true` até o próximo checkpoint. Chamar de novo após terminal é idempotente.
+5. `memory_debug.job_release` remove um job terminal e seus resultados retidos; `queued`/`running` respondem `invalid_state`/`job_not_terminal` — cancele primeiro.
+
+`ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES` limita, de forma agregada sobre todos os jobs retidos ao mesmo tempo (não por job), quantos bytes de resultado o servidor mantém em memória. Um job pode terminar com o scan totalmente coberto (`coverage_complete: true`) e ainda assim não conseguir reter todos os matches encontrados porque outros jobs já ocupam a maior parte do orçamento agregado; nesse caso o servidor mantém o maior prefixo de resultados que couber e sinaliza a perda como qualquer outra truncagem: `truncated: true`, `results_complete: false` e `"retained_bytes_budget"` em `truncation_reasons`. `job_release`, a expiração do TTL de resultados e `detach_session` devolvem os bytes liberados ao orçamento agregado, disponíveis para os próximos jobs.
+
+```json
+{
+  "name": "memory_debug.scan_start",
+  "arguments": {
+    "session_id": "...",
+    "operation": "scan_exact",
+    "request": {"pattern_hex": "d4087105", "writable_only": true, "result_limit": 4096},
+    "execution": {"byte_budget": 4294967296, "deadline_ms": 300000}
+  }
+}
+```
+
+```json
+{"ok": true, "data": {"job_id": "...", "job_kind": "scan", "operation": "scan_exact", "state": "queued", "cancel_requested": false, "progress": {"sequence": 0, "bytes_scanned": 0, "bytes_eligible": 0, "bytes_skipped": 0, "regions_scanned": 0, "regions_eligible": 0, "regions_skipped": 0, "matches_found": 0, "matches_retained": 0, "coverage_ratio": 1.0}, "results_available": false, "results_expired": false, "termination": null}}
+```
+
+```json
+{"name": "memory_debug.job_status", "arguments": {"session_id": "...", "job_id": "..."}}
+{"name": "memory_debug.job_results", "arguments": {"session_id": "...", "job_id": "...", "offset": 0, "limit": 100}}
+{"name": "memory_debug.job_cancel", "arguments": {"session_id": "...", "job_id": "..."}}
+{"name": "memory_debug.job_release", "arguments": {"session_id": "...", "job_id": "..."}}
+```
+
+Um `job_status` terminal e truncado:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "job_id": "...", "job_kind": "scan", "operation": "scan_exact", "state": "completed", "cancel_requested": false,
+    "progress": {"sequence": 104, "bytes_scanned": 2147483648, "bytes_eligible": 3484033024, "bytes_skipped": 0,
+      "regions_scanned": 11021, "regions_eligible": 18292, "regions_skipped": 0, "matches_found": 4096,
+      "matches_retained": 4096, "coverage_ratio": 0.6164},
+    "results_available": true, "results_expired": false,
+    "termination": {"stop_reason": "result_limit", "coverage_complete": false, "results_complete": false,
+      "complete": false, "truncated": true, "truncation_reasons": ["result_limit"], "read_error_count": 0,
+      "next_start_address": "0x1FE49001234", "resume_token": null}
+  }
+}
+```
+
+`job_results` para o mesmo job (o payload de `items` é discriminado por `operation` e usa o mesmo shape da tool síncrona correspondente):
+
+```json
+{
+  "ok": true,
+  "data": {
+    "job_id": "...", "job_kind": "scan", "operation": "scan_exact",
+    "items": [{"address": "0x1FE44726C90"}],
+    "page": {"offset": 0, "returned": 1, "total": 4096, "has_more": true},
+    "termination": {"stop_reason": "result_limit", "coverage_complete": false, "results_complete": false,
+      "complete": false, "truncated": true, "truncation_reasons": ["result_limit"], "read_error_count": 0,
+      "next_start_address": "0x1FE49001234", "resume_token": null}
+  }
+}
+```
+
+`scan_first`/`scan_next` acrescentam `scan_id`, `generation`, `candidate_count` e `draft_retained_for_resume` a `job_results`; `scan_id` só vem preenchido quando o job terminou com `range_exhausted` e cobertura/resultados completos — em qualquer resultado parcial ou cancelado, os três campos vêm `null` e `draft_retained_for_resume: false` (nesta versão, resumo de `scan_first`/`scan_next` não é suportado — o draft é descartado, não retido).
+
+**`resume_token` não é emitido nesta versão.** `next_start_address` é diagnóstico best-effort (disponível para `scan_exact`/`scan_pointers_to` truncados por `byte_budget`/`result_limit`) e nunca deve ser usado como cursor de continuação — não há garantia de não perder nem duplicar matches na fronteira. A forma `resume_token`-only de `scan_start` é aceita pelo schema e sempre responde `unsupported`/`resume_not_supported`:
+
+```json
+{"name": "memory_debug.scan_start", "arguments": {"session_id": "...", "resume_token": "...", "execution": {"deadline_ms": 300000}}}
+{"ok": false, "error": {"code": "unsupported", "message": "resume_token continuation is not implemented in this version", "reason": "resume_not_supported"}}
+```
+
 ## PDB — enumeração de tipos
 
 `memory_debug.pdb_list_types` lista os tipos (`class`/`struct`/`enum`/`union`) presentes no PDB de um módulo já carregado na sessão, para descobrir nomes antes de chamar `memory_debug.pdb_type`. Aceita `name_filter` (substring, case-insensitive) e `kind_filter` opcionais, além de `max_symbols`. Mesma regra de proveniência de `pdb_type`: `confidence: high` só quando o PDB corresponde ao binário carregado; nenhum caminho de PDB arbitrário é aceito do cliente.
@@ -436,3 +514,11 @@ está implementada: cobertura em `scan_first` (A3), filtro e paginação em
 `memory_debug.regions` (B1), `memory_debug.address_space_summary` (B2) e valor
 em decimal (F1). São extensões de contrato dentro de ADR-0009; não houve
 mudança na superfície de autorização nem novo gate de ambiente.
+
+Os itens A1/A2 do mesmo roadmap foram especificados em
+[`docs/specs/0008-async-scan-operations.md`](../specs/0008-async-scan-operations.md)
+(ADR [0012](../adr/0012-async-scan-progress-resumption.md)) e estão
+implementados como `memory_debug.scan_start`/`job_status`/`job_results`/
+`job_cancel`/`job_release` (ver "Jobs assíncronos de scan" acima), exceto a
+retomada por `resume_token`, que permanece um ponto de extensão explícito e
+documentado.

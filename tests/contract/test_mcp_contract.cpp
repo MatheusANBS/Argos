@@ -437,7 +437,13 @@ int main() {
         check(list_result.find("ttlMs") == nullptr, "legacy tools/list does not add modern cache hints");
         check(list_result.find("cacheScope") == nullptr, "legacy tools/list does not add modern cache scope");
         const auto& tools = list_result.at("tools").as_array();
-        check(tools.size() >= 25U, "tool catalog exposes the runtime debugging tools");
+        check(tools.size() >= 30U, "tool catalog exposes the runtime debugging tools");
+        bool has_scan_start = false;
+        bool has_job_status = false;
+        bool has_job_results = false;
+        bool has_job_cancel = false;
+        bool has_job_release = false;
+        bool scan_start_offers_resume_variant = false;
         bool has_pdb_type = false;
         bool has_unity_type = false;
         bool has_unreal_type = false;
@@ -495,6 +501,15 @@ int main() {
             has_scan_reset = has_scan_reset || name == "memory_debug.scan_reset";
             has_launch = has_launch || name == "memory_debug.launch";
             has_read_output = has_read_output || name == "memory_debug.read_output";
+            has_scan_start = has_scan_start || name == "memory_debug.scan_start";
+            has_job_status = has_job_status || name == "memory_debug.job_status";
+            has_job_results = has_job_results || name == "memory_debug.job_results";
+            has_job_cancel = has_job_cancel || name == "memory_debug.job_cancel";
+            has_job_release = has_job_release || name == "memory_debug.job_release";
+            if (name == "memory_debug.scan_start") {
+                const auto& one_of = tool.at("inputSchema").at("oneOf").as_array();
+                scan_start_offers_resume_variant = one_of.size() == 2U;
+            }
         }
         check(has_pdb_type, "tool catalog exposes PDB type metadata");
         check(has_unity_type, "tool catalog exposes Unity metadata");
@@ -517,6 +532,12 @@ int main() {
         check(all_tools_have_output_schema, "every tool advertises its structured result schema");
         check(detach_is_destructive,
               "detach is conservatively destructive because terminate=true can stop a process");
+        check(has_scan_start, "tool catalog exposes memory_debug.scan_start (Spec 0008)");
+        check(has_job_status, "tool catalog exposes memory_debug.job_status (Spec 0008)");
+        check(has_job_results, "tool catalog exposes memory_debug.job_results (Spec 0008)");
+        check(has_job_cancel, "tool catalog exposes memory_debug.job_cancel (Spec 0008)");
+        check(has_job_release, "tool catalog exposes memory_debug.job_release (Spec 0008)");
+        check(scan_start_offers_resume_variant, "scan_start advertises both the fresh and resume_token input shapes");
     }
 
     // MCP 2026-07-28 is stateless: every request carries its protocol and
@@ -820,6 +841,126 @@ int main() {
         if (data != nullptr) {
             check(data->at("candidate_count").as_integer() == 1,
                   "the existing hexadecimal form still finds the same value");
+        }
+    }
+
+    // Spec 0008 -- async scan operations. End-to-end start -> status ->
+    // results -> cancel -> release across the JSON-RPC surface (the deep
+    // engine behavior -- progress, concurrent cancellation, backpressure,
+    // TTL -- is covered by the AnalysisJobManager unit tests).
+    if (!session_id.empty()) {
+        auto started = call_tool(server, 200, "memory_debug.scan_start", JsonValue::object({
+            {"session_id", session_id},
+            {"operation", "scan_exact"},
+            {"request", JsonValue::object({
+                {"pattern_hex", "2a000000"}, {"start_address", "0x1000"}, {"end_address", "0x1010"}
+            })},
+            {"execution", JsonValue::object({{"byte_budget", 64}, {"deadline_ms", 5000}})}
+        }));
+        const auto* start_data = successful_tool_data(started);
+        check(start_data != nullptr, "scan_start accepts a well-formed scan_exact job");
+        std::string job_id;
+        if (start_data != nullptr) {
+            check(start_data->at("job_kind").as_string() == "scan", "scan_start reports job_kind scan");
+            check(start_data->at("operation").as_string() == "scan_exact", "scan_start echoes the chosen operation");
+            const auto& state = start_data->at("state").as_string();
+            check(state == "queued" || state == "running" || state == "completed",
+                  "scan_start returns a job in a valid initial state");
+            job_id = start_data->at("job_id").as_string();
+        }
+
+        if (!job_id.empty()) {
+            argos::protocol::json::Value status_data;
+            bool reached_terminal = false;
+            for (int attempt = 0; attempt < 200'000 && !reached_terminal; ++attempt) {
+                auto status = call_tool(server, 201, "memory_debug.job_status", JsonValue::object({
+                    {"session_id", session_id}, {"job_id", job_id}
+                }));
+                const auto* data = successful_tool_data(status);
+                if (data == nullptr) break;
+                status_data = *data;
+                const auto& state = status_data.at("state").as_string();
+                reached_terminal = state == "completed" || state == "failed" || state == "cancelled";
+            }
+            check(reached_terminal, "job_status converges to a terminal state without any fixed sleep");
+            if (reached_terminal) {
+                check(status_data.at("state").as_string() == "completed",
+                      "a tiny in-budget scan_exact job completes");
+                check(status_data.at("results_available").as_bool(), "results_available once terminal");
+                const auto& termination = status_data.at("termination");
+                check(!termination.is_null(), "a terminal job always carries a termination block");
+                if (!termination.is_null()) {
+                    check(termination.at("stop_reason").as_string() == "range_exhausted",
+                          "an untruncated sweep terminates as range_exhausted");
+                    check(termination.at("coverage_complete").as_bool() && termination.at("results_complete").as_bool(),
+                          "a full sweep reports complete coverage and results");
+                    check(!termination.at("truncated").as_bool(), "a full sweep is not truncated");
+                    check(termination.at("resume_token").is_null(),
+                          "no resume_token is ever issued in this version");
+                }
+            }
+
+            auto results = call_tool(server, 202, "memory_debug.job_results", JsonValue::object({
+                {"session_id", session_id}, {"job_id", job_id}, {"offset", 0}, {"limit", 10}
+            }));
+            const auto* results_data = successful_tool_data(results);
+            check(results_data != nullptr, "job_results returns data for a terminal job");
+            if (results_data != nullptr) {
+                const auto& items = results_data->at("items").as_array();
+                check(items.size() == 1U && items.front().at("address").as_string() == "0x1004",
+                      "job_results finds the same match the fixture memory contains");
+                const auto& page = results_data->at("page");
+                check(page.at("total").as_integer() == 1 && page.at("returned").as_integer() == 1 &&
+                          !page.at("has_more").as_bool(),
+                      "job_results pagination metadata matches a single-item result");
+            }
+
+            auto wrong_job = call_tool(server, 203, "memory_debug.job_status", JsonValue::object({
+                {"session_id", session_id}, {"job_id", "does-not-exist"}
+            }));
+            check(!wrong_job.has_value() ? false : wrong_job->at("result").at("isError").as_bool(),
+                  "job_status on an unknown job_id is an error");
+
+            auto idempotent_cancel = call_tool(server, 204, "memory_debug.job_cancel", JsonValue::object({
+                {"session_id", session_id}, {"job_id", job_id}
+            }));
+            const auto* cancel_data = successful_tool_data(idempotent_cancel);
+            check(cancel_data != nullptr && cancel_data->at("state").as_string() == "completed",
+                  "cancelling an already-completed job is idempotent and reports the winning state");
+
+            auto released = call_tool(server, 205, "memory_debug.job_release", JsonValue::object({
+                {"session_id", session_id}, {"job_id", job_id}
+            }));
+            const auto* released_data = successful_tool_data(released);
+            check(released_data != nullptr && released_data->at("released").as_bool(),
+                  "job_release succeeds on a terminal job");
+
+            auto after_release = call_tool(server, 206, "memory_debug.job_status", JsonValue::object({
+                {"session_id", session_id}, {"job_id", job_id}
+            }));
+            check(after_release.has_value() && after_release->at("result").at("isError").as_bool(),
+                  "job_status after release reports the job as gone");
+        }
+
+        auto conflicting_start = call_tool(server, 207, "memory_debug.scan_start", JsonValue::object({
+            {"session_id", session_id},
+            {"operation", "scan_exact"},
+            {"resume_token", "should-not-be-combined-with-operation"},
+            {"request", JsonValue::object({{"pattern_hex", "2a"}})}
+        }));
+        check(is_invalid_arguments(conflicting_start),
+              "scan_start rejects operation and resume_token supplied together");
+
+        auto resume_attempt = call_tool(server, 208, "memory_debug.scan_start", JsonValue::object({
+            {"session_id", session_id}, {"resume_token", "deadbeefdeadbeefdeadbeefdeadbeef"}
+        }));
+        if (resume_attempt) {
+            const auto& structured = resume_attempt->at("result").at("structuredContent");
+            check(!structured.at("ok").as_bool() && structured.at("error").at("code").as_string() == "unsupported" &&
+                      structured.at("error").at("reason").as_string() == "resume_not_supported",
+                  "resume_token continuation is a well-defined unsupported extension point, not a crash or a fake success");
+        } else {
+            check(false, "scan_start with only resume_token receives a response");
         }
     }
 
