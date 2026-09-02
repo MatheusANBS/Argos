@@ -5,11 +5,32 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace argos::security {
+
+// Operator-owned mapping from a stable module fingerprint to roots for one
+// supported Unreal layout. Clients can select an enabled layout, but they
+// cannot submit or persist a build fingerprint through MCP.
+struct UnrealBuildProfile {
+    std::string build_id;
+    std::string profile_id;
+    std::string module_name;
+    std::uint64_t module_size{};
+    std::uint64_t signature_rva{};
+    std::vector<std::byte> signature;
+    std::uint64_t gu_object_array_rva{};
+    std::uint64_t fname_pool_rva{};
+};
+
+// Parses the bounded server-side format documented for
+// ARGOS_MCP_UNREAL_BUILD_PROFILES. Exposed for deterministic configuration
+// tests; it performs no process I/O.
+[[nodiscard]] std::expected<std::vector<UnrealBuildProfile>, std::string>
+parse_unreal_build_profiles(std::string_view text);
 
 struct SecurityPolicy {
     bool allow_write{false};
@@ -41,6 +62,8 @@ struct SecurityPolicy {
     bool enable_unreal_runtime{false};
     bool enable_unreal_auto_discovery{false};
     std::vector<std::string> unreal_profile_allowlist;
+    std::vector<UnrealBuildProfile> unreal_build_profiles;
+    bool unreal_build_profiles_valid{true};
     std::size_t max_unreal_contexts_per_session{2U};
     std::size_t max_unreal_contexts_total{8U};
     std::size_t max_unreal_slots_visited{1000000U};

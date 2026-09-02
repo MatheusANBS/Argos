@@ -1,22 +1,32 @@
 #include "argos_mcp/security/policy.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
+#include <optional>
+#include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 
 namespace argos::security {
 namespace {
 
-[[nodiscard]] bool env_flag(std::string_view name) {
+[[nodiscard]] std::optional<std::string_view> env_text(const std::string_view name) {
     const char* value = std::getenv(std::string{name}.c_str());
     if (value == nullptr) {
-        return false;
+        return std::nullopt;
     }
-    const std::string_view text{value};
+    return std::string_view{value};
+}
+
+[[nodiscard]] bool env_flag(std::string_view name) {
+    const auto value = env_text(name);
+    if (!value) return false;
+    const std::string_view text{*value};
     return text == "1" || text == "true" || text == "TRUE" || text == "yes" || text == "YES";
 }
 
@@ -25,12 +35,10 @@ namespace {
     std::size_t fallback,
     std::size_t hard_max
 ) {
-    const char* value = std::getenv(std::string{name}.c_str());
-    if (value == nullptr) {
-        return fallback;
-    }
+    const auto value = env_text(name);
+    if (!value) return fallback;
     std::uint64_t parsed = 0;
-    const std::string_view text{value};
+    const std::string_view text{*value};
     const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), parsed);
     if (ec != std::errc{} || ptr != text.data() + text.size() || parsed == 0U) {
         return fallback;
@@ -47,11 +55,9 @@ namespace {
 // become an entry that matches nothing -- or everything.
 [[nodiscard]] std::vector<std::string> env_string_list(std::string_view name) {
     std::vector<std::string> output;
-    const char* value = std::getenv(std::string{name}.c_str());
-    if (value == nullptr) {
-        return output;
-    }
-    const std::string_view text{value};
+    const auto value = env_text(name);
+    if (!value) return output;
+    const std::string_view text{*value};
     std::size_t start = 0;
     while (start <= text.size()) {
         const auto separator = text.find(';', start);
@@ -68,7 +74,137 @@ namespace {
     return output;
 }
 
+[[nodiscard]] std::optional<std::uint64_t> parse_u64(
+    std::string_view text,
+    const int base
+) noexcept {
+    if (base == 16 && text.starts_with("0x")) {
+        text.remove_prefix(2U);
+    }
+    if (text.empty()) {
+        return std::nullopt;
+    }
+    std::uint64_t value = 0U;
+    const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), value, base);
+    if (ec != std::errc{} || end != text.data() + text.size()) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+[[nodiscard]] std::optional<unsigned int> hex_digit(const char value) noexcept {
+    if (value >= '0' && value <= '9') return static_cast<unsigned int>(value - '0');
+    if (value >= 'a' && value <= 'f') return static_cast<unsigned int>(value - 'a' + 10);
+    if (value >= 'A' && value <= 'F') return static_cast<unsigned int>(value - 'A' + 10);
+    return std::nullopt;
+}
+
+[[nodiscard]] std::optional<std::vector<std::byte>> parse_signature(const std::string_view text) {
+    constexpr std::size_t min_signature_bytes = 8U;
+    constexpr std::size_t max_signature_bytes = 64U;
+    if (text.size() % 2U != 0U ||
+        text.size() < min_signature_bytes * 2U ||
+        text.size() > max_signature_bytes * 2U) {
+        return std::nullopt;
+    }
+    std::vector<std::byte> bytes;
+    bytes.reserve(text.size() / 2U);
+    for (std::size_t index = 0; index < text.size(); index += 2U) {
+        const auto high = hex_digit(text[index]);
+        const auto low = hex_digit(text[index + 1U]);
+        if (!high || !low) {
+            return std::nullopt;
+        }
+        bytes.push_back(static_cast<std::byte>((*high << 4U) | *low));
+    }
+    return bytes;
+}
+
+[[nodiscard]] bool safe_identifier(const std::string_view text, const std::size_t max_size) noexcept {
+    if (text.empty() || text.size() > max_size) return false;
+    return std::ranges::all_of(text, [](const char value) {
+        return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
+            (value >= '0' && value <= '9') || value == '-' || value == '_' || value == '.';
+    });
+}
+
+[[nodiscard]] bool safe_module_name(const std::string_view text) noexcept {
+    return safe_identifier(text, 260U) && !text.contains('/') && !text.contains('\\');
+}
+
 }  // namespace
+
+std::expected<std::vector<UnrealBuildProfile>, std::string>
+parse_unreal_build_profiles(const std::string_view text) {
+    constexpr std::size_t field_count = 8U;
+    constexpr std::size_t max_profiles = 64U;
+    constexpr std::size_t max_config_bytes = 32U * 1024U;
+    if (text.empty()) return std::vector<UnrealBuildProfile>{};
+    if (text.size() > max_config_bytes) {
+        return std::unexpected("build profile configuration exceeds the size limit");
+    }
+
+    std::vector<UnrealBuildProfile> profiles;
+    std::unordered_set<std::string> build_ids;
+    std::size_t record_start = 0U;
+    while (record_start <= text.size()) {
+        if (profiles.size() >= max_profiles) {
+            return std::unexpected("too many Unreal build profiles");
+        }
+        const auto separator = text.find(';', record_start);
+        const auto record_end = separator == std::string_view::npos ? text.size() : separator;
+        const auto record = text.substr(record_start, record_end - record_start);
+        if (record.empty()) {
+            return std::unexpected("Unreal build profile contains an empty record");
+        }
+
+        std::array<std::string_view, field_count> fields{};
+        std::size_t field_start = 0U;
+        for (std::size_t field = 0U; field < field_count; ++field) {
+            const auto field_separator = record.find('|', field_start);
+            if (field + 1U == field_count) {
+                if (field_separator != std::string_view::npos) {
+                    return std::unexpected("Unreal build profile has too many fields");
+                }
+                fields[field] = record.substr(field_start);
+            } else {
+                if (field_separator == std::string_view::npos) {
+                    return std::unexpected("Unreal build profile has too few fields");
+                }
+                fields[field] = record.substr(field_start, field_separator - field_start);
+                field_start = field_separator + 1U;
+            }
+        }
+
+        const auto module_size = parse_u64(fields[3], 10);
+        const auto signature_rva = parse_u64(fields[4], 16);
+        auto signature = parse_signature(fields[5]);
+        const auto object_array_rva = parse_u64(fields[6], 16);
+        const auto name_pool_rva = parse_u64(fields[7], 16);
+        if (!safe_identifier(fields[0], 128U) || !safe_identifier(fields[1], 128U) ||
+            !safe_module_name(fields[2]) || !module_size || *module_size == 0U ||
+            !signature_rva || !signature || !object_array_rva || !name_pool_rva) {
+            return std::unexpected("Unreal build profile contains an invalid field");
+        }
+        const auto signature_end = domain::checked_add(*signature_rva, signature->size());
+        if (!signature_end || *signature_end > *module_size ||
+            *object_array_rva >= *module_size || *name_pool_rva >= *module_size) {
+            return std::unexpected("Unreal build profile RVA is outside the module");
+        }
+        if (!build_ids.emplace(fields[0]).second) {
+            return std::unexpected("Unreal build profile id is duplicated");
+        }
+
+        profiles.push_back(UnrealBuildProfile{
+            std::string{fields[0]}, std::string{fields[1]}, std::string{fields[2]},
+            *module_size, *signature_rva, std::move(*signature),
+            *object_array_rva, *name_pool_rva
+        });
+        if (separator == std::string_view::npos) break;
+        record_start = separator + 1U;
+    }
+    return profiles;
+}
 
 SecurityPolicy SecurityPolicy::from_environment() {
     SecurityPolicy policy;
@@ -116,6 +252,13 @@ SecurityPolicy SecurityPolicy::from_environment() {
     policy.enable_unreal_runtime = env_flag("ARGOS_MCP_ENABLE_UNREAL_RUNTIME");
     policy.enable_unreal_auto_discovery = env_flag("ARGOS_MCP_ENABLE_UNREAL_AUTO_DISCOVERY");
     policy.unreal_profile_allowlist = env_string_list("ARGOS_MCP_UNREAL_PROFILES");
+    if (const auto configured = env_text("ARGOS_MCP_UNREAL_BUILD_PROFILES")) {
+        auto profiles = parse_unreal_build_profiles(*configured);
+        policy.unreal_build_profiles_valid = profiles.has_value();
+        if (profiles) {
+            policy.unreal_build_profiles = std::move(*profiles);
+        }
+    }
     policy.max_unreal_contexts_per_session = env_size("ARGOS_MCP_MAX_UNREAL_CONTEXTS_PER_SESSION", 2U, 16U);
     policy.max_unreal_contexts_total = env_size("ARGOS_MCP_MAX_UNREAL_CONTEXTS", 8U, 64U);
     policy.max_unreal_slots_visited = env_size("ARGOS_MCP_MAX_UNREAL_SLOTS", 1000000U, 8000000U);

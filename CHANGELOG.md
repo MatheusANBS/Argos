@@ -2,6 +2,13 @@
 
 ## Não lançado
 
+- reflexão Unreal: `mode: "profile"` agora resolve roots por perfis de build
+  configurados pelo operador e `mode: "auto"` reutiliza primeiro esses perfis,
+  permitindo que clientes e chats novos funcionem sem conservar RVAs no
+  histórico. O fingerprint combina nome, `SizeOfImage` e assinatura bounded do
+  módulo; mismatch e ambiguidade falham fechados, e todas as invariantes de
+  runtime continuam obrigatórias antes de publicar um contexto;
+
 ## 0.2.0 — 2026-08-12
 
 - build no Windows: `tools/build.ps1` importa o ambiente MSVC antes do CMake e

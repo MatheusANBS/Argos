@@ -1,6 +1,7 @@
 # ADR-0019 — Reflexão Unreal em runtime sem PDB
 
-Status: aceito e implementado (execução síncrona; jobs e descoberta automática permanecem propostos)
+Status: aceito e implementado (execução síncrona; perfis de build implementados
+pela ADR-0020; jobs e descoberta multipadrão permanecem propostos)
 
 ## Contexto
 

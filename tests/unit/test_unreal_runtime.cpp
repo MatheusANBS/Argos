@@ -5,6 +5,7 @@
 #include "argos_mcp/security/policy.hpp"
 
 #include <algorithm>
+#include <array>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -37,8 +38,14 @@ constexpr std::uint64_t module_size = 0x1000000ULL;
 constexpr Address data_start = 0x140010000ULL;
 constexpr Address object_array_root = 0x140010000ULL;
 constexpr Address name_pool_root = 0x140010100ULL;
+constexpr Address build_signature_address = 0x140010800ULL;
 constexpr std::uint64_t object_array_rva = object_array_root - module_base;
 constexpr std::uint64_t name_pool_rva = name_pool_root - module_base;
+constexpr std::uint64_t build_signature_rva = build_signature_address - module_base;
+constexpr std::array<std::byte, 8U> build_signature{
+    std::byte{0x41}, std::byte{0x52}, std::byte{0x47}, std::byte{0x4F},
+    std::byte{0x53}, std::byte{0x55}, std::byte{0x45}, std::byte{0x35}
+};
 
 constexpr Address heap_start = 0x200000000ULL;
 constexpr Address chunk_table = 0x200000000ULL;
@@ -136,6 +143,7 @@ void write_property(
     state.regions.push_back({heap_start, heap_start + 0x10000ULL, true, true, false, true, ""});
     state.map_zeroed(data_start, 0x1000U);
     state.map_zeroed(heap_start, 0x10000U);
+    state.write_bytes(build_signature_address, build_signature);
 
     NameWriter names{&state, 2U};
     const auto name_player_state = names.add("APlayerState");
@@ -207,6 +215,12 @@ void write_property(
     argos::security::SecurityPolicy policy;
     policy.enable_unreal_runtime = true;
     policy.unreal_profile_allowlist = {"ue5-fproperty-x64", "ue4-uproperty-x64"};
+    policy.unreal_build_profiles.push_back(argos::security::UnrealBuildProfile{
+        "synthetic-ue5-build", "ue5-fproperty-x64", "Game-Win64-Shipping.exe",
+        module_size, build_signature_rva,
+        std::vector<std::byte>{build_signature.begin(), build_signature.end()},
+        object_array_rva, name_pool_rva
+    });
     return policy;
 }
 
@@ -281,6 +295,78 @@ void test_auto_discovery_needs_its_own_gate() {
     check(!result.has_value(), "auto discovery stays off behind the general gate");
     check(!result && result.error().code == argos::domain::DebugErrorCode::unsupported,
           "auto discovery without its gate reports unsupported");
+}
+
+void test_registered_build_profile_survives_fresh_sessions() {
+    auto fixture = make_fixture();
+    auto policy = enabled_policy();
+    auto harness = make_harness(fixture.state, policy);
+
+    auto profile_request = rva_request();
+    profile_request.mode = argos::domain::DiscoveryMode::build_profile;
+    profile_request.gu_object_array_rva.reset();
+    profile_request.fname_pool_rva.reset();
+    auto profiled = harness.service->unreal_runtime_discover(harness.session, profile_request);
+    check(profiled.has_value(), "a registered build profile resolves roots without client RVAs");
+    if (profiled) {
+        check(profiled->roots.origin == argos::domain::RootOrigin::build_profile,
+              "registered roots report build_profile provenance");
+        check(std::ranges::find(profiled->provenance.evidence,
+                                argos::domain::RuntimeEvidence::module_fingerprint) !=
+                  profiled->provenance.evidence.end(),
+              "a matched signature is reported as module fingerprint evidence");
+    }
+
+    policy.enable_unreal_auto_discovery = true;
+    auto auto_harness = make_harness(fixture.state, policy);
+    auto auto_request = profile_request;
+    auto_request.mode = argos::domain::DiscoveryMode::auto_discovery;
+    auto automatic = auto_harness.service->unreal_runtime_discover(auto_harness.session, auto_request);
+    check(automatic.has_value(), "auto discovery reuses a registered exact build fingerprint");
+}
+
+void test_registered_build_profile_fails_closed() {
+    auto fixture = make_fixture();
+    auto policy = enabled_policy();
+    policy.unreal_build_profiles.front().signature.front() = std::byte{0x00};
+    auto harness = make_harness(fixture.state, policy);
+    auto request = rva_request();
+    request.mode = argos::domain::DiscoveryMode::build_profile;
+    request.gu_object_array_rva.reset();
+    request.fname_pool_rva.reset();
+    auto mismatch = harness.service->unreal_runtime_discover(harness.session, request);
+    check(!mismatch.has_value(), "a mismatched module signature does not reuse stale roots");
+    check(!mismatch && mismatch.error().code == argos::domain::DebugErrorCode::not_found,
+          "a fingerprint mismatch reports not_found");
+
+    policy = enabled_policy();
+    auto duplicate = policy.unreal_build_profiles.front();
+    duplicate.build_id = "synthetic-ue5-build-copy";
+    policy.unreal_build_profiles.push_back(std::move(duplicate));
+    auto ambiguous_harness = make_harness(fixture.state, policy);
+    auto ambiguous = ambiguous_harness.service->unreal_runtime_discover(ambiguous_harness.session, request);
+    check(!ambiguous.has_value(), "multiple matching fingerprints are rejected as ambiguous");
+    check(!ambiguous && ambiguous.error().code == argos::domain::DebugErrorCode::invalid_argument,
+          "an ambiguous fingerprint reports invalid_argument");
+}
+
+void test_build_profile_configuration_parser() {
+    const auto valid = argos::security::parse_unreal_build_profiles(
+        "fixture|ue5-fproperty-x64|Game-Win64-Shipping.exe|16777216|0x10800|"
+        "4152474f53554535|0x10000|0x10100"
+    );
+    check(valid.has_value() && valid->size() == 1U, "a bounded build profile configuration parses");
+    check(valid && valid->front().signature.size() == 8U, "the fingerprint signature is decoded");
+
+    const auto short_signature = argos::security::parse_unreal_build_profiles(
+        "fixture|ue5-fproperty-x64|Game.exe|16777216|0x10800|00|0x10000|0x10100"
+    );
+    check(!short_signature.has_value(), "a weak fingerprint signature is rejected");
+    const auto traversal = argos::security::parse_unreal_build_profiles(
+        "fixture|ue5-fproperty-x64|..\\Game.exe|16777216|0x10800|"
+        "4152474f53554535|0x10000|0x10100"
+    );
+    check(!traversal.has_value(), "a module path is not accepted as a configured module name");
 }
 
 void test_roots_are_one_of_not_a_merge() {
@@ -794,6 +880,9 @@ int main() {
     test_feature_is_gated_off_by_default();
     test_profile_must_be_allowlisted();
     test_auto_discovery_needs_its_own_gate();
+    test_registered_build_profile_survives_fresh_sessions();
+    test_registered_build_profile_fails_closed();
+    test_build_profile_configuration_parser();
     test_roots_are_one_of_not_a_merge();
 
     test_discover_validates_and_publishes();

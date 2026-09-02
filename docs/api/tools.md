@@ -370,6 +370,9 @@ oferece apenas os perfis já habilitados; uma requisição nunca liga um gate.
 `roots` usa `oneOf`: o par de RVAs (que exige `module`) ou o par de endereços
 absolutos (válidos só na sessão corrente, `root_origin: "explicit_address"`).
 Misturar as duas formas, ou enviar metade de uma, retorna `invalid_argument`.
+Nos modos `profile` e `auto`, `roots` deve estar ausente. O servidor consulta
+os registros de `ARGOS_MCP_UNREAL_BUILD_PROFILES`; o cliente não fornece nem
+persiste fingerprints.
 
 Antes de publicar um `runtime_id`, o servidor valida alinhamento das raízes,
 região legível, coerência de `num_elements`/`max_elements`/chunks, uma amostra
@@ -402,11 +405,12 @@ distintas e comparáveis.
 
 Limites desta entrega, explícitos por serem escopo e não defeito:
 
-- `mode: "profile"` retorna `not_found` — nenhum fingerprint de build está
-  registrado neste release;
-- `mode: "auto"` exige o segundo gate e então retorna `unsupported`: a descoberta
-  multipadrão ([Spec 0009](../specs/0009-scan-composition-and-multi-pattern.md))
-  não está implementada;
+- `mode: "profile"` exige um registro server-side cujo nome, tamanho e
+  assinatura bounded correspondam exatamente ao módulo carregado;
+- `mode: "auto"` exige o segundo gate e tenta primeiro esses mesmos registros.
+  Sem registro aplicável, retorna `unsupported` porque a descoberta multipadrão
+  ([Spec 0009](../specs/0009-scan-composition-and-multi-pattern.md)) ainda não
+  está implementada;
 - `discover` e `objects` executam de forma síncrona e bounded. A resposta traz
   `execution: "synchronous"` e o mesmo envelope terminal
   (`result` + `termination`) do contrato assíncrono, para que a migração para

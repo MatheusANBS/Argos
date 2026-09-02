@@ -225,6 +225,7 @@ Depois disso, o `attach` deve solicitar `access: "read_write"`, e cada chamada d
 | `ARGOS_MCP_ENABLE_UNREAL_RUNTIME` | `0` | booleano |
 | `ARGOS_MCP_ENABLE_UNREAL_AUTO_DISCOVERY` | `0` | booleano |
 | `ARGOS_MCP_UNREAL_PROFILES` | (vazio = nenhum perfil habilitado) | lista separada por `;` |
+| `ARGOS_MCP_UNREAL_BUILD_PROFILES` | (vazio) | até 64 registros / 32 KiB |
 | `ARGOS_MCP_MAX_UNREAL_CONTEXTS_PER_SESSION` | 2 | 16 |
 | `ARGOS_MCP_MAX_UNREAL_CONTEXTS` | 8 | 64 |
 | `ARGOS_MCP_MAX_UNREAL_SLOTS` | 1.000.000 | 8.000.000 |
@@ -245,6 +246,18 @@ rígido do domínio continua sendo o limite superior.
 `ARGOS_MCP_ENABLE_UNREAL_RUNTIME=1` sozinho não habilita nada. Um perfil precisa
 ser nomeado em `ARGOS_MCP_UNREAL_PROFILES` (allowlist vazia = nenhum perfil), e
 `mode: "auto"` exige o segundo gate. Uma requisição nunca liga um gate.
+
+Builds conhecidas podem ser registradas sem expor roots ao cliente:
+
+```text
+build_id|profile_id|module_name|module_size_decimal|signature_rva_hex|signature_hex|gu_object_array_rva_hex|fname_pool_rva_hex
+```
+
+Registros são separados por `;`. A assinatura deve conter 8–64 bytes e todos
+os RVAs precisam estar dentro de `module_size`. `mode: "profile"` usa esse
+registro diretamente; `mode: "auto"` tenta registros exatos antes do fallback
+multipadrão ainda não implementado. Nome, tamanho e assinatura precisam
+corresponder, e as invariantes completas do runtime ainda são validadas.
 
 `ARGOS_MCP_ALLOW_FOREIGN_USER=1` remove somente a validação interna de proprietário. Ele não contorna permissões do sistema operacional e deve ser usado apenas em ambientes de laboratório controlados.
 

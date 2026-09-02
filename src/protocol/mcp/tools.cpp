@@ -1357,16 +1357,16 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
 
         tools.push_back(ToolDefinition{
             "memory_debug.unreal_runtime_discover",
-            "Validate GUObjectArray and FNamePool roots against an enabled Unreal layout profile and publish a read-only runtime context with its class catalog. Complements, and never replaces, the PDB path: results carry their own provenance and confidence.",
+            "Discover and validate GUObjectArray/FNamePool, then publish a read-only runtime context. Prefer mode profile for an operator-registered build; mode auto can select a matching registered build without chat history. Use explicit only when the client already knows both roots. Complements, and never replaces, the PDB path: results carry provenance and confidence.",
             object_schema({
                 {"session_id", session},
                 {"profile_id", profile_schema},
                 {"mode", enum_string_schema({"explicit", "profile", "auto"})},
-                {"module", string_schema("Loaded module name, required when roots are RVAs.")},
+                {"module", string_schema("Optional loaded module name for profile/auto; required when explicit roots are RVAs.")},
                 {"roots", Value::object({
                     {"description",
                      "Either both RVAs (with module) or both absolute addresses. The two forms are "
-                     "mutually exclusive; absolute addresses are valid for the current session only."},
+                     "mutually exclusive and valid only in explicit mode; omit roots for profile/auto."},
                     {"oneOf", Value::array({
                         object_schema({
                             {"gu_object_array_rva", address},

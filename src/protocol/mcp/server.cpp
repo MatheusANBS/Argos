@@ -74,6 +74,10 @@ enum class LineReadStatus {
 
 [[nodiscard]] const Value& generic_tool_output_schema() {
     static const Value schema = Value::object({
+        // MCP requires outputSchema to be an object schema, so the root carries
+        // type even though both oneOf branches already constrain it. Clients
+        // validate the root shape and reject a bare oneOf.
+        {"type", "object"},
         {"oneOf", Value::array({
             Value::object({
                 {"type", "object"},

@@ -120,6 +120,13 @@ Três controles server-side, todos aplicados antes de I/O ou alocação:
   significa **nenhum** perfil habilitado, não todos;
 - `ARGOS_MCP_ENABLE_UNREAL_AUTO_DISCOVERY=0`, independente do gate geral.
 
+Perfis de build registrados pelo operador não são aceitos do cliente MCP. O
+parser limita a configuração a 32 KiB/64 registros e assinaturas de 8–64 bytes;
+um registro só corresponde quando nome, tamanho e bytes no RVA configurado
+batem exatamente. Mismatch, leitura curta e ambiguidade falham fechados. Os
+RVAs resultantes ainda passam por bounds/overflow e por todas as invariantes do
+runtime antes da publicação. Bytes esperados ou observados nunca entram em log.
+
 Uma requisição nunca liga um gate. O parser trata a memória do alvo como
 hostil: contagens do alvo são validadas antes de dimensionar qualquer loop ou
 leitura; toda lista encadeada tem detecção de ciclo, limite de nós e deadline;

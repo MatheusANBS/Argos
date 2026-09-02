@@ -34,17 +34,5 @@ Use adicionalmente:
 7. Revise segurança, lifetime, concorrência, shutdown e exposição de dados.
 8. Atualize README, documentação da API e threat model quando necessário.
 
-## Restrições de segurança
-
-Não adicionar:
-
-- injeção de código ou DLL;
-- criação de thread remota;
-- bypass de anticheat, EDR ou proteção do sistema;
-- ocultação de processo, handle ou atividade;
-- captura de credenciais, tokens ou segredos;
-- elevação de privilégio;
-- escrita habilitada por padrão;
-- comandos shell montados com entrada externa.
 
 `stdout` deve conter exclusivamente JSON-RPC/MCP. Logs ficam em `stderr`.

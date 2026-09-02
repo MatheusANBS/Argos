@@ -18,6 +18,24 @@ namespace {
     return domain::DebugError{code, std::move(message)};
 }
 
+[[nodiscard]] bool ascii_case_equal(const std::string_view lhs, const std::string_view rhs) noexcept {
+    if (lhs.size() != rhs.size()) return false;
+    for (std::size_t index = 0U; index < lhs.size(); ++index) {
+        const auto lower = [](const char value) noexcept {
+            return value >= 'A' && value <= 'Z' ? static_cast<char>(value - 'A' + 'a') : value;
+        };
+        if (lower(lhs[index]) != lower(rhs[index])) return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool requested_module_matches(
+    const domain::ModuleInfo& module,
+    const std::string_view requested
+) noexcept {
+    return requested.empty() || ascii_case_equal(module.name, requested) || module.path == requested;
+}
+
 [[nodiscard]] domain::Result<domain::Address> add_offset(
     const domain::Address address,
     const std::int64_t offset
@@ -2134,7 +2152,6 @@ domain::Result<MemoryDebugService::RuntimeQueryScope> MemoryDebugService::open_r
     if (profile == nullptr) {
         return std::unexpected(error(domain::DebugErrorCode::unsupported, "unsupported_profile"));
     }
-
     RuntimeQueryScope scope;
     scope.session = *session;
     scope.context = *context;
@@ -2161,24 +2178,13 @@ domain::Result<UnrealDiscoverResult> MemoryDebugService::unreal_runtime_discover
     if (profile == nullptr) {
         return std::unexpected(error(domain::DebugErrorCode::unsupported, "unsupported_profile"));
     }
-
     if (request.mode == domain::DiscoveryMode::auto_discovery) {
-        // The second gate is checked first so a disabled feature reports the
-        // gate rather than the missing engine behind it.
+        // Check the independent gate before validating mode-specific input, so
+        // a disabled capability reveals no details about what it would accept.
         auto auto_gate = policy_.authorize_unreal_auto_discovery();
         if (!auto_gate) {
             return std::unexpected(auto_gate.error());
         }
-        return std::unexpected(error(
-            domain::DebugErrorCode::unsupported,
-            "auto_discovery_unavailable: multi-pattern root discovery is not implemented"
-        ));
-    }
-    if (request.mode == domain::DiscoveryMode::build_profile) {
-        return std::unexpected(error(
-            domain::DebugErrorCode::not_found,
-            "no_build_profile: no build fingerprint is registered for this module"
-        ));
     }
 
     const bool has_rva = request.gu_object_array_rva.has_value() || request.fname_pool_rva.has_value();
@@ -2188,12 +2194,19 @@ domain::Result<UnrealDiscoverResult> MemoryDebugService::unreal_runtime_discover
         request.gu_object_array_rva.has_value() && request.fname_pool_rva.has_value();
     const bool complete_address =
         request.gu_object_array_address.has_value() && request.fname_pool_address.has_value();
-    // oneOf, not precedence: mixing the two forms or supplying half of one is
-    // rejected instead of resolved silently.
-    if (has_rva == has_address || (has_rva && !complete_rva) || (has_address && !complete_address)) {
+    if (request.mode == domain::DiscoveryMode::explicit_roots) {
+        // oneOf, not precedence: mixing the two forms or supplying half of one
+        // is rejected instead of resolved silently.
+        if (has_rva == has_address || (has_rva && !complete_rva) || (has_address && !complete_address)) {
+            return std::unexpected(error(
+                domain::DebugErrorCode::invalid_argument,
+                "conflicting_roots: supply either both RVAs or both absolute addresses"
+            ));
+        }
+    } else if (has_rva || has_address) {
         return std::unexpected(error(
             domain::DebugErrorCode::invalid_argument,
-            "conflicting_roots: supply either both RVAs or both absolute addresses"
+            "conflicting_roots: profile and auto modes do not accept client-supplied roots"
         ));
     }
 
@@ -2210,7 +2223,85 @@ domain::Result<UnrealDiscoverResult> MemoryDebugService::unreal_runtime_discover
     domain::UnrealRuntimeRoots roots;
     std::string module_name = request.module_name;
     std::uint64_t fingerprint = resume_key_;
-    if (complete_rva) {
+    bool matched_build_profile = false;
+    if (request.mode == domain::DiscoveryMode::build_profile ||
+        request.mode == domain::DiscoveryMode::auto_discovery) {
+        // Auto may use a registered, exact build fingerprint without a
+        // multipattern scan. Its independent gate was checked before input
+        // validation because the client did not name a specific build mapping.
+        if (!policy_.unreal_build_profiles_valid) {
+            return std::unexpected(error(
+                domain::DebugErrorCode::invalid_argument,
+                "invalid_build_profile_config: ARGOS_MCP_UNREAL_BUILD_PROFILES is invalid"
+            ));
+        }
+
+        struct Match {
+            const security::UnrealBuildProfile* profile{};
+            const domain::ModuleInfo* module{};
+        };
+        std::vector<Match> matches;
+        bool profile_was_registered = false;
+        for (const auto& configured : policy_.unreal_build_profiles) {
+            if (configured.profile_id != request.profile_id) continue;
+            profile_was_registered = true;
+            for (const auto& module : (*snapshot)->modules.all()) {
+                if (!ascii_case_equal(module.name, configured.module_name) ||
+                    !requested_module_matches(module, request.module_name) ||
+                    module.size != configured.module_size) {
+                    continue;
+                }
+                const auto signature_address = domain::checked_add(module.base, configured.signature_rva);
+                const auto signature_end = domain::checked_add(
+                    configured.signature_rva, configured.signature.size()
+                );
+                if (!signature_address || !signature_end || *signature_end > module.size) continue;
+
+                std::vector<std::byte> observed(configured.signature.size());
+                auto read = view->read(*signature_address, observed, cancellation);
+                if (!read || *read != observed.size()) continue;
+                if (std::ranges::equal(observed, configured.signature)) {
+                    matches.push_back(Match{&configured, &module});
+                }
+            }
+        }
+        if (matches.empty()) {
+            if (request.mode == domain::DiscoveryMode::auto_discovery && !profile_was_registered) {
+                return std::unexpected(error(
+                    domain::DebugErrorCode::unsupported,
+                    "auto_discovery_unavailable: no build profile is registered and multipattern discovery is not implemented"
+                ));
+            }
+            return std::unexpected(error(
+                domain::DebugErrorCode::not_found,
+                "no_build_profile: no registered module fingerprint matched the target"
+            ));
+        }
+        if (matches.size() != 1U) {
+            return std::unexpected(error(
+                domain::DebugErrorCode::invalid_argument,
+                "ambiguous_build_profile: more than one registered fingerprint matched the target"
+            ));
+        }
+        const auto& selected = matches.front();
+        const auto object_array = domain::checked_add(
+            selected.module->base, selected.profile->gu_object_array_rva
+        );
+        const auto name_pool = domain::checked_add(
+            selected.module->base, selected.profile->fname_pool_rva
+        );
+        if (!object_array || !name_pool) {
+            return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "build profile root overflow"));
+        }
+        roots.gu_object_array = *object_array;
+        roots.fname_pool = *name_pool;
+        roots.origin = domain::RootOrigin::build_profile;
+        module_name = selected.module->name;
+        fingerprint = domain::resume_token::digest(selected.profile->build_id, fingerprint);
+        fingerprint = domain::resume_token::digest(selected.module->name, fingerprint);
+        fingerprint = domain::resume_token::combine(fingerprint, selected.module->size);
+        matched_build_profile = true;
+    } else if (complete_rva) {
         if (request.module_name.empty()) {
             return std::unexpected(error(
                 domain::DebugErrorCode::invalid_argument, "module is required when roots are RVAs"
@@ -2260,6 +2351,9 @@ domain::Result<UnrealDiscoverResult> MemoryDebugService::unreal_runtime_discover
     auto validation = reader.validate_roots(cancellation);
     if (!validation) {
         return std::unexpected(validation.error());
+    }
+    if (matched_build_profile) {
+        validation->evidence.insert(validation->evidence.begin(), domain::RuntimeEvidence::module_fingerprint);
     }
     auto catalog = reader.build_class_catalog(cancellation);
     if (!catalog) {

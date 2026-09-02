@@ -1,6 +1,8 @@
 # Spec 0012 — Reflexão Unreal em runtime sem PDB
 
-Status: implementado (entrega incremental 1–5) · ADR: [0019](../adr/0019-unreal-runtime-reflection.md)
+Status: implementado (entrega incremental 1–5) · ADRs:
+[0019](../adr/0019-unreal-runtime-reflection.md),
+[0020](../adr/0020-server-side-unreal-build-profiles.md)
 
 ## Estado da entrega
 
@@ -23,13 +25,14 @@ Diferenças em relação ao texto original, por dependência não implementada:
   opaco vinculado ao contexto e ao filtro. Migrar para jobs continua aditivo:
   nenhuma tool própria de controle foi criada, e não há pool, thread destacada
   nem registry de jobs paralelo.
-- **`mode: "profile"`.** Retorna `not_found` com motivo `no_build_profile`:
-  nenhum fingerprint de build está registrado neste release. A origem
-  `build_profile` já existe no contrato e nas regras de confiança.
+- **`mode: "profile"`.** Usa fingerprints configurados pelo operador com nome,
+  tamanho e assinatura bounded do módulo. A origem é `build_profile`; mismatch
+  retorna `not_found` e ambiguidade é rejeitada.
 - **`mode: "auto"`.** Exige o segundo gate (`ARGOS_MCP_ENABLE_UNREAL_AUTO_DISCOVERY`)
-  e, com ele ligado, retorna `unsupported`: a descoberta multipadrão da
-  [Spec 0009](0009-scan-composition-and-multi-pattern.md) não está implementada.
-  `signature_candidate` continua sem alcançar `confidence: high`.
+  e tenta primeiro fingerprints registrados. Sem registro aplicável, a
+  descoberta multipadrão da [Spec 0009](0009-scan-composition-and-multi-pattern.md)
+  continua `unsupported`. `signature_candidate` continua sem alcançar
+  `confidence: high`.
 
 Além do texto original, nomes lidos do alvo são sanitizados para ASCII
 imprimível antes de entrarem no protocolo: um nome hostil não deve injetar
