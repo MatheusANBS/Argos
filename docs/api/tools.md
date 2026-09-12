@@ -496,6 +496,20 @@ Limites desta entrega, explícitos por serem escopo e não defeito:
 - nomes vindos do alvo são sanitizados para ASCII imprimível antes de entrar no
   protocolo.
 
+## Runtime Santa Monica/Kinetica (proposto)
+
+A [Spec 0014](../specs/0014-santa-monica-kinetica-runtime-instrumentation.md)
+propõe suporte de runtime por build para *God of War* (2018), incluindo
+reflexão RTTI, registries SLI, Lua e operações de gameplay. **Nenhuma dessas
+tools existe em `tools/list` nesta versão.**
+
+Quando implementadas, serão `memory_debug.santamonica_runtime_discover`,
+`_types`, `_type`, `_enums`, `_sli_functions`, `_lua_scripts`, `_lua_execute`,
+`_items`, `_inventory`, `_grant_item`, `_remove_item`, `_invoke` e `_release`.
+Elas exigirão perfil exato habilitado pelo operador; chamadas mutáveis
+requererão gates distintos e `authorized: true`. O cliente não fornecerá RVA,
+endereço de função, DLL ou payload nativo.
+
 ## Histórico
 
 As tools `memory_debug.strings`, `memory_debug.scan_pointers_to`,

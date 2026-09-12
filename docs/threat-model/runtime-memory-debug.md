@@ -95,6 +95,36 @@ de páginas nem suporte a processos de outro usuário por padrão. A primeira
 bridge não instala hooks nem expõe execução de comandos; capacidades dentro do
 alvo exigem ADR e protocolo próprios.
 
+### Instrumentação Santa Monica/Kinetica proposta (Spec 0014)
+
+Vetor: um cliente habilita uma bridge de modding e tenta executá-la contra
+build sem perfil, trocar o perfil/bridge entre chamadas, injetar fonte Lua ou
+argumentos SLI desproporcionais, chamar a engine fora do main thread ou
+corromper inventário/save por uma operação parcialmente interrompida.
+
+Controles exigidos antes da implementação: gates de startup independentes para
+runtime, carga antecipada, gameplay e Lua; perfil server-side vinculado à
+identidade completa do módulo; bridge e protocolo versionados; sessão
+autorizada e confirmação explícita para toda ação mutável; ausência completa
+das tools quando os gates estiverem desligados; e nenhum endereço, RVA,
+assinatura, DLL, export ou payload nativo recebido do cliente.
+
+RTTI, SLI e Lua só são usados depois de validar ranges, limites, alinhamento,
+ponteiros, strings, referências cruzadas e estabilidade entre leituras. A
+bridge serializa comandos numa fila limitada e os executa no tick/main thread
+do perfil; uma transação em commit termina observavelmente em vez de ser
+interrompida. Handles são opacos e por sessão, payload Lua possui orçamento de
+bytes/instruções/tempo/saída, e logs redigem scripts, bytes, saves, paths,
+assinaturas, RVAs e erros nativos.
+
+Risco residual: Lua e invocação SLI constituem modding de propósito geral
+dentro da build autorizada; seu uso tem impacto equivalente a carregar um mod
+local naquele jogo. A capacidade não é exposta como injector genérico e não
+inclui bypass de DRM, anticheat, EDR, stealth, elevação ou processos de outro
+usuário. A [Spec 0014](../specs/0014-santa-monica-kinetica-runtime-instrumentation.md)
+permanece proposta até fixtures, testes de main-thread/shutdown e validação
+contra cópia de save demonstrarem as invariantes de persistência.
+
 ### Corrupção do protocolo
 
 Controles: `stdout` reservado; cada frame é drenado e rejeitado acima de 8 MiB antes de crescer sem limite; parser limita nesting a 128 e o DOM a 65.536 nós, rejeita chaves duplicadas e nunca serializa números não finitos; erros JSON-RPC são tipados. Cancelamento é linearizado com a conclusão e suprime qualquer resposta tardia com o ID cancelado. Testes de contrato verificam ressincronização após frame excessivo e as duas eras do protocolo.

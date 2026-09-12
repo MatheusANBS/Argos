@@ -35,6 +35,7 @@ disponíveis depois da entrega de código e testes.
 | Índice reutilizável/persistente para pointer chains | [Spec 0010](0010-persistent-pointer-index.md) | [ADR-0018](../adr/0018-persistent-pointer-index.md) | jobs e identidade do processo | proposto |
 | Inspeção derivada de endereço, vtable provável e referências | [Spec 0011](0011-inspect-address.md) | [ADR-0013](../adr/0013-address-inspection-derived-evidence.md) | cobertura e pointer index | **implementado**; referências por índice aguardam a Spec 0010 |
 | Reflexão Unreal em runtime sem PDB | [Spec 0012](0012-unreal-runtime-reflection.md) | [ADR-0019](../adr/0019-unreal-runtime-reflection.md) | jobs, multipadrão e perfis | **implementado** de forma síncrona; migração para jobs (Spec 0008, já disponível) e descoberta `auto` (Spec 0009) permanecem trabalho futuro |
+| Runtime Santa Monica/Kinetica: RTTI, SLI, Lua e gameplay | [Spec 0014](0014-santa-monica-kinetica-runtime-instrumentation.md) | [ADR-0022](../adr/0022-santa-monica-kinetica-runtime-instrumentation.md) | bridge, perfis de build e canal main-thread | proposto |
 
 As três capacidades entregues (0008, 0011 e 0012) preservam o contrato
 original: `inspect_address` expõe cobertura e `resume_token` no próprio

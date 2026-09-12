@@ -58,6 +58,15 @@ modulo que ja foi listado na sessao. O cliente nao fornece um caminho de PDB
 arbitrario. DbgHelp e protegido por mutex porque a API oficial nao e
 thread-safe.
 
+## Adapters de runtime específicos de engine
+
+O suporte proposto Santa Monica/Kinetica (ADR-0022 / Spec 0014) preserva a
+mesma direção de dependências. O domínio recebe leitores e canais de bridge
+tipados, enquanto a infraestrutura Windows contém PE, carga antecipada/attach,
+assinaturas, RTTI, SLI, Lua e ABI nativa. A camada MCP só valida e apresenta
+handles opacos. O adapter é orientado a perfis exatos de build, nunca a
+endereços ou assinaturas fornecidos pelo cliente.
+
 ## Shutdown
 
 Fechamento de `stdin` encerra o loop. A destruição em ordem reversa libera sessions, handles e demais objetos. Não existem threads destacadas.

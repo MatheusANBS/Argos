@@ -354,6 +354,16 @@ sendo o caminho preferido para layout nativo completo. Perfis embutidos:
 `ue5-fproperty-x64` (`FField`/`FProperty`) e `ue4-uproperty-x64`
 (`UField`/`UProperty`), selecionados explicitamente e sem fallback entre si.
 
+## Santa Monica/Kinetica (proposto)
+
+O suporte por build para a engine proprietária de *God of War* (2018) está
+documentado, mas ainda não implementado. A proposta inclui RTTI, SLI, Lua,
+inventário e operações de gameplay por bridge, sempre vinculadas a um perfil
+exato e a gates opt-in. Consulte
+[`docs/engines/santa-monica-kinetica.md`](docs/engines/santa-monica-kinetica.md),
+[Spec 0014](docs/specs/0014-santa-monica-kinetica-runtime-instrumentation.md)
+e [ADR-0022](docs/adr/0022-santa-monica-kinetica-runtime-instrumentation.md).
+
 ## Licença
 
 MIT. Consulte `LICENSE`.
