@@ -546,6 +546,22 @@ domain::Result<domain::OutputChunk> MemoryDebugService::read_output(
     return launched->read_output(since_cursor, max_bytes);
 }
 
+domain::Result<domain::InjectedDebugBridge> MemoryDebugService::inject_debug_bridge(
+    const domain::SessionId& id,
+    const std::string_view bridge_path,
+    const bool authorized
+) {
+    auto authorization = policy_.authorize_debug_bridge_injection(authorized, bridge_path);
+    if (!authorization) {
+        return std::unexpected(authorization.error());
+    }
+    auto session = sessions_.get(id);
+    if (!session) {
+        return std::unexpected(session.error());
+    }
+    return (*session)->inject_debug_bridge(domain::DebugBridgeSpec{std::string{bridge_path}});
+}
+
 domain::Result<std::vector<domain::MemoryRegion>> MemoryDebugService::regions(
     const domain::SessionId& id
 ) const {

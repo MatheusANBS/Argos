@@ -42,7 +42,7 @@ void check(bool condition, const char* message) {
     }
 }
 
-class FakeSession final : public argos::domain::ProcessSession {
+class FakeSession : public argos::domain::ProcessSession {
 public:
     FakeSession() {
         memory_ = {
@@ -107,6 +107,22 @@ public:
 private:
     std::vector<std::byte> memory_{};
     std::vector<argos::domain::ModuleInfo> modules_{};
+};
+
+class FakeBridgeSession final : public FakeSession {
+public:
+    using FakeSession::FakeSession;
+
+    [[nodiscard]] argos::domain::Result<argos::domain::InjectedDebugBridge> inject_debug_bridge(
+        const argos::domain::DebugBridgeSpec& spec
+    ) override {
+        if (spec.path.empty()) {
+            return std::unexpected(argos::domain::DebugError{
+                argos::domain::DebugErrorCode::invalid_argument, "bridge path is empty"
+            });
+        }
+        return argos::domain::InjectedDebugBridge{42U, "argos_debug_bridge.dll", 0x180000000U};
+    }
 };
 
 class FakeProvider final : public argos::domain::ProcessMemoryProvider {
@@ -1589,6 +1605,46 @@ void test_authorize_launch_policy() {
           "path traversal cannot escape the allowlist");
 }
 
+void test_debug_bridge_policy_and_service() {
+    namespace fs = std::filesystem;
+    const auto bridge_path = fs::temp_directory_path() / "argos_debug_bridge_policy_test.dll";
+    {
+        std::ofstream bridge{bridge_path, std::ios::binary | std::ios::trunc};
+        bridge << "test";
+    }
+
+    argos::security::SecurityPolicy policy;
+    check(!policy.authorize_debug_bridge_injection(true, bridge_path.string()).has_value(),
+          "debug bridge injection is disabled by default");
+    policy.allow_debug_bridge_injection = true;
+    check(!policy.authorize_debug_bridge_injection(false, bridge_path.string()).has_value(),
+          "debug bridge injection requires explicit authorization");
+    check(!policy.authorize_debug_bridge_injection(true, bridge_path.string()).has_value(),
+          "debug bridge injection requires a non-empty allowlist");
+    policy.debug_bridge_allowed_paths = {bridge_path.string()};
+    check(policy.authorize_debug_bridge_injection(true, bridge_path.string()).has_value(),
+          "an explicitly allowlisted bridge is accepted");
+    check(!policy.authorize_debug_bridge_injection(true, (bridge_path.parent_path() / "other.dll").string()).has_value(),
+          "a bridge outside the allowlist is rejected");
+
+    auto provider = std::make_unique<SingleSessionFakeProvider>([] {
+        return std::unique_ptr<argos::domain::ProcessSession>{std::make_unique<FakeBridgeSession>()};
+    });
+    argos::application::MemoryDebugService service{std::move(provider), policy};
+    auto session = service.attach(42U, argos::domain::AccessMode::read_only, true);
+    check(session.has_value(), "bridge test attaches a fake session");
+    if (session) {
+        auto denied = service.inject_debug_bridge(session->id, bridge_path.string(), false);
+        check(!denied.has_value() && denied.error().code == argos::domain::DebugErrorCode::unauthorized,
+              "service rejects an unconfirmed bridge injection");
+        auto injected = service.inject_debug_bridge(session->id, bridge_path.string(), true);
+        check(injected.has_value() && injected->pid == 42U && injected->module_base == 0x180000000U,
+              "service returns the injected bridge identity");
+    }
+    std::error_code cleanup_error;
+    fs::remove(bridge_path, cleanup_error);
+}
+
 void test_launch_and_managed_process() {
     namespace domain = argos::domain;
     auto terminated = std::make_shared<bool>(false);
@@ -2733,6 +2789,7 @@ int main() {
     test_domain_query_helpers();
     test_output_ring_buffer();
     test_authorize_launch_policy();
+    test_debug_bridge_policy_and_service();
     test_launch_and_managed_process();
     test_extract_strings();
     test_unity_il2cpp_metadata();

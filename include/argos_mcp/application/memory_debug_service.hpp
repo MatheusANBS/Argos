@@ -290,6 +290,12 @@ public:
         std::size_t max_bytes
     ) const;
 
+    [[nodiscard]] domain::Result<domain::InjectedDebugBridge> inject_debug_bridge(
+        const domain::SessionId& id,
+        std::string_view bridge_path,
+        bool authorized
+    );
+
     [[nodiscard]] domain::Result<std::vector<domain::MemoryRegion>> regions(
         const domain::SessionId& id
     ) const;

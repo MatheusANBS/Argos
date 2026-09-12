@@ -10,9 +10,12 @@ class NativeProcessMemoryProvider final : public domain::ProcessMemoryProvider {
 public:
     explicit NativeProcessMemoryProvider(
         bool allow_foreign_user = false,
-        std::size_t max_captured_output_bytes = 1U * 1024U * 1024U
+        std::size_t max_captured_output_bytes = 1U * 1024U * 1024U,
+        bool allow_debug_bridge_injection = false
     ) noexcept
-        : allow_foreign_user_(allow_foreign_user), max_captured_output_bytes_(max_captured_output_bytes) {}
+        : allow_foreign_user_(allow_foreign_user),
+          max_captured_output_bytes_(max_captured_output_bytes),
+          allow_debug_bridge_injection_(allow_debug_bridge_injection) {}
 
     [[nodiscard]] domain::Result<std::vector<domain::ProcessInfo>> list_processes(
         std::string_view filter,
@@ -32,6 +35,7 @@ public:
 private:
     bool allow_foreign_user_{false};
     std::size_t max_captured_output_bytes_{1U * 1024U * 1024U};
+    bool allow_debug_bridge_injection_{false};
 };
 
 }  // namespace argos::infrastructure

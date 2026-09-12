@@ -266,8 +266,17 @@ private:
 
 class WindowsProcessSession final : public ProcessSession {
 public:
-    WindowsProcessSession(ProcessId pid, std::string name, AccessMode access, UniqueHandle handle)
-        : pid_(pid), name_(std::move(name)), access_(access), handle_(std::move(handle)) {}
+    WindowsProcessSession(
+        ProcessId pid,
+        std::string name,
+        AccessMode access,
+        UniqueHandle handle,
+        bool debug_bridge_enabled
+    ) : pid_(pid),
+        name_(std::move(name)),
+        access_(access),
+        handle_(std::move(handle)),
+        debug_bridge_enabled_(debug_bridge_enabled) {}
 
     [[nodiscard]] ProcessId pid() const noexcept override { return pid_; }
     [[nodiscard]] std::string_view process_name() const noexcept override { return name_; }
@@ -292,11 +301,16 @@ public:
         return windows_query_modules(pid_);
     }
 
+    [[nodiscard]] Result<domain::InjectedDebugBridge> inject_debug_bridge(
+        const domain::DebugBridgeSpec& spec
+    ) override;
+
 private:
     ProcessId pid_{};
     std::string name_;
     AccessMode access_{AccessMode::read_only};
     UniqueHandle handle_;
+    bool debug_bridge_enabled_{false};
 };
 
 [[nodiscard]] std::wstring utf8_to_wide(std::string_view input) {
@@ -316,6 +330,105 @@ private:
         return {};
     }
     return output;
+}
+
+class RemoteAllocation final {
+public:
+    RemoteAllocation(HANDLE process, void* address) noexcept : process_(process), address_(address) {}
+    ~RemoteAllocation() {
+        if (address_ != nullptr) {
+            VirtualFreeEx(process_, address_, 0U, MEM_RELEASE);
+        }
+    }
+
+    RemoteAllocation(const RemoteAllocation&) = delete;
+    RemoteAllocation& operator=(const RemoteAllocation&) = delete;
+
+private:
+    HANDLE process_{};
+    void* address_{};
+};
+
+Result<domain::InjectedDebugBridge> WindowsProcessSession::inject_debug_bridge(
+    const domain::DebugBridgeSpec& spec
+) {
+    if (!debug_bridge_enabled_) {
+        return std::unexpected(error(
+            DebugErrorCode::access_denied, "debug bridge injection is disabled for this session"
+        ));
+    }
+    const std::filesystem::path requested_path{spec.path};
+    std::error_code filesystem_error;
+    const auto canonical_path = std::filesystem::weakly_canonical(requested_path, filesystem_error);
+    if (filesystem_error || !std::filesystem::is_regular_file(canonical_path, filesystem_error) || filesystem_error) {
+        return std::unexpected(error(
+            DebugErrorCode::not_found, "debug bridge does not exist or is not a regular file"
+        ));
+    }
+    const auto find_loaded_bridge = [this, &canonical_path]() -> Result<std::optional<domain::InjectedDebugBridge>> {
+        auto loaded_modules = windows_query_modules(pid_);
+        if (!loaded_modules) {
+            return std::unexpected(loaded_modules.error());
+        }
+        const auto expected_path = canonical_path.lexically_normal();
+        for (const auto& module : *loaded_modules) {
+            std::error_code module_error;
+            const auto module_path = std::filesystem::weakly_canonical(module.path, module_error);
+            if (!module_error && module_path.lexically_normal() == expected_path) {
+                return domain::InjectedDebugBridge{pid_, module.name, module.base};
+            }
+        }
+        return std::optional<domain::InjectedDebugBridge>{};
+    };
+    auto already_loaded = find_loaded_bridge();
+    if (!already_loaded) {
+        return std::unexpected(already_loaded.error());
+    }
+    if (*already_loaded) {
+        return **already_loaded;
+    }
+    const std::wstring wide_path{canonical_path.native()};
+    if (wide_path.empty() || wide_path.size() >= static_cast<std::size_t>(std::numeric_limits<DWORD>::max())) {
+        return std::unexpected(error(DebugErrorCode::invalid_argument, "debug bridge path is invalid"));
+    }
+    const std::size_t byte_count = (wide_path.size() + 1U) * sizeof(wchar_t);
+    void* remote_path = VirtualAllocEx(
+        handle_.get(), nullptr, byte_count, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE
+    );
+    if (remote_path == nullptr) {
+        return std::unexpected(error(DebugErrorCode::io_error, "debug bridge allocation failed"));
+    }
+    RemoteAllocation allocation{handle_.get(), remote_path};
+    SIZE_T bytes_written = 0U;
+    if (!WriteProcessMemory(handle_.get(), remote_path, wide_path.c_str(), byte_count, &bytes_written) ||
+        bytes_written != byte_count) {
+        return std::unexpected(error(DebugErrorCode::io_error, "debug bridge path write failed"));
+    }
+    const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    const auto loader = kernel32 == nullptr ? nullptr : GetProcAddress(kernel32, "LoadLibraryW");
+    if (loader == nullptr) {
+        return std::unexpected(error(DebugErrorCode::invalid_state, "system loader is unavailable"));
+    }
+    UniqueHandle thread{CreateRemoteThread(
+        handle_.get(), nullptr, 0U, reinterpret_cast<LPTHREAD_START_ROUTINE>(loader), remote_path, 0U, nullptr
+    )};
+    if (!thread) {
+        return std::unexpected(error(DebugErrorCode::io_error, "debug bridge loader thread could not be created"));
+    }
+    // The bridge is first-party and its DllMain must be constant-time. Waiting
+    // here prevents releasing the remote UTF-16 buffer while LoadLibraryW is
+    // still consuming it; no target memory is left behind on success.
+    if (WaitForSingleObject(thread.get(), INFINITE) != WAIT_OBJECT_0) {
+        return std::unexpected(error(DebugErrorCode::io_error, "debug bridge loader thread did not complete"));
+    }
+    auto injected_bridge = find_loaded_bridge();
+    if (!injected_bridge) {
+        return std::unexpected(injected_bridge.error());
+    }
+    if (*injected_bridge) {
+        return **injected_bridge;
+    }
+    return std::unexpected(error(DebugErrorCode::io_error, "debug bridge was not loaded by the target"));
 }
 
 // Implements the argument-quoting rules documented by Microsoft for
@@ -844,6 +957,9 @@ domain::Result<std::unique_ptr<domain::ProcessSession>> NativeProcessMemoryProvi
     if (access == AccessMode::read_write) {
         rights |= PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
     }
+    if (allow_debug_bridge_injection_) {
+        rights |= PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD;
+    }
     UniqueHandle handle{OpenProcess(rights, FALSE, pid)};
     if (!handle) {
         return std::unexpected(error(DebugErrorCode::access_denied, "OpenProcess failed"));
@@ -854,7 +970,9 @@ domain::Result<std::unique_ptr<domain::ProcessSession>> NativeProcessMemoryProvi
         name = std::filesystem::path(*path).filename().string();
     }
     return std::unique_ptr<ProcessSession>{
-        std::make_unique<WindowsProcessSession>(pid, std::move(name), access, std::move(handle))
+        std::make_unique<WindowsProcessSession>(
+            pid, std::move(name), access, std::move(handle), allow_debug_bridge_injection_
+        )
     };
 #elif defined(__linux__)
     const std::filesystem::path root = "/proc/" + std::to_string(pid);

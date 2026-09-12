@@ -26,6 +26,19 @@ struct OutputChunk {
     bool process_alive{true};
 };
 
+// Describes an operator-approved Argos debug bridge. It intentionally carries
+// only a DLL path: arbitrary exports, arguments and code bytes are not a part
+// of the domain contract.
+struct DebugBridgeSpec {
+    std::string path;
+};
+
+struct InjectedDebugBridge {
+    ProcessId pid{};
+    std::string name;
+    Address module_base{};
+};
+
 class ProcessSession {
 public:
     virtual ~ProcessSession() = default;
@@ -46,6 +59,18 @@ public:
 
     [[nodiscard]] virtual Result<std::vector<MemoryRegion>> regions() const = 0;
     [[nodiscard]] virtual Result<std::vector<ModuleInfo>> modules() const = 0;
+
+    // Platforms and synthetic test sessions that do not implement the
+    // explicitly-gated bridge return unsupported. This keeps a Win32 remote
+    // loading mechanism out of the domain and avoids making injection an
+    // implicit capability of every ProcessSession implementation.
+    [[nodiscard]] virtual Result<InjectedDebugBridge> inject_debug_bridge(
+        const DebugBridgeSpec&
+    ) {
+        return std::unexpected(DebugError{
+            DebugErrorCode::unsupported, "debug bridge injection is not supported on this platform"
+        });
+    }
 };
 
 // A ProcessSession for a process the MCP itself started with launch(). In

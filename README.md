@@ -4,7 +4,7 @@ Servidor MCP local em C++23 para depuração autorizada de memória em runtime. 
 
 ## Escopo de segurança
 
-Use somente em processos próprios ou em sistemas para os quais exista autorização explícita de depuração. O servidor não implementa injeção de código, DLL injection, criação de threads remotas, alteração de proteção de páginas, bypass de anticheat/EDR, ocultação, captura de credenciais ou elevação de privilégio.
+Use somente em processos próprios ou em sistemas para os quais exista autorização explícita de depuração. Por padrão, o servidor não implementa injeção. No Windows, a bridge de depuração Argos é uma exceção opt-in e limitada a DLLs explicitamente aprovadas pelo operador; ela não aceita código, exports ou argumentos arbitrários. O servidor não oferece alteração de proteção de páginas, bypass de anticheat/EDR, ocultação, captura de credenciais ou elevação de privilégio.
 
 Por padrão:
 
@@ -46,6 +46,7 @@ assinaturas permanecem candidatos e não são promovidos a layout confirmado.
 | `memory_debug.resolve_pointer_chain` | Resolve pointer chains de 32 ou 64 bits. |
 | `memory_debug.write` | Escreve bytes somente quando habilitado e confirmado. |
 | `memory_debug.launch` / `read_output` | Inicia um executável escolhido pelo operador e captura `stdout`/`stderr`. Desligado por padrão (`ARGOS_MCP_ALLOW_LAUNCH`). |
+| `memory_debug.debug_bridge_inject` | Carrega uma DLL bridge do próprio Argos, explicitamente aprovada, em uma sessão autorizada do Windows. Desligada por padrão (`ARGOS_MCP_ALLOW_DEBUG_BRIDGE_INJECTION`). Não aceita código, exports ou argumentos arbitrários. |
 | `memory_debug.scan_start` | Inicia `scan_exact`/`strings`/`scan_pointers_to`/`scan_pointer_chains`/`scan_first`/`scan_next` como job em background que sobrevive à chamada MCP ([Spec 0008](docs/specs/0008-async-scan-operations.md)). |
 | `memory_debug.job_status` | Consulta estado, progresso monotônico e motivo de término de um job em background. |
 | `memory_debug.job_results` | Pagina o resultado imutável de um job terminal. |
@@ -225,6 +226,8 @@ Depois disso, o `attach` deve solicitar `access: "read_write"`, e cada chamada d
 | `ARGOS_MCP_MAX_SCAN_SESSION_CANDIDATES` | 262.144 | 4.194.304 |
 | `ARGOS_MCP_MAX_SCAN_SESSIONS_PER_SESSION` | 4 | 64 |
 | `ARGOS_MCP_ALLOW_LAUNCH` | `0` | booleano |
+| `ARGOS_MCP_ALLOW_DEBUG_BRIDGE_INJECTION` | `0` | booleano |
+| `ARGOS_MCP_DEBUG_BRIDGE_ALLOWED_PATHS` | (vazio = nenhuma) | lista de caminhos absolutos de DLL separados por `;` |
 | `ARGOS_MCP_LAUNCH_ALLOWED_DIRS` | (vazio = sem allowlist) | lista separada por `;` |
 | `ARGOS_MCP_MAX_LAUNCHED_PROCESSES` | 4 | 64 |
 | `ARGOS_MCP_MAX_CAPTURED_OUTPUT_BYTES` | 1 MiB | 64 MiB |
@@ -282,6 +285,21 @@ corresponder, e as invariantes completas do runtime ainda são validadas.
 `ARGOS_MCP_ALLOW_FOREIGN_USER=1` remove somente a validação interna de proprietário. Ele não contorna permissões do sistema operacional e deve ser usado apenas em ambientes de laboratório controlados.
 
 `ARGOS_MCP_ALLOW_LAUNCH=1` habilita `memory_debug.launch` (o servidor cria um processo em vez de apenas ler um já existente). Desligado por padrão; útil apenas para alvos de teste/desenvolvimento controlados pelo próprio operador, não para anexar a processos de terceiros já em execução. Ver o threat model para os controles completos.
+
+## Habilitar bridge de depuração no Windows
+
+`memory_debug.debug_bridge_inject` é uma capacidade separada de escrita de
+memória. Ela só aparece quando o servidor inicia com os dois controles abaixo:
+
+```powershell
+$env:ARGOS_MCP_ALLOW_DEBUG_BRIDGE_INJECTION = "1"
+$env:ARGOS_MCP_DEBUG_BRIDGE_ALLOWED_PATHS = "C:\\caminho\\argos_debug_bridge.dll"
+```
+
+A tool exige `authorized: true` em cada chamada, e o caminho deve ser
+exatamente um arquivo regular listado na allowlist após canonicalização. A
+bridge inicial distribuída pelo projeto apenas comprova carregamento; ela não
+instala hooks nem recebe comandos. Consulte [ADR-0021](docs/adr/0021-opt-in-debug-bridge-injection.md) antes de habilitar a capacidade.
 
 As variáveis `ARGOS_MCP_MAX_ASYNC_*` e `ARGOS_MCP_ASYNC_*` limitam `AnalysisJobManager` (jobs em background da Spec 0008): fila global/por sessão, pool de workers, orçamento de bytes e deadline por job, itens de resultado por página e TTL de resultado/tombstone. Nenhum valor pedido pelo cliente em `execution` ultrapassa esses limites — apenas reduz. `ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES` é um limite **agregado**, somado sobre os resultados retidos de todos os jobs simultaneamente (não por job): a contabilidade inclui o conteúdo alocado no heap de cada match (texto de `strings`, offsets de `scan_pointer_chains`), não só `size() * sizeof(T)`. Quando um job termina e a retenção de seus resultados estouraria o agregado, o job mantém o quanto couber (a cobertura do scan pode continuar `coverage_complete: true`) e o excedente é descartado com `termination.truncated: true`, `results_complete: false` e `truncation_reasons` incluindo `"retained_bytes_budget"` — nunca um descarte silencioso. `job_release`, a expiração do TTL de resultados e `detach_session` devolvem os bytes ao orçamento agregado.
 

@@ -49,6 +49,12 @@ struct SecurityPolicy {
     std::size_t max_launched_processes{4U};
     std::size_t max_captured_output_bytes{1U * 1024U * 1024U};
 
+    // ADR-0021: opt-in, first-party debug bridge. The server never treats a
+    // caller-supplied DLL as approved without both this gate and a canonical
+    // allowlist match.
+    bool allow_debug_bridge_injection{false};
+    std::vector<std::string> debug_bridge_allowed_paths;
+
     // Spec 0008 -- async scan jobs (AnalysisJobManager). Every limit here is a
     // hard cap the client cannot raise: a requested execution limit is only
     // ever reduced to fit inside these, never extended.
@@ -126,6 +132,11 @@ struct SecurityPolicy {
     [[nodiscard]] domain::Result<void> authorize_launch(
         bool user_acknowledged,
         std::string_view executable_path
+    ) const;
+
+    [[nodiscard]] domain::Result<void> authorize_debug_bridge_injection(
+        bool user_acknowledged,
+        std::string_view bridge_path
     ) const;
 
     // Clamps a client-requested async job byte_budget/deadline down to the

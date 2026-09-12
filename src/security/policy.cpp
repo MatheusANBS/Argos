@@ -229,6 +229,8 @@ SecurityPolicy SecurityPolicy::from_environment() {
     policy.max_captured_output_bytes = env_size(
         "ARGOS_MCP_MAX_CAPTURED_OUTPUT_BYTES", 1U * 1024U * 1024U, 64U * 1024U * 1024U
     );
+    policy.allow_debug_bridge_injection = env_flag("ARGOS_MCP_ALLOW_DEBUG_BRIDGE_INJECTION");
+    policy.debug_bridge_allowed_paths = env_string_list("ARGOS_MCP_DEBUG_BRIDGE_ALLOWED_PATHS");
     policy.max_async_jobs_total = env_size("ARGOS_MCP_MAX_ASYNC_JOBS_TOTAL", 64U, 1024U);
     policy.max_async_jobs_per_session = env_size("ARGOS_MCP_MAX_ASYNC_JOBS_PER_SESSION", 8U, 128U);
     policy.max_async_queue_depth = env_size("ARGOS_MCP_MAX_ASYNC_QUEUE_DEPTH", 32U, 512U);
@@ -443,6 +445,54 @@ domain::Result<void> SecurityPolicy::authorize_launch(
         }
     }
     return {};
+}
+
+domain::Result<void> SecurityPolicy::authorize_debug_bridge_injection(
+    const bool user_acknowledged,
+    const std::string_view bridge_path
+) const {
+    if (!allow_debug_bridge_injection) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::access_denied,
+            "debug bridge injection is disabled; set ARGOS_MCP_ALLOW_DEBUG_BRIDGE_INJECTION=1 before starting the server"
+        ));
+    }
+    if (!user_acknowledged) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::unauthorized,
+            "debug bridge injection requires explicit confirmation that the target is authorized"
+        ));
+    }
+    if (debug_bridge_allowed_paths.empty()) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::access_denied,
+            "debug bridge injection requires ARGOS_MCP_DEBUG_BRIDGE_ALLOWED_PATHS"
+        ));
+    }
+    const std::filesystem::path requested{std::string{bridge_path}};
+    if (!requested.is_absolute()) {
+        return std::unexpected(error(domain::DebugErrorCode::invalid_argument, "debug bridge path must be absolute"));
+    }
+    std::error_code path_error;
+    const auto canonical_requested = std::filesystem::weakly_canonical(requested, path_error);
+    if (path_error || !std::filesystem::is_regular_file(canonical_requested, path_error) || path_error) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::not_found, "debug bridge does not exist or is not a regular file"
+        ));
+    }
+    for (const auto& configured : debug_bridge_allowed_paths) {
+        std::error_code allowed_error;
+        const auto canonical_allowed = std::filesystem::weakly_canonical(
+            std::filesystem::path{configured}, allowed_error
+        );
+        if (!allowed_error && canonical_allowed == canonical_requested) {
+            return {};
+        }
+    }
+    return std::unexpected(error(
+        domain::DebugErrorCode::access_denied,
+        "debug bridge is not present in ARGOS_MCP_DEBUG_BRIDGE_ALLOWED_PATHS"
+    ));
 }
 
 domain::Result<std::size_t> SecurityPolicy::clamp_async_byte_budget(

@@ -31,7 +31,7 @@ int main() {
         const auto policy = argos::security::SecurityPolicy::from_environment();
         argos::observability::Logger logger{argos::observability::log_level_from_environment()};
         auto provider = std::make_unique<argos::infrastructure::NativeProcessMemoryProvider>(
-            policy.allow_foreign_user, policy.max_captured_output_bytes
+            policy.allow_foreign_user, policy.max_captured_output_bytes, policy.allow_debug_bridge_injection
         );
         auto metadata_provider = std::make_unique<argos::infrastructure::PdbTypeMetadataProvider>();
         argos::application::MemoryDebugService service{

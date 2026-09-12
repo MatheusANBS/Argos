@@ -1041,6 +1041,20 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
         stateful_annotations()
     });
 
+    if (service_.policy().allow_debug_bridge_injection &&
+        !service_.policy().debug_bridge_allowed_paths.empty()) {
+        tools.push_back(ToolDefinition{
+            "memory_debug.debug_bridge_inject",
+            "Load an operator-approved Argos debug bridge into an explicitly authorized session. Disabled unless the server was started with ARGOS_MCP_ALLOW_DEBUG_BRIDGE_INJECTION=1. It accepts no arbitrary code, exports, or payload arguments.",
+            object_schema({
+                {"session_id", session},
+                {"bridge_path", string_schema("Absolute path exactly listed in ARGOS_MCP_DEBUG_BRIDGE_ALLOWED_PATHS.")},
+                {"authorized", boolean_schema()}
+            }, {"session_id", "bridge_path", "authorized"}),
+            stateful_annotations()
+        });
+    }
+
     tools.push_back(ToolDefinition{
         "memory_debug.read_output",
         "Poll captured stdout/stderr from a session created by memory_debug.launch.",
@@ -1697,6 +1711,22 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         auto result = service_.launch(spec, access, *authorized);
         if (!result) return domain_error(result.error());
         return success(session_to_json(*result));
+    }
+
+    if (name == "memory_debug.debug_bridge_inject") {
+        auto session = session_arg(arguments);
+        auto bridge_path = string_arg(arguments, "bridge_path", true);
+        auto authorized = bool_arg(arguments, "authorized", true);
+        if (!session) return input_error(session.error().message);
+        if (!bridge_path) return input_error(bridge_path.error().message);
+        if (!authorized) return input_error(authorized.error().message);
+        auto result = service_.inject_debug_bridge(*session, *bridge_path, *authorized);
+        if (!result) return domain_error(result.error());
+        return success(Value::object({
+            {"pid", static_cast<std::int64_t>(result->pid)},
+            {"bridge_name", result->name},
+            {"module_base", hex_address(result->module_base)}
+        }));
     }
 
     if (name == "memory_debug.read_output") {

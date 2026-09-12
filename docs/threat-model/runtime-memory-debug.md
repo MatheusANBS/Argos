@@ -8,6 +8,8 @@
 - integridade do cliente MCP e do host local;
 - processo filho criado pelo MCP (`memory_debug.launch`) e sua saída capturada
   (`stdout`/`stderr`);
+- bridge de depuração Argos, quando injetada explicitamente em uma sessão
+  autorizada (Spec 0013 — implementada no Windows);
 - jobs de análise assíncronos (`AnalysisJobManager`) e os resultados/progresso
   retidos em memória durante seu TTL (Spec 0008 — **implementado**; jobs de
   `pointer_index`/`unreal_runtime` das Specs 0010/0012 permanecem propostos);
@@ -79,7 +81,19 @@ Controles: logs não registram conteúdo de memória, argumentos completos, toke
 
 ### Bypass ou uso ofensivo
 
-Controles de escopo: não há injection, remote thread, mudança de proteção, privilege escalation, stealth, bypass de EDR/anticheat ou coleta de credenciais.
+Vetor: um cliente tenta usar o MCP como injector genérico, carregar uma DLL
+fora do controle do operador, reutilizar uma sessão sem autorização ou obter
+detalhes nativos úteis para evasão.
+
+Controles: a Spec 0013 nasce desabilitada; exige gate de ambiente, sessão
+autorizada, confirmação por chamada e DLL canônica pertencente a uma allowlist
+do operador. A API não recebe shellcode, export, argumentos ou bytes de
+payload. O adapter Windows libera todo handle e memória remota por RAII e
+retorna erros tipados sem `GetLastError`, caminhos externos ou conteúdo do
+alvo. Não há elevação, stealth, bypass de EDR/anticheat, mudança de proteção
+de páginas nem suporte a processos de outro usuário por padrão. A primeira
+bridge não instala hooks nem expõe execução de comandos; capacidades dentro do
+alvo exigem ADR e protocolo próprios.
 
 ### Corrupção do protocolo
 
