@@ -13,7 +13,7 @@ descobrível sem already saber o truque.
 
 ## Decisão
 
-Adicionar `memory_debug.scan_pointers_to`, implementada em
+Adicionar `memory_debug_scan_pointers_to`, implementada em
 `MemoryDebugService::scan_pointers_to` como um invólucro fino sobre a mesma
 rotina interna de varredura de `scan_exact`: o serviço codifica
 `target_address` em 4 ou 8 bytes little-endian (conforme `pointer_size`) e

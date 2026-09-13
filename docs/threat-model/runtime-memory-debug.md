@@ -6,7 +6,7 @@
 - handles de processo;
 - dados potencialmente sensíveis presentes na memória;
 - integridade do cliente MCP e do host local;
-- processo filho criado pelo MCP (`memory_debug.launch`) e sua saída capturada
+- processo filho criado pelo MCP (`memory_debug_launch`) e sua saída capturada
   (`stdout`/`stderr`);
 - bridge de depuração Argos, quando injetada explicitamente em uma sessão
   autorizada (Spec 0013 — implementada no Windows);
@@ -63,13 +63,23 @@ Controles: confirmação explícita, mesmo usuário por padrão, permissões do 
 
 Controles: limite por leitura, limite de itens em batch, orçamento total de scan, limite de resultados e chunks de 64 KiB. `scan_pointer_chains` reutiliza o mesmo orçamento de bytes compartilhado e adiciona tetos de profundidade e fan-out (`ARGOS_MCP_MAX_POINTER_CHAIN_DEPTH`/`ARGOS_MCP_MAX_POINTER_CHAIN_FANOUT`). A fronteira inteira é comparada em uma única passagem por profundidade, limitando o I/O a `O(max_depth)` passagens; `visited` previne ciclos.
 
-`memory_debug.regions` aplica filtro e paginação no servidor, e `memory_debug.address_space_summary` devolve apenas agregados de tamanho e contagem. Ambos **reduzem** o volume trafegado: substituem o despejo integral da lista de regiões — dezenas de milhares de entradas num alvo real — por um recorte ou por um resumo de tamanho constante. Nenhum dos dois expõe conteúdo de memória, apenas metadados de mapeamento que `regions` já expunha.
+`memory_debug_regions` aplica filtro e paginação no servidor, e `memory_debug_address_space_summary` devolve apenas agregados de tamanho e contagem. Ambos **reduzem** o volume trafegado: substituem o despejo integral da lista de regiões — dezenas de milhares de entradas num alvo real — por um recorte ou por um resumo de tamanho constante. Nenhum dos dois expõe conteúdo de memória, apenas metadados de mapeamento que `regions` já expunha.
 
 O bloco `coverage` de `scan_first` reporta apenas contagens de bytes e regiões varridas, sem conteúdo. Ele existe para evitar uma falha de interpretação com consequência prática: sem ele, um resultado vazio por orçamento esgotado é indistinguível de "o valor não existe", o que leva o cliente a repetir varreduras desnecessárias — custo que este mesmo controle de DoS pretende limitar.
 
 ### Escrita acidental
 
-Controles: escrita desabilitada no startup, sessão read-write explícita, confirmação fixa por chamada e limite de bytes.
+Controles: sessão read-write explícita, confirmação fixa por chamada
+(`AUTHORIZED_DEBUG_WRITE`) e limite de bytes.
+
+**Mudança de postura:** a escrita passou a ser habilitada por padrão no
+startup, por decisão explícita do dono do repositório. O gate
+`ARGOS_MCP_ALLOW_WRITE=0` restaura o comportamento anterior. Isso remove uma
+das quatro barreiras: a partir daqui, qualquer sessão que peça `read_write` e
+forneça `authorized: true` obtém acesso de escrita, e o que separa um erro de
+uma escrita real passa a ser apenas a frase de confirmação por chamada e o
+limite de bytes. Em troca, o servidor deixa de exigir reinício para operações
+de escrita autorizadas.
 
 ### Overflow de endereço
 
@@ -95,12 +105,99 @@ de páginas nem suporte a processos de outro usuário por padrão. A primeira
 bridge não instala hooks nem expõe execução de comandos; capacidades dentro do
 alvo exigem ADR e protocolo próprios.
 
-### Instrumentação Santa Monica/Kinetica proposta (Spec 0014)
+### Instrumentação Santa Monica/Kinetica em implementação (Spec 0014)
+
+Estado atual: seis tools de reflexão somente leitura existem, atrás de gate
+próprio e de uma origem configurada pelo operador; um perfil com raiz de
+recursos acrescenta a leitura de inventário e uma escrita direta de saldo
+(seção própria abaixo). Com perfil de build, o servidor **lê a
+memória do jogo** pela sessão de depuração autorizada e publica tipos,
+herança, campos, enums/valores e funções SLI descritivas; sem perfil, conversa com um peer sintético controlado. Continua sem
+execução no alvo, sem injeção e sem bridge dentro do processo. A leitura de
+inventário segue ponteiros de heap a partir de uma raiz do módulo, e a única
+escrita é a de saldo de recursos, ambas descritas abaixo. No domínio existem a identidade de perfil, a porta de leitura e a
+validação de catálogos normalizados; na infraestrutura, o codec da ADR-0023, o
+handshake da ADR-0024, o canal da ADR-0025 e o reader nativo da ADR-0026. O codec decodifica bytes
+não confiáveis com limites verificados antes de alocar (frame, budget agregado,
+registros, strings, contagem de módulos), rejeita kind/versão/reservado/tag
+desconhecidos, exige request e sequência esperados, trata EOF prematuro como
+erro, fecha o stream na primeira falha e reduz erros do transporte a razões
+fixas. O handshake da ADR-0024 acrescenta autenticação mútua por desafio-resposta
+sobre segredo efêmero de sessão: a posse do segredo é a prova, e identidade
+declarada, PID, nome de pipe ou versão anunciada não autenticam nada. O MAC é
+HMAC-SHA-256 do provedor do sistema, sem primitiva escrita aqui e sem fallback
+quando o provedor falta; o segredo tem armazenamento fixo e é apagado no move
+e na destruição. O transcript vincula versões, capacidades, nonces, digests,
+instância de processo, época e request, com rótulo distinto por direção, então
+uma prova não serve para a outra direção, outro nonce ou outra sessão. A
+comparação é em tempo constante, a identidade só é comparada depois da prova,
+a resposta de divergência é única, e o motivo de reject no wire é grosseiro
+de propósito. Capacidades vêm de conjunto fechado e o concedido é subconjunto
+do oferecido e do solicitado.
+
+O canal da ADR-0025 fecha o transporte para um alvo sintético: named pipe local
+de instância única, criado antes de existir peer, com `FILE_FLAG_FIRST_PIPE_INSTANCE`
+contra pré-criação, `PIPE_REJECT_REMOTE_CLIENTS` contra acesso remoto e DACL
+protegida com apenas o SID do usuário atual — a garantia de mesmo usuário vem
+do kernel na abertura, não de uma comparação posterior que já teria perdido a
+corrida. O PID do par é conferido contra o processo esperado, o que vincula a
+conexão sem autenticar. O segredo de 32 bytes vem do CSPRNG e é entregue pela
+stdin do filho, nunca por argv, ambiente, nome de pipe, arquivo ou log; o
+executável do peer é caminho absoluto configurado pelo operador, jamais vindo
+de uma requisição. Todo I/O tem deadline e cancelamento em fatias, e o
+encerramento cancela I/O pendente.
+
+Sobre isso, o manager aplica quotas por dono e globais, TTL, release idempotente
+por janela e um único dono vivo por instância de processo e época; as seis tools
+MCP são somente leitura, ausentes sem gate e peer, com token de paginação opaco
+vinculado a sessão, contexto, época, filtro e tool. Ids de metadados são strings
+opacas, nunca endereços, e nenhuma entrada SLI é anunciada como invocável.
+
+Com perfil de build (ADR-0026) existe uma segunda origem, que não usa canal
+nenhum: o servidor lê a tabela de tipos direto da sessão autorizada, somente
+leitura. O domínio separa as duas origens e recusa que uma se apresente como a
+outra: perfil de bridge precisa carregar identidade de bridge, perfil nativo não
+pode carregar nenhuma, e o byte de origem viaja no enquadramento. O perfil é
+server-side; o cliente não o fornece, não o escolhe e não o lê. Antes de confiar
+em qualquer RVA, o reader exige o módulo carregado com o tamanho declarado, e
+valida cada registro individualmente, pulando e contando o que não passa. O
+digest do módulo é afirmação do operador sobre o arquivo, não atestação da
+imagem carregada — por isso o snapshot é sempre `validated_best_effort` e
+`coverage_complete` é sempre falso.
+
+O reader da ADR-0027 confina todas as leituras ao módulo, incluindo arrays de
+nomes/valores de enum; usa subtração para validar bounds antes de somar endereços.
+Índices temporários são limitados antes da alocação, há teto de 64 MiB lidos e
+deadline cooperativo de até 5 s. Falhas de I/O e cancelamento encerram a leitura.
+Nunca segue o array de membros no heap nem executa callbacks. Campos próprios
+são selecionados pela faixa do dono e pela ausência de atributo externo;
+referências presentes inválidas não viram metadados aparentemente válidos.
+Mapas sem tamanho comprovado são omitidos. As faixas opcionais e o digest do
+módulo participam da identidade do perfil; a família antiga é recusada para
+evitar reinterpretar o enquadramento anterior.
+
+O que continua fora: o peer é sintético e prova o protocolo, não compatibilidade
+com uma build do jogo; tabelas auxiliares de coleções e propriedades SLI não
+são interpretadas pelo caminho nativo. Não há bridge injetada falando o protocolo, validação da
+imagem carregada, heartbeat, fila ou dispatcher. O canal não protege contra quem
+já pode depurar o servidor — esse acesso lê o segredo da memória —, a tag prova
+posse do segredo e não que a imagem carregada seja o artefato aprovado, e o
+frescor entre conexões depende de segredo e nonce novos por sessão. O
+catálogo valida limites de registros/strings/capacidades, referências, herança,
+bounds e identidade antes/depois; normaliza erros do reader para razões fixas.
+Não deriva autenticação de campos recebidos nem promove best-effort a stable.
+A futura infraestrutura ainda deve impor limites antes de alocar/decodificar,
+autenticar peers e validar a imagem carregada. O custo temporário dos índices
+é limitado pelo teto de registros; quota agregada entre catálogos depende do
+manager futuro. Os controles abaixo são requisitos para os próximos incrementos.
 
 Vetor: um cliente habilita uma bridge de modding e tenta executá-la contra
 build sem perfil, trocar o perfil/bridge entre chamadas, injetar fonte Lua ou
 argumentos SLI desproporcionais, chamar a engine fora do main thread ou
-corromper inventário/save por uma operação parcialmente interrompida.
+corromper inventário/save por uma operação parcialmente interrompida. Outros
+vetores incluem peer IPC falso, replay/reconexão, PID reutilizado, duas sessões
+mutando o mesmo alvo, retry após ACK perdido e escape Lua por callbacks ou
+referências ao ambiente global.
 
 Controles exigidos antes da implementação: gates de startup independentes para
 runtime, carga antecipada, gameplay e Lua; perfil server-side vinculado à
@@ -108,22 +205,57 @@ identidade completa do módulo; bridge e protocolo versionados; sessão
 autorizada e confirmação explícita para toda ação mutável; ausência completa
 das tools quando os gates estiverem desligados; e nenhum endereço, RVA,
 assinatura, DLL, export ou payload nativo recebido do cliente.
+Discover não carrega bridge nem inicia jogo implicitamente; attach preserva os
+gates da Spec 0013, cuja implementação atual só prova presença. Early load
+exige preparação do operador; automatizá-lo requer contrato da Spec 0005.
+
+O novo canal exige ACL local, autenticação dos peers, bootstrap protegido com
+segredo efêmero, identidade de processo/criação, digest de perfil/artefato,
+época e sequência contra replay. Versão declarada e nome do endpoint não
+autenticam a bridge. Comprimento/opcode são validados antes da alocação e
+todos os waits têm deadline. A imagem carregada é validada além do hash em
+disco. Transporte/wire format concretos e testes negativos são condição de
+avanço da etapa 1 da Spec 0014.
 
 RTTI, SLI e Lua só são usados depois de validar ranges, limites, alinhamento,
-ponteiros, strings, referências cruzadas e estabilidade entre leituras. A
-bridge serializa comandos numa fila limitada e os executa no tick/main thread
-do perfil; uma transação em commit termina observavelmente em vez de ser
-interrompida. Handles são opacos e por sessão, payload Lua possui orçamento de
-bytes/instruções/tempo/saída, e logs redigem scripts, bytes, saves, paths,
-assinaturas, RVAs e erros nativos.
+ponteiros, strings e referências cruzadas. Releitura de cabeçalhos é
+best-effort; snapshot `stable` requer mecanismo de consistência comprovado,
+sem promover ausência de mudança observada a atomicidade. A bridge serializa
+engine/Lua numa fila limitada com um owner por processo/época, e os executa no
+tick/main thread do perfil. Nenhum comando de engine roda no loader lock.
 
-Risco residual: Lua e invocação SLI constituem modding de propósito geral
-dentro da build autorizada; seu uso tem impacto equivalente a carregar um mod
-local naquele jogo. A capacidade não é exposta como injector genérico e não
+Mutações exigem allowlist de função/efeitos, revalidação no safe point e chave
+de idempotência com deduplicação também na bridge. Retorno perdido após efeito
+gera `outcome_unknown`, sem retry automático. Status por chave recupera a
+operação cuja resposta inicial se perdeu; release mantém tombstone limitado
+pelo TTL. Não há exactly-once entre crashes nem rollback implícito. Resultado
+em memória e persistência de save são distintos. Instâncias/handles são
+vinculados à geração; troca de save/mundo invalida os afetados. Resultado incerto
+bloqueia mutações até quiescência e reconciliação; leitura com callback ainda
+ativo, release ou expiração do registro não libera o alvo.
+
+Lua exige ABI, ambiente de capacidades e cleanup verificados, sem acesso
+transitivo a shell/filesystem/rede/loaders/FFI/debug/registry ou callbacks não
+aprovados. Sem essas provas, a tool permanece indisponível. Payload, memória
+atribuível, instruções e saída têm quotas. Deadline é cooperativo e não
+interrompe callback nativo bloqueado. Release/shutdown fecham admissão sem
+liberar estado usado por callbacks, sem unload e sem encerrar o jogo. Perda
+de heartbeat descarta fila pendente; servidor encerra I/O local com prazo.
+Logs redigem scripts, bytes, saves, paths, tokens, segredos do canal,
+assinaturas, RVAs e erros nativos. Orçamentos também cobrem snapshots, frames,
+filas, resultados e tombstones agregados.
+
+Risco residual: execução no mesmo processo compartilha falhas, memória e
+privilégios do jogo; a bridge não isola um alvo comprometido. Mesmo callbacks
+aprovados podem bloquear o tick, causar efeitos parciais ou corromper save.
+Lua irrestrito exigiria outra decisão de segurança. A capacidade não é exposta
+como injector genérico e não
 inclui bypass de DRM, anticheat, EDR, stealth, elevação ou processos de outro
 usuário. A [Spec 0014](../specs/0014-santa-monica-kinetica-runtime-instrumentation.md)
-permanece proposta até fixtures, testes de main-thread/shutdown e validação
-contra cópia de save demonstrarem as invariantes de persistência.
+está aprovada, com entrega por capacidade: reflexão pode avançar após
+seus testes; gameplay exige também perda de ACK/deduplicação, main-thread e
+shutdown em alvo controlado, além de validação contra cópia de save após
+restart. Lua depende de provas adicionais de isolamento, limites e limpeza.
 
 ### Corrupção do protocolo
 
@@ -131,7 +263,7 @@ Controles: `stdout` reservado; cada frame é drenado e rejeitado acima de 8 MiB 
 
 ### Execução de binário arbitrário escolhido pelo cliente
 
-`memory_debug.launch` é o único ponto do MCP que cria processos em vez de
+`memory_debug_launch` é o único ponto do MCP que cria processos em vez de
 apenas lê-los — uma classe de risco nova. Controles: gate de ambiente
 `ARGOS_MCP_ALLOW_LAUNCH` desligado por padrão (nega antes de qualquer
 tentativa de criação de processo); `authorized: true` explícito por chamada,
@@ -149,7 +281,7 @@ ponta de escrita é herdável, a ponta de leitura do processo pai é marcada
 ADR-0001; texto capturado é saneado para UTF-8 válido antes de entrar em
 qualquer resposta JSON; buffer de captura é limitado e circular
 (`ARGOS_MCP_MAX_CAPTURED_OUTPUT_BYTES`); `ARGOS_MCP_MAX_LAUNCHED_PROCESSES`
-limita processos simultâneos; `terminate` (via `memory_debug.detach`) só é
+limita processos simultâneos; `terminate` (via `memory_debug_detach`) só é
 aceito para sessões `owned` (criadas por `launch`) — uma sessão obtida por
 `attach` a um processo pré-existente nunca pode ser encerrada pelo MCP.
 Permanece proibido: elevação de privilégio, herança de console do MCP, shell
@@ -157,14 +289,46 @@ intermediário. Este recurso não ajuda contra um processo de terceiros já em
 execução — só é útil para alvos de teste/desenvolvimento que o próprio
 operador controla (ver `docs/specs/0000-roadmap-introspeccao-runtime.md`).
 
+### Inventário e escrita de saldo Santa Monica (ADR-0028)
+
+Ativos: integridade do estado do jogo e do save do operador; confidencialidade
+dos endereços do processo.
+
+- **Perfil hostil ou desatualizado.** A raiz vem só da configuração do
+  operador, precisa ser slot de 8 bytes dentro do módulo, e o módulo precisa
+  casar nome e tamanho. A cadeia é validada por invariantes independentes:
+  `ResourcesPerm` concorda com o store em ponteiro e contagem, cada registro
+  liga-se a `Resources[i]`, e o estado pertence a `{2, 3}` e é coerente com a
+  quantidade. Divergência falha sem snapshot parcial; não há busca alternativa.
+- **Estrutura mudando durante a leitura.** Duas passadas estruturais idênticas;
+  nomes lidos pelos ponteiros da primeira passada só valem se todos os bytes de
+  definição continuam iguais.
+- **Exaustão.** 4.096 entradas, nomes de 256 bytes, 8 MiB lidos, deadline de 5 s
+  e cancelamento cooperativo, checados antes de alocar ou ler.
+- **Exposição.** Respostas trazem índice, nome técnico e valores, nunca
+  endereços; erros usam razões fixas; logs não recebem endereços nem saldos.
+- **Escrita indevida.** Mesma autorização de `memory_debug_write` (escrita
+  habilitada e frase por chamada) mais sessão `read_write`; nome exato; só
+  recurso já adquirido e dentro do teto; revalidação de ligação e estado antes
+  da escrita e releitura depois. O cliente não fornece endereço, offset nem
+  bytes.
+- **Corrida com a thread do jogo.** Não há lock do jogo: uma atualização
+  concorrente pode ser perdida ou sobrescrita. Aceito e declarado
+  (`engine_transaction: false`, `verified` pela releitura).
+- **Semântica parcial.** A escrita não dispara componentes, telemetria nem
+  salvamento, e um checkpoint pode revertê-la. Documentado na própria tool.
+
+Risco residual: o layout vem de correlação confirmada por disassembly nesta
+build, não de símbolo; outra build exige novo perfil e nova evidência.
+
 ## Ameaças e controles — capacidades propostas (Specs 0008–0012)
 
 Esta seção foi escrita como gate textual pré-implementação (exigido pela
 ADR-0012 antes da Spec 0008, e pelas ADR-0017/0018/0019 antes das Specs
 0009–0012). **As Specs 0008, 0011 e 0012 saíram desse estado:**
 `AnalysisJobManager` e as cinco tools de job (Spec 0008) estão implementadas
-e expostas em `README.md`, assim como `memory_debug.inspect_address` (Spec
-0011) e as tools `memory_debug.unreal_runtime_*` (Spec 0012) — ver as seções
+e expostas em `README.md`, assim como `memory_debug_inspect_address` (Spec
+0011) e as tools `memory_debug_unreal_runtime_*` (Spec 0012) — ver as seções
 "Inspeção derivada de endereço" e "Reflexão Unreal em runtime" abaixo para a
 descrição das mitigações efetivamente implementadas. As análises das
 subseções "Spec 0008", "Spec 0011" e "Spec 0012" abaixo permanecem válidas
@@ -411,7 +575,7 @@ que fazer com uma sequência de bytes que satisfaz o comprimento declarado
 porém não é UTF-8/UTF-16 válido — por exemplo, memória corrompida ou um
 processo-alvo adversarial que grava lixo binário exatamente no formato de
 comprimento esperado. O threat model atual já exige, para
-`memory_debug.launch`, que "texto capturado é saneado para UTF-8 válido
+`memory_debug_launch`, que "texto capturado é saneado para UTF-8 válido
 antes de entrar em qualquer resposta JSON"; a Spec 0012 não repete essa
 exigência para nomes Unreal. Sem ela, bytes arbitrários do alvo poderiam
 propagar para o payload JSON.
@@ -522,7 +686,7 @@ resolvido só porque a spec correspondente existe:
    baixa resolução, a defesa central contra PID reuse se enfraquece sem que
    a spec preveja fallback.
 6. **Sanitização de nomes Unreal decodificados** (Spec 0012): ao contrário
-   de `memory_debug.launch`, a spec não exige explicitamente saneamento
+   de `memory_debug_launch`, a spec não exige explicitamente saneamento
    para UTF-8 válido de `object_name`/`class_name`/nomes de propriedade
    antes de entrarem na resposta JSON.
 7. **Teste de contrato ausente para `signature_candidate` × `confidence:
@@ -532,7 +696,7 @@ resolvido só porque a spec correspondente existe:
 
 ## Inspeção derivada de endereço
 
-`memory_debug.inspect_address` é somente leitura e substitui um fluxo que hoje
+`memory_debug_inspect_address` é somente leitura e substitui um fluxo que hoje
 transfere bytes crus por metadados derivados pequenos — uma **redução** de
 exposição, não um aumento. Ela lê apenas regiões marcadas como legíveis, nunca
 dereferencia uma função da possível vtable e valida `address + size`, a
@@ -553,6 +717,27 @@ vinculado a sessão, alvo, largura de ponteiro e filtros. Ele não atravessa
 sessões nem consultas, e um servidor reiniciado recusa continuações antigas em
 vez de retomar uma varredura sobre um espaço de endereçamento que já não existe.
 Endereços, bytes, nomes de módulo/região, `session_id`, cursores e tokens não
+entram no log.
+
+## Desmontador e referências de código (ADR-0029)
+
+`memory_debug_disassemble` e `memory_debug_find_code_references` são somente
+leitura: decodificam bytes que a sessão já pode ler pelos mesmos controles de
+`read`/`inspect_address`. Não escrevem, não instalam hook, não criam thread nem
+executam código; não têm gate próprio porque não ampliam a superfície de
+autorização — só interpretam bytes legíveis. Alvos de branch/RIP-relativo são
+resolvidos por cálculo, sem dereferenciar o destino.
+
+Surge uma superfície de *parsing*: o decodificador (Zydis, vendorizado e fixado
+por versão) processa bytes controlados pelo processo-alvo. A mitigação é dupla:
+Zydis é um decodificador maduro, e a varredura trata byte indecodificável como
+"avança um byte", nunca como erro fatal ou leitura fora de limite. Toda varredura
+é limitada antes de qualquer leitura por `byte_budget` e `result_limit` da policy,
+lê em blocos que não cruzam o fim do intervalo elegível e devolve `coverage`: uma
+lista de hits vazia só é conclusiva com `coverage.complete: true`. A varredura
+linear pode decodificar preenchimento entre funções, então um hit é declarado
+como evidência de referência, não prova de limite de função — o mesmo cuidado
+epistemológico da inspeção de endereço. Endereços, bytes e texto desmontado não
 entram no log.
 
 ## Reflexão Unreal em runtime

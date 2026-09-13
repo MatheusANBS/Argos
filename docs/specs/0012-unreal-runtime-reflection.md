@@ -45,8 +45,8 @@ classes e propriedades que o runtime Unreal mantém em `GUObjectArray`,
 `FNamePool`, `UClass`/`UStruct` e `FProperty`, mesmo quando o PDB da build não
 está disponível.
 
-A capacidade complementa — não substitui — `memory_debug.unreal_type` e
-`memory_debug.unreal_reflection`. O caminho PDB continua sendo a fonte mais
+A capacidade complementa — não substitui — `memory_debug_unreal_type` e
+`memory_debug_unreal_reflection`. O caminho PDB continua sendo a fonte mais
 forte para layout nativo; o caminho runtime só reporta o que um perfil
 suportado e validações estruturais conseguirem demonstrar.
 
@@ -189,10 +189,10 @@ e variantes fechadas `UnrealRuntimeProgress`/`UnrealRuntimeJobResult` ao
 contrato da Spec 0008. Starts específicos devolvem `job_id`; status, paginação,
 cancelamento e liberação usam exclusivamente:
 
-- `memory_debug.job_status`;
-- `memory_debug.job_results`;
-- `memory_debug.job_cancel`;
-- `memory_debug.job_release`.
+- `memory_debug_job_status`;
+- `memory_debug_job_results`;
+- `memory_debug_job_cancel`;
+- `memory_debug_job_release`.
 
 Todos entram no mesmo `AnalysisJobManager`, fila, quotas e pool de
 `std::jthread` usado por scans e pointer-index. Não existe pool, detached thread
@@ -337,7 +337,7 @@ usam limites antes de alocar.
 As tools desta seção são propostas e não devem aparecer na tabela de recursos
 implementados até que código e testes sejam entregues.
 
-### `memory_debug.unreal_runtime_discover`
+### `memory_debug_unreal_runtime_discover`
 
 Inicia sempre um job, inclusive em modo explícito, para manter um único ciclo
 de cancelamento e publicação atômica:
@@ -375,7 +375,7 @@ Resposta imediata:
 }
 ```
 
-O cliente usa `memory_debug.job_status/results/cancel/release` com o mesmo
+O cliente usa `memory_debug_job_status/results/cancel/release` com o mesmo
 `session_id`. O resultado terminal de `job_results` contém o envelope comum e
 o recurso publicado:
 
@@ -417,7 +417,7 @@ candidato válido retorna `not_found`; perfil desconhecido retorna
 `unsupported` com reason `unsupported_profile`; snapshot mutável além do retry
 termina o job `failed/unstable_snapshot` e não publica `runtime_id`.
 
-### `memory_debug.unreal_runtime_classes`
+### `memory_debug_unreal_runtime_classes`
 
 ```json
 {
@@ -433,7 +433,7 @@ Retorna summaries, `next_page_token`, `snapshot_status`, proveniência e
 coverage. O token é opaco, vinculado a runtime/process identity/filtros e
 expira com o contexto. Nunca é apenas um índice confiado do cliente.
 
-### `memory_debug.unreal_runtime_type`
+### `memory_debug_unreal_runtime_type`
 
 ```json
 {
@@ -452,7 +452,7 @@ alternativa exclusiva, `class_name` seleciona uma classe e retorna
 diferencia properties declaradas e herdadas, informa a classe declarante e
 nunca chama uma função do objeto.
 
-### `memory_debug.unreal_runtime_objects`
+### `memory_debug_unreal_runtime_objects`
 
 Enumeração extensa é um job paginado:
 
@@ -469,12 +469,12 @@ Enumeração extensa é um job paginado:
 
 A resposta imediata contém `job_id`, `job_kind: "unreal_runtime"`,
 `operation: "objects"` e `state`. Resultados são paginados por
-`memory_debug.job_results`, contêm apenas summaries — não valores de
+`memory_debug_job_results`, contêm apenas summaries — não valores de
 propriedades — e usam `items/page/termination` da Spec 0008. Progresso inclui
 `slots_visited`, `slots_eligible`, `objects_found`, `objects_stored`, retries e
 contagem de slots instáveis.
 
-### `memory_debug.unreal_runtime_release`
+### `memory_debug_unreal_runtime_release`
 
 ```json
 {"session_id":"…","runtime_id":"…"}

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "argos_mcp/domain/address_inspection.hpp"
+#include "argos_mcp/domain/disassembly.hpp"
 #include "argos_mcp/domain/types.hpp"
 
 #include <cstddef>
@@ -32,8 +33,39 @@ struct UnrealBuildProfile {
 [[nodiscard]] std::expected<std::vector<UnrealBuildProfile>, std::string>
 parse_unreal_build_profiles(std::string_view text);
 
+// Operator-owned location of one engine build's type table. Like the Unreal
+// build profile, it is server-side only: a client can neither submit nor read
+// it, and the layout family it names must be one the server already knows.
+struct SantaMonicaBuildProfile {
+    std::string build_id;
+    std::string profile_id;
+    std::string module_name;
+    std::uint64_t module_size{};
+    std::vector<std::byte> module_digest;
+    std::uint64_t table_begin_rva{};
+    std::uint64_t table_end_rva{};
+    std::uint64_t names_begin_rva{};
+    std::uint64_t names_end_rva{};
+    std::uint64_t attribute_begin_rva{};
+    std::uint64_t attribute_end_rva{};
+    std::uint64_t enum_begin_rva{};
+    std::uint64_t enum_end_rva{};
+    std::uint64_t sli_begin_rva{};
+    std::uint64_t sli_end_rva{};
+    // RVA of the code-addressed global that leads to the player's resource
+    // store (ADR-0028). Zero means the profile does not publish resources.
+    std::uint64_t resources_root_rva{};
+};
+
+// Parses the bounded server-side format documented for
+// ARGOS_MCP_SANTAMONICA_BUILD_PROFILES. Pure: no process or file I/O.
+[[nodiscard]] std::expected<std::vector<SantaMonicaBuildProfile>, std::string>
+parse_santamonica_build_profiles(std::string_view text);
+
 struct SecurityPolicy {
-    bool allow_write{false};
+    // Default-on by the owner's explicit direction; a read-write session and
+    // the per-call confirmation phrase are still required for every write.
+    bool allow_write{true};
     bool allow_foreign_user{false};
     std::size_t max_read_bytes{64U * 1024U};
     std::size_t max_write_bytes{4U * 1024U};
@@ -69,12 +101,18 @@ struct SecurityPolicy {
     std::size_t async_results_ttl_ms{300'000U};
     std::size_t async_tombstone_ttl_ms{60'000U};
 
-    // Ceilings for memory_debug.inspect_address. The operator can only lower
+    // Ceilings for memory_debug_inspect_address. The operator can only lower
     // them: the domain hard caps remain the upper bound.
     std::uint64_t max_inspect_lookbehind_bytes{domain::inspection_max_lookbehind_bytes};
     std::size_t max_inspect_vtable_probes{domain::inspection_max_vtable_probes};
     std::size_t max_inspect_vtable_entries{domain::inspection_max_vtable_entries};
     std::size_t max_inspect_object_candidates{domain::inspection_max_object_candidates};
+
+    // Ceilings for the read-only disassembler (ADR-0029). The operator can only
+    // lower them; the domain hard caps remain the upper bound.
+    std::size_t max_disassemble_instructions{domain::disassemble_max_instructions};
+    std::uint64_t max_code_ref_byte_budget{domain::code_ref_max_byte_budget};
+    std::size_t max_code_ref_results{domain::code_ref_max_results};
 
     // Unreal runtime reflection is gated off by default, and automatic root
     // discovery needs a second, independent gate. A request can never turn
@@ -97,6 +135,23 @@ struct SecurityPolicy {
     std::size_t max_unreal_root_candidates{64U};
     std::size_t max_unreal_context_bytes{64U * 1024U * 1024U};
     std::size_t unreal_context_ttl_seconds{900U};
+
+    // Santa Monica/Kinetica runtime (Spec 0014, ADRs 0023-0025). Gated off by
+    // default. The controlled peer is a server-side path chosen by the
+    // operator: a request can never name an executable or raise a limit.
+    bool enable_santamonica_runtime{false};
+    std::string santamonica_peer_path;
+    std::vector<SantaMonicaBuildProfile> santamonica_build_profiles;
+    bool santamonica_build_profiles_valid{true};
+    std::size_t max_santamonica_contexts_per_session{1U};
+    std::size_t max_santamonica_contexts_total{2U};
+    std::size_t max_santamonica_records{100000U};
+    std::size_t max_santamonica_string_bytes{4096U};
+    std::size_t max_santamonica_retained_bytes{32U * 1024U * 1024U};
+    std::size_t max_santamonica_fields_per_type{1024U};
+    std::size_t max_santamonica_values_per_enum{1024U};
+    std::size_t max_santamonica_session_ms{10000U};
+    std::size_t santamonica_context_ttl_seconds{900U};
 
     [[nodiscard]] static SecurityPolicy from_environment();
 
@@ -129,6 +184,15 @@ struct SecurityPolicy {
         std::size_t max_fanout
     ) const;
 
+    [[nodiscard]] domain::Result<void> authorize_disassemble(
+        std::size_t instruction_count
+    ) const;
+
+    [[nodiscard]] domain::Result<void> authorize_code_references(
+        std::uint64_t byte_budget,
+        std::size_t result_limit
+    ) const;
+
     [[nodiscard]] domain::Result<void> authorize_launch(
         bool user_acknowledged,
         std::string_view executable_path
@@ -159,6 +223,14 @@ struct SecurityPolicy {
 
     [[nodiscard]] domain::Result<void> authorize_unreal_runtime(std::string_view profile_id) const;
     [[nodiscard]] domain::Result<void> authorize_unreal_auto_discovery() const;
+
+    // Validates the gate and the operator-configured controlled peer. It never
+    // accepts a path, endpoint or limit coming from an MCP request.
+    [[nodiscard]] domain::Result<void> authorize_santamonica_runtime() const;
+
+    // Checked only where the controlled peer is actually launched, so a server
+    // configured with a build profile alone never needs a peer on disk.
+    [[nodiscard]] domain::Result<void> authorize_santamonica_peer() const;
 };
 
 }  // namespace argos::security

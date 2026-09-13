@@ -1,6 +1,7 @@
 #include "argos_mcp/application/memory_debug_service.hpp"
 
 #include "argos_mcp/application/analysis_job_manager.hpp"
+#include "argos_mcp/infrastructure/zydis_disassembler.hpp"
 
 #include <algorithm>
 #include <array>
@@ -417,7 +418,7 @@ domain::Result<void> MemoryDebugService::reject_if_analysis_job_active(const dom
         return std::unexpected(domain::DebugError{
             domain::DebugErrorCode::invalid_state,
             "a background scan job is already running for this session; "
-            "poll it with memory_debug.job_status or use the async API to queue another",
+            "poll it with memory_debug_job_status or use the async API to queue another",
             "analysis_job_active"
         });
     }
@@ -463,7 +464,7 @@ domain::Result<void> MemoryDebugService::detach(const domain::SessionId& id, con
         if (launched == nullptr || !launched->owned()) {
             return std::unexpected(error(
                 domain::DebugErrorCode::access_denied,
-                "terminate is only allowed for sessions created by memory_debug.launch"
+                "terminate is only allowed for sessions created by memory_debug_launch"
             ));
         }
         auto terminated = launched->terminate();
@@ -484,6 +485,7 @@ domain::Result<void> MemoryDebugService::detach(const domain::SessionId& id, con
     // Runtime contexts die with the session that authorized them: an id left
     // behind would outlive the authorization it was built under.
     unreal_contexts_.remove_owned_by(id);
+    santamonica_contexts_.remove_owned_by(id);
     return removed;
 }
 
@@ -540,7 +542,7 @@ domain::Result<domain::OutputChunk> MemoryDebugService::read_output(
     auto* launched = dynamic_cast<domain::LaunchedProcessSession*>(session->get());
     if (launched == nullptr) {
         return std::unexpected(error(
-            domain::DebugErrorCode::invalid_argument, "session was not created by memory_debug.launch"
+            domain::DebugErrorCode::invalid_argument, "session was not created by memory_debug_launch"
         ));
     }
     return launched->read_output(since_cursor, max_bytes);
@@ -626,6 +628,210 @@ domain::Result<std::vector<domain::ModuleInfo>> MemoryDebugService::modules(
         return std::unexpected(session.error());
     }
     return (*session)->modules();
+}
+
+namespace {
+
+// x86/x64 instructions are at most 15 bytes. A linear sweep stops decoding a
+// read block this far from its end and carries the tail into the next read, so
+// an instruction that straddles a block boundary is decoded whole.
+constexpr std::size_t kMaxInstructionLength = 15U;
+constexpr std::size_t kCodeSweepChunkBytes = 64U * 1024U;
+
+struct SweepRange {
+    domain::Address lo{};
+    domain::Address hi{};
+};
+
+// Executable, readable ranges to sweep, optionally clipped to a module image or
+// an explicit [start,end). Returns the ranges and their total eligible bytes.
+[[nodiscard]] domain::Result<std::vector<SweepRange>> collect_code_ranges(
+    domain::ProcessSession& session,
+    const CodeReferenceRequest& request
+) {
+    domain::Address clip_lo = 0U;
+    domain::Address clip_hi = std::numeric_limits<domain::Address>::max();
+    if (request.module) {
+        auto modules = session.modules();
+        if (!modules) return std::unexpected(modules.error());
+        const auto found = std::find_if(
+            modules->begin(), modules->end(), [&](const domain::ModuleInfo& module) {
+                return requested_module_matches(module, *request.module);
+            });
+        if (found == modules->end()) {
+            return std::unexpected(domain::DebugError{
+                domain::DebugErrorCode::not_found, "module is not loaded in the session"});
+        }
+        clip_lo = found->base;
+        clip_hi = found->base + found->size;
+    }
+    if (request.start_address) clip_lo = std::max(clip_lo, *request.start_address);
+    if (request.end_address) clip_hi = std::min(clip_hi, *request.end_address);
+
+    auto regions = session.regions();
+    if (!regions) return std::unexpected(regions.error());
+
+    std::vector<SweepRange> ranges;
+    for (const auto& region : *regions) {
+        if (!region.executable || !region.readable) continue;
+        const auto lo = std::max(region.start, clip_lo);
+        const auto hi = std::min(region.end, clip_hi);
+        if (lo < hi) ranges.push_back(SweepRange{lo, hi});
+    }
+    return ranges;
+}
+
+}  // namespace
+
+domain::Result<DisassembleResult> MemoryDebugService::disassemble(
+    const domain::SessionId& id,
+    const DisassembleRequest& request,
+    const std::stop_token cancellation
+) const {
+    auto authorization = policy_.authorize_disassemble(request.instruction_count);
+    if (!authorization) return std::unexpected(authorization.error());
+    if (request.pointer_width == domain::TargetPointerWidth::x86 &&
+        request.address > std::numeric_limits<std::uint32_t>::max()) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument, "address is outside the 32-bit address space"));
+    }
+
+    auto session = sessions_.get(id);
+    if (!session) return std::unexpected(session.error());
+
+    const auto disassembler = infrastructure::make_zydis_disassembler();
+
+    std::vector<std::byte> buffer(request.instruction_count * kMaxInstructionLength);
+    const auto read = (*session)->read(request.address, buffer);
+    if (!read) return std::unexpected(read.error());
+
+    DisassembleResult result;
+    result.bytes_read = *read;
+    const std::span<const std::byte> code{buffer.data(), *read};
+
+    std::size_t offset = 0U;
+    for (std::size_t count = 0U; count < request.instruction_count; ++count) {
+        if (cancellation.stop_requested()) {
+            return std::unexpected(error(domain::DebugErrorCode::cancelled, "disassembly cancelled"));
+        }
+        if (offset >= code.size()) {
+            result.stopped_early = true;
+            break;
+        }
+        auto decoded = disassembler->decode_one(
+            code.subspan(offset), request.address + offset, request.pointer_width, true);
+        if (!decoded) {
+            result.stopped_early = true;
+            break;
+        }
+        offset += decoded->length;
+        result.instructions.push_back(std::move(*decoded));
+    }
+    return result;
+}
+
+domain::Result<CodeReferenceResult> MemoryDebugService::find_code_references(
+    const domain::SessionId& id,
+    const CodeReferenceRequest& request,
+    const std::stop_token cancellation
+) const {
+    auto authorization = policy_.authorize_code_references(request.byte_budget, request.result_limit);
+    if (!authorization) return std::unexpected(authorization.error());
+
+    auto session = sessions_.get(id);
+    if (!session) return std::unexpected(session.error());
+
+    auto ranges = collect_code_ranges(**session, request);
+    if (!ranges) return std::unexpected(ranges.error());
+
+    const auto disassembler = infrastructure::make_zydis_disassembler();
+    const domain::Address window_lo = request.target;
+    const domain::Address window_hi = request.target + request.window;  // inclusive
+
+    CodeReferenceResult result;
+    for (const auto& range : *ranges) {
+        result.coverage.bytes_eligible += range.hi - range.lo;
+    }
+    result.coverage.regions_eligible = ranges->size();
+
+    std::uint64_t remaining_budget = request.byte_budget;
+    std::vector<std::byte> buffer(kCodeSweepChunkBytes);
+
+    for (const auto& range : *ranges) {
+        if (remaining_budget == 0U) {
+            result.coverage.truncated_by_budget = true;
+            break;
+        }
+        if (result.hits.size() >= request.result_limit) break;
+        ++result.coverage.regions_scanned;
+
+        domain::Address cursor = range.lo;
+        while (cursor < range.hi) {
+            if (cancellation.stop_requested()) {
+                return std::unexpected(error(domain::DebugErrorCode::cancelled, "code reference scan cancelled"));
+            }
+            if (remaining_budget == 0U) {
+                result.coverage.truncated_by_budget = true;
+                break;
+            }
+            const std::uint64_t want = std::min<std::uint64_t>(
+                {kCodeSweepChunkBytes, range.hi - cursor, remaining_budget});
+            const auto read = (*session)->read(cursor, std::span{buffer.data(), static_cast<std::size_t>(want)});
+            if (!read || *read == 0U) {
+                // A region that fails to read is skipped, not fatal: a live
+                // target constantly maps and unmaps pages.
+                break;
+            }
+            const std::span<const std::byte> chunk{buffer.data(), *read};
+            // Only decode instructions that fit wholly in the chunk unless this
+            // is the final slice of the range; otherwise stop short and re-read
+            // the straddling tail from the next cursor.
+            const bool final_slice = cursor + *read >= range.hi;
+            const std::size_t decode_limit = (!final_slice && *read > kMaxInstructionLength)
+                ? *read - kMaxInstructionLength
+                : *read;
+
+            std::size_t pos = 0U;
+            while (pos < decode_limit) {
+                if (result.hits.size() >= request.result_limit) {
+                    result.coverage.truncated_by_result_limit = true;
+                    break;
+                }
+                auto decoded = disassembler->decode_one(
+                    chunk.subspan(pos), cursor + pos, request.pointer_width, false);
+                if (!decoded) {
+                    ++pos;  // not an instruction here; realign by one byte
+                    continue;
+                }
+                for (const auto& reference : decoded->references) {
+                    if (reference.target >= window_lo && reference.target <= window_hi) {
+                        auto formatted = disassembler->decode_one(
+                            chunk.subspan(pos), cursor + pos, request.pointer_width, true);
+                        result.hits.push_back(domain::CodeReferenceHit{
+                            cursor + pos,
+                            decoded->length,
+                            decoded->mnemonic,
+                            formatted ? std::move(formatted->text) : std::string{},
+                            reference.target,
+                            reference.kind,
+                        });
+                        break;  // one hit per instruction is enough evidence
+                    }
+                }
+                pos += decoded->length;
+            }
+            cursor += pos == 0U ? 1U : pos;
+            const std::uint64_t consumed = pos == 0U ? 1U : pos;
+            result.coverage.bytes_scanned += consumed;
+            remaining_budget -= std::min<std::uint64_t>(consumed, remaining_budget);
+            if (result.hits.size() >= request.result_limit) {
+                result.coverage.truncated_by_result_limit = true;
+                break;
+            }
+        }
+        if (result.coverage.truncated_by_result_limit || result.coverage.truncated_by_budget) break;
+    }
+    return result;
 }
 
 domain::Result<std::string> MemoryDebugService::module_path(

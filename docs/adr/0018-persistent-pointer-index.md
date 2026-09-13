@@ -50,7 +50,7 @@ deadline e resultados terão hard caps; `visited` impedirá ciclos.
 
 ### Build assíncrono e snapshots COW
 
-`memory_debug.pointer_index_build` iniciará um job no `AnalysisJobManager` da
+`memory_debug_pointer_index_build` iniciará um job no `AnalysisJobManager` da
 Spec 0008. Progresso, resultado terminal, cancelamento e release usarão as
 tools genéricas de job. O worker construirá o vetor privadamente, sem mutex de
 registry durante leitura, ordenação ou persistência.
@@ -118,14 +118,14 @@ expiram por TTL e nunca são carregados como índice.
 
 Serão adicionadas quatro tools:
 
-- `memory_debug.pointer_index_build` — start assíncrono, devolve `job_id`;
-- `memory_debug.pointer_index_query` — busca limitada e revalidada por
+- `memory_debug_pointer_index_build` — start assíncrono, devolve `job_id`;
+- `memory_debug_pointer_index_query` — busca limitada e revalidada por
   `index_id`;
-- `memory_debug.pointer_index_list` — metadados paginados e compatibilidade;
-- `memory_debug.pointer_index_delete` — remove um ID exato e anuncia
+- `memory_debug_pointer_index_list` — metadados paginados e compatibilidade;
+- `memory_debug_pointer_index_delete` — remove um ID exato e anuncia
   `destructiveHint: true`.
 
-O build usa `memory_debug.job_status/results/cancel/release` da Spec 0008 e
+O build usa `memory_debug_job_status/results/cancel/release` da Spec 0008 e
 publica um `index_id` apenas no resultado terminal válido.
 
 Tipos de índice, fingerprint, aresta e algoritmo de query permanecem sem JSON,

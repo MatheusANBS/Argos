@@ -41,8 +41,59 @@ void check(bool condition, const char* message) {
 
 class ContractSession final : public argos::domain::ProcessSession {
 public:
-    explicit ContractSession(const argos::domain::AccessMode access) : access_(access) {
+    explicit ContractSession(const argos::domain::AccessMode access, const bool native = false)
+        : access_(access), native_(native) {
         memory_[4] = std::byte{0x2A};  // i32 42 at 0x1004, little-endian.
+        if (!native) return;
+        memory_.assign(4096, std::byte{});
+        const auto number = [this](const std::size_t rva, const std::uint64_t value, const std::size_t width) {
+            for (std::size_t i = 0; i < width; ++i) memory_[rva + i] = static_cast<std::byte>((value >> (8U * i)) & 255U);
+        };
+        std::size_t next_name = 0x800;
+        const auto name = [this, &next_name](const std::string_view text) {
+            const auto pointer = 0x1000U + next_name;
+            for (const char c : text) memory_[next_name++] = static_cast<std::byte>(c);
+            memory_[next_name++] = std::byte{};
+            return pointer;
+        };
+        number(0x100, name("tContract"), 8);
+        number(0x110, 16, 8);
+        number(0x118, 8, 8);
+        number(0x124, 1, 4);
+        number(0x128, 0xFFFF, 2);
+        number(0x200, name("Mode"), 8);
+        number(0x212, 4, 2);
+        number(0x214, 4, 1);  // unsigned primitive with enum index 0
+        number(0x218, 0xFFFF, 2);
+        number(0x300, name("ContractMode"), 8);
+        number(0x30C, 1, 4);
+        number(0x310, 0x1500, 8);
+        number(0x318, 0x1510, 8);
+        number(0x500, name("Active"), 8);
+        number(0x510, 7, 8);
+        number(0x400, name("DescribeContract"), 8);
+        number(0x408, 0x1600, 8);
+        number(0x410, name("v"), 8);
+        // Resource store (ADR-0028): root slot -> wallet set -> records, with
+        // ResourcesPerm immediately before its definitions.
+        number(0xB00, 0x1000U + 0xB08U, 8);
+        number(0xB18, 0x1000U + 0xC00U, 8);
+        number(0xB28, 2, 4);
+        number(0xC28, 0x1000U + 0xD00U, 8);
+        number(0xC30, 5, 4);
+        number(0xC38, 3, 4);
+        number(0xC68, 0x1000U + 0xD40U, 8);
+        number(0xC70, 0xFFFFFFFFU, 4);
+        number(0xC78, 2, 4);
+        number(0xC88, 0x1000U + 0xD00U, 8);
+        number(0xC90, 2, 4);
+        number(0xD00, name("ContractOre"), 8);
+        number(0xD08, 11, 4);
+        number(0xD28, 0xFFFFFFFFU, 4);
+        number(0xD3C, 1, 1);
+        number(0xD40, name("ContractKey"), 8);
+        number(0xD48, 12, 4);
+        number(0xD68, 1, 4);
     }
 
     [[nodiscard]] argos::domain::ProcessId pid() const noexcept override { return 4242U; }
@@ -70,15 +121,30 @@ public:
     }
 
     [[nodiscard]] argos::domain::Result<std::size_t> write(
-        argos::domain::Address,
-        std::span<const std::byte>
+        const argos::domain::Address address,
+        const std::span<const std::byte> bytes
     ) override {
-        return std::unexpected(debug_error(
-            argos::domain::DebugErrorCode::access_denied, "contract target is read-only"
-        ));
+        // Only the native image accepts writes, and only through a read_write
+        // session, so resource writes can be exercised end to end.
+        constexpr argos::domain::Address base = 0x1000U;
+        if (!native_ || access_ != argos::domain::AccessMode::read_write) {
+            return std::unexpected(debug_error(
+                argos::domain::DebugErrorCode::access_denied, "contract target is read-only"
+            ));
+        }
+        if (address < base || address - base > memory_.size() ||
+            bytes.size() > memory_.size() - static_cast<std::size_t>(address - base)) {
+            return std::unexpected(debug_error(
+                argos::domain::DebugErrorCode::io_error, "write is outside contract memory"
+            ));
+        }
+        std::copy(bytes.begin(), bytes.end(),
+                  memory_.begin() + static_cast<std::ptrdiff_t>(address - base));
+        return bytes.size();
     }
 
     [[nodiscard]] argos::domain::Result<std::vector<argos::domain::MemoryRegion>> regions() const override {
+        if (native_) return std::vector<argos::domain::MemoryRegion>{{0x1000U, 0x2000U, true, false, false, false, "image"}};
         return std::vector<argos::domain::MemoryRegion>{
             {0x1000U, 0x1010U, true, true, false, true, "heap-main"},
             {0x2000U, 0x2020U, true, false, true, false, "image.text"},
@@ -87,16 +153,19 @@ public:
     }
 
     [[nodiscard]] argos::domain::Result<std::vector<argos::domain::ModuleInfo>> modules() const override {
+        if (native_) return std::vector<argos::domain::ModuleInfo>{{"Contract.exe", "C:/synthetic", 0x1000U, 4096U}};
         return std::vector<argos::domain::ModuleInfo>{};
     }
 
 private:
     argos::domain::AccessMode access_;
-    std::array<std::byte, 16> memory_{};
+    bool native_{};
+    std::vector<std::byte> memory_ = std::vector<std::byte>(16);
 };
 
 class ContractProvider final : public argos::domain::ProcessMemoryProvider {
 public:
+    explicit ContractProvider(const bool native = false) : native_(native) {}
     [[nodiscard]] argos::domain::Result<std::vector<argos::domain::ProcessInfo>> list_processes(
         std::string_view,
         std::size_t
@@ -113,7 +182,7 @@ public:
         if (pid != 4242U) {
             return std::unexpected(debug_error(argos::domain::DebugErrorCode::not_found, "process not found"));
         }
-        std::unique_ptr<argos::domain::ProcessSession> session = std::make_unique<ContractSession>(access);
+        std::unique_ptr<argos::domain::ProcessSession> session = std::make_unique<ContractSession>(access, native_);
         return session;
     }
 
@@ -125,6 +194,8 @@ public:
             argos::domain::DebugErrorCode::unsupported, "launch is unavailable in contract tests"
         ));
     }
+private:
+    bool native_{};
 };
 
 class SlowContractSession final : public argos::domain::ProcessSession {
@@ -320,13 +391,13 @@ int main() {
         }
     }
 
-    const auto legacy_unknown = call_tool(server, 903, "memory_debug.no_such_tool", JsonValue::object({}));
+    const auto legacy_unknown = call_tool(server, 903, "memory_debug_no_such_tool", JsonValue::object({}));
     check(legacy_unknown.has_value() && legacy_unknown->contains("error") &&
               legacy_unknown->at("error").at("code").as_integer() == -32602 &&
               !legacy_unknown->contains("result"),
           "legacy unknown tool is a JSON-RPC invalid-params error");
     const auto modern_unknown = call_modern_tool(
-        server, 904, "memory_debug.no_such_tool", JsonValue::object({})
+        server, 904, "memory_debug_no_such_tool", JsonValue::object({})
     );
     check(modern_unknown.has_value() && modern_unknown->contains("error") &&
               modern_unknown->at("error").at("code").as_integer() == -32602 &&
@@ -347,7 +418,7 @@ int main() {
             const auto tool_call = JsonValue::object({
                 {"jsonrpc", "2.0"}, {"id", 905}, {"method", "tools/call"},
                 {"params", JsonValue::object({
-                    {"name", "memory_debug.scan_exact"},
+                    {"name", "memory_debug_scan_exact"},
                     {"arguments", JsonValue::object({
                         {"session_id", attached->id.value()}, {"pattern_hex", "ff"},
                         {"byte_budget", 64 * 1024}, {"result_limit", 16}
@@ -438,6 +509,10 @@ int main() {
         check(list_result.find("cacheScope") == nullptr, "legacy tools/list does not add modern cache scope");
         const auto& tools = list_result.at("tools").as_array();
         check(tools.size() >= 30U, "tool catalog exposes the runtime debugging tools");
+        for (const auto& tool : tools) {
+            check(!tool.at("name").as_string().starts_with("memory_debug_santamonica_runtime_"),
+                  "Santa Monica tools stay absent in legacy MCP while the gate is off");
+        }
         bool has_scan_start = false;
         bool has_job_status = false;
         bool has_job_results = false;
@@ -463,80 +538,109 @@ int main() {
         bool scan_first_accepts_decimal = false;
         bool scan_next_accepts_decimal = false;
         bool all_tools_have_output_schema = true;
+        // Both of the checks below guard the same observed failure mode: a
+        // client that validates the tool list rejects the whole array, so a
+        // single malformed entry makes *every* tool disappear with no visible
+        // error -- the server still reports as connected, just with nothing
+        // callable. A bare oneOf inputSchema root and a name outside
+        // ^[A-Za-z0-9_-]{1,128}$ have each caused exactly that.
+        bool all_tools_have_object_input_schema = true;
+        bool all_tool_names_are_client_safe = true;
+        const auto name_is_client_safe = [](const std::string& value) {
+            if (value.empty() || value.size() > 128U) return false;
+            for (const char character : value) {
+                const bool allowed = (character >= 'a' && character <= 'z') ||
+                                     (character >= 'A' && character <= 'Z') ||
+                                     (character >= '0' && character <= '9') ||
+                                     character == '_' || character == '-';
+                if (!allowed) return false;
+            }
+            return true;
+        };
         bool detach_is_destructive = false;
         for (const auto& tool : tools) {
             const auto name = tool.at("name").as_string();
             all_tools_have_output_schema = all_tools_have_output_schema &&
                 tool.contains("outputSchema") && tool.at("outputSchema").is_object();
-            if (name == "memory_debug.detach") {
+            all_tools_have_object_input_schema = all_tools_have_object_input_schema &&
+                tool.contains("inputSchema") && tool.at("inputSchema").is_object() &&
+                tool.at("inputSchema").contains("type") &&
+                tool.at("inputSchema").at("type").as_string() == "object";
+            all_tool_names_are_client_safe =
+                all_tool_names_are_client_safe && name_is_client_safe(name);
+            if (name == "memory_debug_detach") {
                 detach_is_destructive = tool.at("annotations").at("destructiveHint").as_bool();
             }
-            if (name == "memory_debug.regions") {
+            if (name == "memory_debug_regions") {
                 const auto& properties = tool.at("inputSchema").at("properties");
                 regions_supports_filtering = properties.find("writable") != nullptr &&
                     properties.find("offset") != nullptr && properties.find("limit") != nullptr;
             }
-            if (name == "memory_debug.scan_first") {
+            if (name == "memory_debug_scan_first") {
                 const auto& properties = tool.at("inputSchema").at("properties");
                 scan_first_accepts_decimal = properties.find("value_decimal") != nullptr;
             }
-            if (name == "memory_debug.scan_next") {
+            if (name == "memory_debug_scan_next") {
                 const auto& properties = tool.at("inputSchema").at("properties");
                 scan_next_accepts_decimal = properties.find("value_decimal") != nullptr &&
                     properties.find("delta_decimal") != nullptr;
             }
             has_address_space_summary =
-                has_address_space_summary || name == "memory_debug.address_space_summary";
-            has_pdb_type = has_pdb_type || name == "memory_debug.pdb_type";
-            has_unity_type = has_unity_type || name == "memory_debug.unity_type";
-            has_unreal_type = has_unreal_type || name == "memory_debug.unreal_type";
-            has_unreal_reflection = has_unreal_reflection || name == "memory_debug.unreal_reflection";
-            has_strings = has_strings || name == "memory_debug.strings";
-            has_scan_pointers_to = has_scan_pointers_to || name == "memory_debug.scan_pointers_to";
-            has_scan_pointer_chains = has_scan_pointer_chains || name == "memory_debug.scan_pointer_chains";
-            has_pdb_list_types = has_pdb_list_types || name == "memory_debug.pdb_list_types";
-            has_scan_first = has_scan_first || name == "memory_debug.scan_first";
-            has_scan_next = has_scan_next || name == "memory_debug.scan_next";
-            has_scan_results = has_scan_results || name == "memory_debug.scan_results";
-            has_scan_reset = has_scan_reset || name == "memory_debug.scan_reset";
-            has_launch = has_launch || name == "memory_debug.launch";
-            has_read_output = has_read_output || name == "memory_debug.read_output";
-            has_scan_start = has_scan_start || name == "memory_debug.scan_start";
-            has_job_status = has_job_status || name == "memory_debug.job_status";
-            has_job_results = has_job_results || name == "memory_debug.job_results";
-            has_job_cancel = has_job_cancel || name == "memory_debug.job_cancel";
-            has_job_release = has_job_release || name == "memory_debug.job_release";
-            if (name == "memory_debug.scan_start") {
+                has_address_space_summary || name == "memory_debug_address_space_summary";
+            has_pdb_type = has_pdb_type || name == "memory_debug_pdb_type";
+            has_unity_type = has_unity_type || name == "memory_debug_unity_type";
+            has_unreal_type = has_unreal_type || name == "memory_debug_unreal_type";
+            has_unreal_reflection = has_unreal_reflection || name == "memory_debug_unreal_reflection";
+            has_strings = has_strings || name == "memory_debug_strings";
+            has_scan_pointers_to = has_scan_pointers_to || name == "memory_debug_scan_pointers_to";
+            has_scan_pointer_chains = has_scan_pointer_chains || name == "memory_debug_scan_pointer_chains";
+            has_pdb_list_types = has_pdb_list_types || name == "memory_debug_pdb_list_types";
+            has_scan_first = has_scan_first || name == "memory_debug_scan_first";
+            has_scan_next = has_scan_next || name == "memory_debug_scan_next";
+            has_scan_results = has_scan_results || name == "memory_debug_scan_results";
+            has_scan_reset = has_scan_reset || name == "memory_debug_scan_reset";
+            has_launch = has_launch || name == "memory_debug_launch";
+            has_read_output = has_read_output || name == "memory_debug_read_output";
+            has_scan_start = has_scan_start || name == "memory_debug_scan_start";
+            has_job_status = has_job_status || name == "memory_debug_job_status";
+            has_job_results = has_job_results || name == "memory_debug_job_results";
+            has_job_cancel = has_job_cancel || name == "memory_debug_job_cancel";
+            has_job_release = has_job_release || name == "memory_debug_job_release";
+            if (name == "memory_debug_scan_start") {
                 const auto& one_of = tool.at("inputSchema").at("oneOf").as_array();
                 scan_start_offers_resume_variant = one_of.size() == 2U;
             }
         }
+        check(all_tools_have_object_input_schema,
+              "every tool advertises an object inputSchema; a bare oneOf root drops the whole catalog");
+        check(all_tool_names_are_client_safe,
+              "every tool name matches ^[A-Za-z0-9_-]{1,128}$ enforced by MCP clients");
         check(has_pdb_type, "tool catalog exposes PDB type metadata");
         check(has_unity_type, "tool catalog exposes Unity metadata");
         check(has_unreal_type, "tool catalog exposes Unreal type metadata");
         check(has_unreal_reflection, "tool catalog exposes Unreal reflection metadata");
-        check(has_strings, "tool catalog exposes memory_debug.strings");
-        check(has_scan_pointers_to, "tool catalog exposes memory_debug.scan_pointers_to");
-        check(has_scan_pointer_chains, "tool catalog exposes memory_debug.scan_pointer_chains");
-        check(has_pdb_list_types, "tool catalog exposes memory_debug.pdb_list_types");
-        check(has_scan_first, "tool catalog exposes memory_debug.scan_first");
-        check(has_scan_next, "tool catalog exposes memory_debug.scan_next");
-        check(has_scan_results, "tool catalog exposes memory_debug.scan_results");
-        check(has_scan_reset, "tool catalog exposes memory_debug.scan_reset");
-        check(has_launch, "tool catalog exposes memory_debug.launch");
-        check(has_read_output, "tool catalog exposes memory_debug.read_output");
-        check(has_address_space_summary, "tool catalog exposes memory_debug.address_space_summary");
-        check(regions_supports_filtering, "memory_debug.regions advertises filtering and paging");
-        check(scan_first_accepts_decimal, "memory_debug.scan_first advertises value_decimal");
-        check(scan_next_accepts_decimal, "memory_debug.scan_next advertises decimal value and delta");
+        check(has_strings, "tool catalog exposes memory_debug_strings");
+        check(has_scan_pointers_to, "tool catalog exposes memory_debug_scan_pointers_to");
+        check(has_scan_pointer_chains, "tool catalog exposes memory_debug_scan_pointer_chains");
+        check(has_pdb_list_types, "tool catalog exposes memory_debug_pdb_list_types");
+        check(has_scan_first, "tool catalog exposes memory_debug_scan_first");
+        check(has_scan_next, "tool catalog exposes memory_debug_scan_next");
+        check(has_scan_results, "tool catalog exposes memory_debug_scan_results");
+        check(has_scan_reset, "tool catalog exposes memory_debug_scan_reset");
+        check(has_launch, "tool catalog exposes memory_debug_launch");
+        check(has_read_output, "tool catalog exposes memory_debug_read_output");
+        check(has_address_space_summary, "tool catalog exposes memory_debug_address_space_summary");
+        check(regions_supports_filtering, "memory_debug_regions advertises filtering and paging");
+        check(scan_first_accepts_decimal, "memory_debug_scan_first advertises value_decimal");
+        check(scan_next_accepts_decimal, "memory_debug_scan_next advertises decimal value and delta");
         check(all_tools_have_output_schema, "every tool advertises its structured result schema");
         check(detach_is_destructive,
               "detach is conservatively destructive because terminate=true can stop a process");
-        check(has_scan_start, "tool catalog exposes memory_debug.scan_start (Spec 0008)");
-        check(has_job_status, "tool catalog exposes memory_debug.job_status (Spec 0008)");
-        check(has_job_results, "tool catalog exposes memory_debug.job_results (Spec 0008)");
-        check(has_job_cancel, "tool catalog exposes memory_debug.job_cancel (Spec 0008)");
-        check(has_job_release, "tool catalog exposes memory_debug.job_release (Spec 0008)");
+        check(has_scan_start, "tool catalog exposes memory_debug_scan_start (Spec 0008)");
+        check(has_job_status, "tool catalog exposes memory_debug_job_status (Spec 0008)");
+        check(has_job_results, "tool catalog exposes memory_debug_job_results (Spec 0008)");
+        check(has_job_cancel, "tool catalog exposes memory_debug_job_cancel (Spec 0008)");
+        check(has_job_release, "tool catalog exposes memory_debug_job_release (Spec 0008)");
         check(scan_start_offers_resume_variant, "scan_start advertises both the fresh and resume_token input shapes");
     }
 
@@ -587,6 +691,10 @@ int main() {
 
         const auto& tools = result.at("tools").as_array();
         bool deterministic_order = true;
+        for (const auto& tool : tools) {
+            check(!tool.at("name").as_string().starts_with("memory_debug_santamonica_runtime_"),
+                  "Santa Monica tools stay absent in modern MCP while the gate is off");
+        }
         for (std::size_t index = 1; index < tools.size(); ++index) {
             deterministic_order = deterministic_order &&
                 tools[index - 1].at("name").as_string() <= tools[index].at("name").as_string();
@@ -654,7 +762,7 @@ int main() {
     }
 
     auto modern_tool_response = call_modern_tool(
-        server, 105, "memory_debug.process_list", JsonValue::object({})
+        server, 105, "memory_debug_process_list", JsonValue::object({})
     );
     check(modern_tool_response.has_value(), "modern tools/call receives a response");
     if (modern_tool_response) {
@@ -673,7 +781,7 @@ int main() {
     // is not evidence the handler works, so each new capability is invoked.
     std::string session_id;
     {
-        auto attached = call_tool(server, 3, "memory_debug.attach", JsonValue::object({
+        auto attached = call_tool(server, 3, "memory_debug_attach", JsonValue::object({
             {"pid", 4242}, {"authorized", true}, {"access", "read_only"}
         }));
         if (attached) {
@@ -695,7 +803,7 @@ int main() {
     }
 
     if (!session_id.empty()) {
-        auto summary = call_tool(server, 4, "memory_debug.address_space_summary", JsonValue::object({
+        auto summary = call_tool(server, 4, "memory_debug_address_space_summary", JsonValue::object({
             {"session_id", session_id}
         }));
         const auto* data = successful_tool_data(summary);
@@ -710,7 +818,7 @@ int main() {
                   "summary separates readable+writable bytes");
         }
 
-        auto filtered = call_tool(server, 5, "memory_debug.regions", JsonValue::object({
+        auto filtered = call_tool(server, 5, "memory_debug_regions", JsonValue::object({
             {"session_id", session_id}, {"writable", true}
         }));
         data = successful_tool_data(filtered);
@@ -722,7 +830,7 @@ int main() {
                   "regions returns the matching region");
         }
 
-        auto paged = call_tool(server, 6, "memory_debug.regions", JsonValue::object({
+        auto paged = call_tool(server, 6, "memory_debug_regions", JsonValue::object({
             {"session_id", session_id}, {"offset", 1}, {"limit", 1}
         }));
         data = successful_tool_data(paged);
@@ -736,7 +844,7 @@ int main() {
                   "regions honours the requested offset");
         }
 
-        auto by_name = call_tool(server, 7, "memory_debug.regions", JsonValue::object({
+        auto by_name = call_tool(server, 7, "memory_debug_regions", JsonValue::object({
             {"session_id", session_id}, {"name_contains", "IMAGE"}
         }));
         data = successful_tool_data(by_name);
@@ -747,7 +855,7 @@ int main() {
 
         // The decimal form must find the same i32 the hex form would, without
         // the caller hand-encoding little-endian bytes.
-        auto scan = call_tool(server, 8, "memory_debug.scan_first", JsonValue::object({
+        auto scan = call_tool(server, 8, "memory_debug_scan_first", JsonValue::object({
             {"session_id", session_id}, {"value_type", "i32"},
             {"comparison", "exact"}, {"value_decimal", "42"}
         }));
@@ -770,21 +878,21 @@ int main() {
         }
 
         if (!decimal_scan_id.empty()) {
-            auto decimal_next = call_tool(server, 14, "memory_debug.scan_next", JsonValue::object({
+            auto decimal_next = call_tool(server, 14, "memory_debug_scan_next", JsonValue::object({
                 {"scan_id", decimal_scan_id}, {"comparison", "exact"}, {"value_decimal", "42"}
             }));
             data = successful_tool_data(decimal_next);
             check(data != nullptr && data->at("candidate_count").as_integer() == 1,
                   "scan_next reuses the session type to encode value_decimal");
 
-            auto conflicting_next = call_tool(server, 15, "memory_debug.scan_next", JsonValue::object({
+            auto conflicting_next = call_tool(server, 15, "memory_debug_scan_next", JsonValue::object({
                 {"scan_id", decimal_scan_id}, {"comparison", "exact"},
                 {"value", "2a000000"}, {"value_decimal", "42"}
             }));
             check(is_invalid_arguments(conflicting_next),
                   "scan_next rejects simultaneous hexadecimal and decimal values");
 
-            auto results_page = call_tool(server, 16, "memory_debug.scan_results", JsonValue::object({
+            auto results_page = call_tool(server, 16, "memory_debug_scan_results", JsonValue::object({
                 {"scan_id", decimal_scan_id}, {"offset", 0}, {"limit", 1}
             }));
             data = successful_tool_data(results_page);
@@ -796,21 +904,21 @@ int main() {
                   "scan_results returns atomic pagination and generation metadata with its matches");
         }
 
-        auto conflicting = call_tool(server, 9, "memory_debug.scan_first", JsonValue::object({
+        auto conflicting = call_tool(server, 9, "memory_debug_scan_first", JsonValue::object({
             {"session_id", session_id}, {"value_type", "i32"}, {"comparison", "exact"},
             {"value", "2a000000"}, {"value_decimal", "42"}
         }));
         check(is_invalid_arguments(conflicting),
               "scan_first rejects value and value_decimal supplied together");
 
-        auto overflowing = call_tool(server, 10, "memory_debug.scan_first", JsonValue::object({
+        auto overflowing = call_tool(server, 10, "memory_debug_scan_first", JsonValue::object({
             {"session_id", session_id}, {"value_type", "u8"}, {"comparison", "exact"},
             {"value_decimal", "300"}
         }));
         check(is_invalid_arguments(overflowing),
               "scan_first rejects a decimal value wider than value_type");
 
-        auto decimal_range = call_tool(server, 11, "memory_debug.scan_first", JsonValue::object({
+        auto decimal_range = call_tool(server, 11, "memory_debug_scan_first", JsonValue::object({
             {"session_id", session_id}, {"value_type", "i32"}, {"comparison", "in_range"},
             {"range_low_decimal", "41"}, {"range_high_decimal", "43"},
             {"start_address", "0x1000"}, {"end_address", "0x1010"},
@@ -823,14 +931,14 @@ int main() {
                   "scan_first encodes both decimal range endpoints");
         }
 
-        auto incomplete_range = call_tool(server, 12, "memory_debug.scan_first", JsonValue::object({
+        auto incomplete_range = call_tool(server, 12, "memory_debug_scan_first", JsonValue::object({
             {"session_id", session_id}, {"value_type", "i32"}, {"comparison", "in_range"},
             {"range_low_decimal", "41"}
         }));
         check(is_invalid_arguments(incomplete_range),
               "scan_first rejects a decimal range with only one endpoint");
 
-        auto legacy_hex = call_tool(server, 13, "memory_debug.scan_first", JsonValue::object({
+        auto legacy_hex = call_tool(server, 13, "memory_debug_scan_first", JsonValue::object({
             {"session_id", session_id}, {"value_type", "i32"}, {"comparison", "exact"},
             {"value", "2a000000"},
             {"start_address", "0x1000"}, {"end_address", "0x1010"},
@@ -849,7 +957,7 @@ int main() {
     // engine behavior -- progress, concurrent cancellation, backpressure,
     // TTL -- is covered by the AnalysisJobManager unit tests).
     if (!session_id.empty()) {
-        auto started = call_tool(server, 200, "memory_debug.scan_start", JsonValue::object({
+        auto started = call_tool(server, 200, "memory_debug_scan_start", JsonValue::object({
             {"session_id", session_id},
             {"operation", "scan_exact"},
             {"request", JsonValue::object({
@@ -873,7 +981,7 @@ int main() {
             argos::protocol::json::Value status_data;
             bool reached_terminal = false;
             for (int attempt = 0; attempt < 200'000 && !reached_terminal; ++attempt) {
-                auto status = call_tool(server, 201, "memory_debug.job_status", JsonValue::object({
+                auto status = call_tool(server, 201, "memory_debug_job_status", JsonValue::object({
                     {"session_id", session_id}, {"job_id", job_id}
                 }));
                 const auto* data = successful_tool_data(status);
@@ -900,7 +1008,7 @@ int main() {
                 }
             }
 
-            auto results = call_tool(server, 202, "memory_debug.job_results", JsonValue::object({
+            auto results = call_tool(server, 202, "memory_debug_job_results", JsonValue::object({
                 {"session_id", session_id}, {"job_id", job_id}, {"offset", 0}, {"limit", 10}
             }));
             const auto* results_data = successful_tool_data(results);
@@ -915,34 +1023,34 @@ int main() {
                       "job_results pagination metadata matches a single-item result");
             }
 
-            auto wrong_job = call_tool(server, 203, "memory_debug.job_status", JsonValue::object({
+            auto wrong_job = call_tool(server, 203, "memory_debug_job_status", JsonValue::object({
                 {"session_id", session_id}, {"job_id", "does-not-exist"}
             }));
             check(!wrong_job.has_value() ? false : wrong_job->at("result").at("isError").as_bool(),
                   "job_status on an unknown job_id is an error");
 
-            auto idempotent_cancel = call_tool(server, 204, "memory_debug.job_cancel", JsonValue::object({
+            auto idempotent_cancel = call_tool(server, 204, "memory_debug_job_cancel", JsonValue::object({
                 {"session_id", session_id}, {"job_id", job_id}
             }));
             const auto* cancel_data = successful_tool_data(idempotent_cancel);
             check(cancel_data != nullptr && cancel_data->at("state").as_string() == "completed",
                   "cancelling an already-completed job is idempotent and reports the winning state");
 
-            auto released = call_tool(server, 205, "memory_debug.job_release", JsonValue::object({
+            auto released = call_tool(server, 205, "memory_debug_job_release", JsonValue::object({
                 {"session_id", session_id}, {"job_id", job_id}
             }));
             const auto* released_data = successful_tool_data(released);
             check(released_data != nullptr && released_data->at("released").as_bool(),
                   "job_release succeeds on a terminal job");
 
-            auto after_release = call_tool(server, 206, "memory_debug.job_status", JsonValue::object({
+            auto after_release = call_tool(server, 206, "memory_debug_job_status", JsonValue::object({
                 {"session_id", session_id}, {"job_id", job_id}
             }));
             check(after_release.has_value() && after_release->at("result").at("isError").as_bool(),
                   "job_status after release reports the job as gone");
         }
 
-        auto conflicting_start = call_tool(server, 207, "memory_debug.scan_start", JsonValue::object({
+        auto conflicting_start = call_tool(server, 207, "memory_debug_scan_start", JsonValue::object({
             {"session_id", session_id},
             {"operation", "scan_exact"},
             {"resume_token", "should-not-be-combined-with-operation"},
@@ -951,7 +1059,7 @@ int main() {
         check(is_invalid_arguments(conflicting_start),
               "scan_start rejects operation and resume_token supplied together");
 
-        auto resume_attempt = call_tool(server, 208, "memory_debug.scan_start", JsonValue::object({
+        auto resume_attempt = call_tool(server, 208, "memory_debug_scan_start", JsonValue::object({
             {"session_id", session_id}, {"resume_token", "deadbeefdeadbeefdeadbeefdeadbeef"}
         }));
         if (resume_attempt) {
@@ -965,7 +1073,7 @@ int main() {
     }
 
     if (!session_id.empty()) {
-        auto inspected = call_tool(server, 20, "memory_debug.inspect_address", JsonValue::object({
+        auto inspected = call_tool(server, 20, "memory_debug_inspect_address", JsonValue::object({
             {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
             {"lookbehind_bytes", 0}
         }));
@@ -997,7 +1105,7 @@ int main() {
         // A window the region cannot supply in full is a partial analysis, and
         // saying so is what keeps an absent candidate from reading as absence
         // of the thing itself.
-        auto clamped = call_tool(server, 210, "memory_debug.inspect_address", JsonValue::object({
+        auto clamped = call_tool(server, 210, "memory_debug_inspect_address", JsonValue::object({
             {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
             {"lookbehind_bytes", 4096}
         }));
@@ -1016,7 +1124,7 @@ int main() {
                   "the window actually read is reported separately");
         }
 
-        auto guarded = call_tool(server, 21, "memory_debug.inspect_address", JsonValue::object({
+        auto guarded = call_tool(server, 21, "memory_debug_inspect_address", JsonValue::object({
             {"session_id", session_id}, {"address", "0x3004"}, {"pointer_size", "8"}
         }));
         data = successful_tool_data(guarded);
@@ -1031,7 +1139,7 @@ int main() {
                   "the limitation names the unreadable region");
         }
 
-        auto references = call_tool(server, 22, "memory_debug.inspect_address", JsonValue::object({
+        auto references = call_tool(server, 22, "memory_debug_inspect_address", JsonValue::object({
             {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
             {"references", JsonValue::object({
                 {"mode", "live_scan"}, {"byte_budget", 65536}, {"result_limit", 8},
@@ -1056,7 +1164,7 @@ int main() {
 
         // The same query over a range the backend cannot fully read must stay
         // distinguishable from the conclusive empty result above.
-        auto partial_references = call_tool(server, 220, "memory_debug.inspect_address", JsonValue::object({
+        auto partial_references = call_tool(server, 220, "memory_debug_inspect_address", JsonValue::object({
             {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
             {"references", JsonValue::object({
                 {"mode", "live_scan"}, {"byte_budget", 65536}, {"result_limit", 8}
@@ -1076,12 +1184,12 @@ int main() {
                   "the reason names the unreadable region");
         }
 
-        check(is_invalid_arguments(call_tool(server, 23, "memory_debug.inspect_address", JsonValue::object({
+        check(is_invalid_arguments(call_tool(server, 23, "memory_debug_inspect_address", JsonValue::object({
                   {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "6"}
               }))),
               "inspect_address rejects a pointer size that is not 4 or 8");
 
-        check(is_invalid_arguments(call_tool(server, 24, "memory_debug.inspect_address", JsonValue::object({
+        check(is_invalid_arguments(call_tool(server, 24, "memory_debug_inspect_address", JsonValue::object({
                   {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
                   {"references", JsonValue::object({
                       {"mode", "live_scan"}, {"byte_budget", 4096}, {"result_limit", 8},
@@ -1090,7 +1198,7 @@ int main() {
               }))),
               "index_id is rejected with reference mode live_scan");
 
-        check(is_invalid_arguments(call_tool(server, 25, "memory_debug.inspect_address", JsonValue::object({
+        check(is_invalid_arguments(call_tool(server, 25, "memory_debug_inspect_address", JsonValue::object({
                   {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
                   {"references", JsonValue::object({
                       {"mode", "index"}, {"index_id", "idx"}, {"byte_budget", 4096}
@@ -1098,14 +1206,14 @@ int main() {
               }))),
               "byte_budget is rejected with reference mode index");
 
-        auto impossible = call_tool(server, 26, "memory_debug.inspect_address", JsonValue::object({
+        auto impossible = call_tool(server, 26, "memory_debug_inspect_address", JsonValue::object({
             {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
             {"min_executable_entries", 9}, {"vtable_entries", 4}
         }));
         check(impossible.has_value() && impossible->at("result").at("isError").as_bool(),
               "a minimum larger than the vtable sample is rejected");
 
-        auto unsupported_index = call_tool(server, 27, "memory_debug.inspect_address", JsonValue::object({
+        auto unsupported_index = call_tool(server, 27, "memory_debug_inspect_address", JsonValue::object({
             {"session_id", session_id}, {"address", "0x1004"}, {"pointer_size", "8"},
             {"references", JsonValue::object({{"mode", "index"}, {"index_id", "idx"}})}
         }));
@@ -1120,11 +1228,11 @@ int main() {
     {
         const auto& tools = catalog.definitions();
         const bool advertises_runtime = std::ranges::any_of(tools, [](const auto& tool) {
-            return tool.name.starts_with("memory_debug.unreal_runtime_");
+            return tool.name.starts_with("memory_debug_unreal_runtime_");
         });
         check(!advertises_runtime, "unreal runtime tools are absent while the feature gate is off");
 
-        auto refused = call_tool(server, 30, "memory_debug.unreal_runtime_discover", JsonValue::object({
+        auto refused = call_tool(server, 30, "memory_debug_unreal_runtime_discover", JsonValue::object({
             {"session_id", session_id}, {"profile_id", "ue5-fproperty-x64"}
         }));
         // An unadvertised tool is not dispatchable at all, so this arrives as a
@@ -1143,9 +1251,9 @@ int main() {
         std::size_t runtime_tools = 0;
         const argos::protocol::mcp::ToolDefinition* discover = nullptr;
         for (const auto& tool : enabled_catalog.definitions()) {
-            if (tool.name.starts_with("memory_debug.unreal_runtime_")) {
+            if (tool.name.starts_with("memory_debug_unreal_runtime_")) {
                 ++runtime_tools;
-                if (tool.name == "memory_debug.unreal_runtime_discover") discover = &tool;
+                if (tool.name == "memory_debug_unreal_runtime_discover") discover = &tool;
             }
         }
         check(runtime_tools == 5U, "enabling the feature advertises the full runtime surface");
@@ -1158,6 +1266,471 @@ int main() {
             check(roots.at("oneOf").as_array().size() == 2U,
                   "root forms are declared as mutually exclusive alternatives");
         }
+    }
+
+    // The Santa Monica surface needs the gate *and* an operator-configured
+    // peer. A request can never supply either, and the whole chain is exercised
+    // against the controlled synthetic peer, never a game.
+    {
+        const auto& tools = catalog.definitions();
+        const bool advertises = std::ranges::any_of(tools, [](const auto& tool) {
+            return tool.name.starts_with("memory_debug_santamonica_runtime_");
+        });
+        check(!advertises, "santa monica tools are absent while the feature gate is off");
+
+        auto refused = call_tool(server, 40, "memory_debug_santamonica_runtime_discover",
+                                 JsonValue::object({{"session_id", session_id}}));
+        const bool rejected = !refused.has_value() || refused->find("error") != nullptr ||
+            refused->at("result").at("isError").as_bool();
+        check(rejected, "calling the gated discovery without the gate fails");
+
+        argos::security::SecurityPolicy gate_only;
+        gate_only.enable_santamonica_runtime = true;
+        argos::application::MemoryDebugService gate_only_service{
+            std::make_unique<ContractProvider>(), gate_only
+        };
+        argos::protocol::mcp::ToolCatalog gate_only_catalog{gate_only_service, logger};
+        const bool advertises_without_peer = std::ranges::any_of(
+            gate_only_catalog.definitions(), [](const auto& tool) {
+                return tool.name.starts_with("memory_debug_santamonica_runtime_");
+            });
+        check(!advertises_without_peer, "the gate alone does not advertise the surface");
+
+#if defined(ARGOS_SANTAMONICA_PEER)
+        argos::security::SecurityPolicy enabled;
+        enabled.enable_santamonica_runtime = true;
+        enabled.santamonica_peer_path = ARGOS_SANTAMONICA_PEER;
+        argos::application::MemoryDebugService enabled_service{
+            std::make_unique<ContractProvider>(), enabled
+        };
+        argos::protocol::mcp::ToolCatalog enabled_catalog{enabled_service, logger};
+        argos::protocol::mcp::Server enabled_server{enabled_catalog, logger};
+
+        std::size_t santamonica_tools = 0;
+        for (const auto& tool : enabled_catalog.definitions()) {
+            if (tool.name.starts_with("memory_debug_santamonica_runtime_")) ++santamonica_tools;
+        }
+        check(santamonica_tools == 6U, "enabling gate and peer advertises the full surface");
+
+        std::string peer_session;
+        auto attached = call_tool(enabled_server, 41, "memory_debug_attach", JsonValue::object({
+            {"pid", 4242}, {"authorized", true}, {"access", "read_only"}
+        }));
+        if (const auto* data = successful_tool_data(attached); data != nullptr) {
+            peer_session = data->at("session_id").as_string();
+        }
+        check(!peer_session.empty(), "attach succeeds for the santa monica flow");
+
+        std::string runtime_id;
+        if (!peer_session.empty()) {
+            auto discovered = call_tool(enabled_server, 42,
+                                        "memory_debug_santamonica_runtime_discover",
+                                        JsonValue::object({{"session_id", peer_session}}));
+            const auto* data = successful_tool_data(discovered);
+            check(data != nullptr, "discovery against the controlled peer succeeds");
+            if (data != nullptr) {
+                runtime_id = data->at("runtime_id").as_string();
+                check(data->at("profile_id").as_string() == "argos-controlled-peer",
+                      "the published profile is the controlled peer, not a game build");
+                check(data->at("source").as_string() == "controlled-synthetic",
+                      "the payload says plainly that the peer is synthetic");
+                check(data->at("consistency").as_string() == "validated_best_effort",
+                      "a best-effort snapshot is never reported as stable");
+                check(data->at("coverage_complete").as_bool(), "declared coverage is reported");
+                const auto& counts = data->at("counts");
+                check(counts.at("types").as_integer() == 3, "every streamed type is admitted");
+                check(counts.at("fields").as_integer() == 5, "every streamed field is admitted");
+                check(counts.at("enums").as_integer() == 1, "every streamed enum is admitted");
+                check(counts.at("enum_values").as_integer() == 3, "every streamed enum value is admitted");
+                check(counts.at("sli_functions").as_integer() == 2, "every streamed SLI entry is admitted");
+            }
+        }
+
+        if (!runtime_id.empty()) {
+            auto first_page = call_tool(enabled_server, 43, "memory_debug_santamonica_runtime_types",
+                                        JsonValue::object({
+                                            {"session_id", peer_session},
+                                            {"runtime_id", runtime_id},
+                                            {"limit", 2}
+                                        }));
+            const auto* page = successful_tool_data(first_page);
+            check(page != nullptr, "the first type page is returned");
+            std::string next_token;
+            if (page != nullptr) {
+                check(page->at("types").as_array().size() == 2U, "the page honors the limit");
+                check(page->at("total_matched").as_integer() == 3, "paging reports the full match count");
+                check(page->at("next_page_token").is_string(), "a further page is offered");
+                if (page->at("next_page_token").is_string()) {
+                    next_token = page->at("next_page_token").as_string();
+                }
+                const auto& first = page->at("types").as_array().front();
+                check(first.at("type_id").is_string(), "metadata ids are opaque strings");
+                check(first.at("name").as_string() == "SyntheticBase", "type names survive the chain");
+            }
+            if (!next_token.empty()) {
+                auto second_page = call_tool(enabled_server, 44,
+                                             "memory_debug_santamonica_runtime_types",
+                                             JsonValue::object({
+                                                 {"session_id", peer_session},
+                                                 {"runtime_id", runtime_id},
+                                                 {"limit", 2},
+                                                 {"page_token", next_token}
+                                             }));
+                const auto* rest = successful_tool_data(second_page);
+                check(rest != nullptr, "the continuation page is returned");
+                if (rest != nullptr) {
+                    check(rest->at("types").as_array().size() == 1U, "the last page holds the remainder");
+                    check(rest->at("next_page_token").is_null(), "the final page offers no token");
+                }
+                // The token is bound to the query, not just to the context.
+                auto crossed = call_tool(enabled_server, 45, "memory_debug_santamonica_runtime_enums",
+                                         JsonValue::object({
+                                             {"session_id", peer_session},
+                                             {"runtime_id", runtime_id},
+                                             {"page_token", next_token}
+                                         }));
+                check(crossed.has_value() && crossed->at("result").at("isError").as_bool(),
+                      "a page token from another query is refused");
+            }
+
+            auto typed = call_tool(enabled_server, 46, "memory_debug_santamonica_runtime_type",
+                                   JsonValue::object({
+                                       {"session_id", peer_session},
+                                       {"runtime_id", runtime_id},
+                                       {"type_id", "2"},
+                                       {"include_inherited", true}
+                                   }));
+            const auto* type_data = successful_tool_data(typed);
+            check(type_data != nullptr, "one type is returned with its fields");
+            if (type_data != nullptr) {
+                check(type_data->at("type").at("name").as_string() == "SyntheticActor",
+                      "the requested type is returned");
+                check(type_data->at("type").at("base_type_id").as_string() == "1",
+                      "the base type is reported as an opaque id");
+                check(type_data->at("inheritance").as_array().size() == 1U,
+                      "the inheritance chain is reported");
+                const auto& fields = type_data->at("fields").as_array();
+                check(fields.size() == 4U, "declared and inherited fields are returned");
+                bool has_enum_field = false;
+                bool has_pointer_field = false;
+                for (const auto& field : fields) {
+                    if (field.at("kind").as_string() == "enumeration") has_enum_field = true;
+                    if (field.at("kind").as_string() == "pointer") has_pointer_field = true;
+                }
+                check(has_enum_field && has_pointer_field, "field kinds survive the whole chain");
+            }
+
+            auto without_inheritance = call_tool(enabled_server, 47,
+                                                 "memory_debug_santamonica_runtime_type",
+                                                 JsonValue::object({
+                                                     {"session_id", peer_session},
+                                                     {"runtime_id", runtime_id},
+                                                     {"type_id", "2"},
+                                                     {"include_inherited", false}
+                                                 }));
+            const auto* declared_only = successful_tool_data(without_inheritance);
+            check(declared_only != nullptr && declared_only->at("fields").as_array().size() == 3U,
+                  "inherited fields are only included on request");
+
+            auto missing_type = call_tool(enabled_server, 48,
+                                          "memory_debug_santamonica_runtime_type",
+                                          JsonValue::object({
+                                              {"session_id", peer_session},
+                                              {"runtime_id", runtime_id},
+                                              {"type_id", "9999"}
+                                          }));
+            check(missing_type.has_value() && missing_type->at("result").at("isError").as_bool(),
+                  "an unknown type id is refused");
+
+            auto enums = call_tool(enabled_server, 49, "memory_debug_santamonica_runtime_enums",
+                                   JsonValue::object({
+                                       {"session_id", peer_session}, {"runtime_id", runtime_id}
+                                   }));
+            const auto* enum_data = successful_tool_data(enums);
+            check(enum_data != nullptr, "enums are returned");
+            if (enum_data != nullptr) {
+                const auto& entries = enum_data->at("enums").as_array();
+                check(entries.size() == 1U, "the streamed enum is returned");
+                if (!entries.empty()) {
+                    const auto& values = entries.front().at("values").as_array();
+                    check(values.size() == 3U, "every enum value is returned");
+                    bool lossless = false;
+                    for (const auto& value : values) {
+                        if (value.at("value").as_string() == "18446744073709551615") lossless = true;
+                    }
+                    check(lossless, "a 64-bit enum value keeps its exact decimal spelling");
+                }
+            }
+
+            auto functions = call_tool(enabled_server, 50,
+                                       "memory_debug_santamonica_runtime_sli_functions",
+                                       JsonValue::object({
+                                           {"session_id", peer_session}, {"runtime_id", runtime_id}
+                                       }));
+            const auto* function_data = successful_tool_data(functions);
+            check(function_data != nullptr, "SLI entries are returned");
+            if (function_data != nullptr) {
+                const auto& entries = function_data->at("sli_functions").as_array();
+                check(entries.size() == 2U, "every SLI entry is returned");
+                const bool none_invocable = std::ranges::none_of(entries, [](const auto& entry) {
+                    return entry.at("invocable").as_bool();
+                });
+                check(none_invocable, "no SLI entry is ever reported as invocable");
+            }
+
+            auto foreign = call_tool(enabled_server, 51, "memory_debug_santamonica_runtime_types",
+                                     JsonValue::object({
+                                         {"session_id", session_id}, {"runtime_id", runtime_id}
+                                     }));
+            check(foreign.has_value() && foreign->at("result").at("isError").as_bool(),
+                  "a context is invisible to a session that does not own it");
+
+            auto released = call_tool(enabled_server, 52, "memory_debug_santamonica_runtime_release",
+                                      JsonValue::object({
+                                          {"session_id", peer_session}, {"runtime_id", runtime_id}
+                                      }));
+            check(successful_tool_data(released) != nullptr, "release succeeds");
+            auto again = call_tool(enabled_server, 53, "memory_debug_santamonica_runtime_release",
+                                   JsonValue::object({
+                                       {"session_id", peer_session}, {"runtime_id", runtime_id}
+                                   }));
+            check(successful_tool_data(again) != nullptr, "release is idempotent for the owner");
+            auto after_release = call_tool(enabled_server, 54,
+                                           "memory_debug_santamonica_runtime_types",
+                                           JsonValue::object({
+                                               {"session_id", peer_session}, {"runtime_id", runtime_id}
+                                           }));
+            check(after_release.has_value() && after_release->at("result").at("isError").as_bool(),
+                  "a released context answers no further query");
+
+            // A fresh discovery gets a new snapshot identity, never the old one.
+            auto rediscovered = call_tool(enabled_server, 55,
+                                          "memory_debug_santamonica_runtime_discover",
+                                          JsonValue::object({{"session_id", peer_session}}));
+            const auto* second = successful_tool_data(rediscovered);
+            check(second != nullptr, "a discovery after release succeeds");
+            if (second != nullptr) {
+                check(second->at("runtime_id").as_string() != runtime_id,
+                      "a new discovery publishes a new context");
+            }
+        }
+#endif
+    }
+
+    // Native path: parser -> policy -> application -> reader -> catalog -> MCP.
+    {
+        auto profiles = argos::security::parse_santamonica_build_profiles(
+            "contract|gow2018-reflection-x64-v2|Contract.exe|4096|" + std::string(64, 'a') +
+            "|100|150|800|A00|200|220|300|320|400|420|B00");
+        check(profiles.has_value(), "native contract profile parses");
+        argos::security::SecurityPolicy native_policy;
+        native_policy.enable_santamonica_runtime = true;
+        if (profiles) native_policy.santamonica_build_profiles = *profiles;
+        argos::application::MemoryDebugService native_service{std::make_unique<ContractProvider>(true), native_policy};
+        argos::protocol::mcp::ToolCatalog native_catalog{native_service, logger};
+        argos::protocol::mcp::Server native_server{native_catalog, logger};
+        auto attach = call_tool(native_server, 70, "memory_debug_attach", JsonValue::object({
+            {"pid", 4242}, {"authorized", true}, {"access", "read_only"}}));
+        if (const auto* attached = successful_tool_data(attach)) {
+            const auto owner = attached->at("session_id").as_string();
+            auto discover = call_tool(native_server, 71, "memory_debug_santamonica_runtime_discover",
+                                      JsonValue::object({{"session_id", owner}}));
+            if (const auto* found = successful_tool_data(discover)) {
+                const auto runtime = found->at("runtime_id").as_string();
+                const auto& counts = found->at("counts");
+                check(found->at("source").as_string() == "native-type-table" &&
+                      !found->at("coverage_complete").as_bool(), "native discovery preserves source and coverage");
+                check(counts.at("types").as_integer() == 1 && counts.at("fields").as_integer() == 1 &&
+                      counts.at("enums").as_integer() == 1 && counts.at("enum_values").as_integer() == 1 &&
+                      counts.at("sli_functions").as_integer() == 1, "all configured native ranges reach the MCP catalog");
+                auto page = call_tool(native_server, 72, "memory_debug_santamonica_runtime_types",
+                                     JsonValue::object({{"session_id", owner}, {"runtime_id", runtime}}));
+                if (const auto* types = successful_tool_data(page); types && !types->at("types").as_array().empty()) {
+                    const auto type_id = types->at("types").as_array().front().at("type_id").as_string();
+                    auto detail = call_tool(native_server, 73, "memory_debug_santamonica_runtime_type",
+                        JsonValue::object({{"session_id", owner}, {"runtime_id", runtime}, {"type_id", type_id}}));
+                    if (const auto* type = successful_tool_data(detail)) {
+                        check(type->at("fields").as_array().size() == 1 &&
+                              type->at("fields").as_array().front().at("kind").as_string() == "enumeration",
+                              "native enum fields are available through type detail");
+                    }
+                }
+                const auto tool_failed = [](const std::optional<JsonValue>& response) {
+                    return !response.has_value() || response->find("error") != nullptr ||
+                        response->at("result").at("isError").as_bool();
+                };
+                check(found->at("resources_published").as_bool(), "a rooted profile publishes resources");
+                auto resources = call_tool(native_server, 80, "memory_debug_santamonica_runtime_resources",
+                    JsonValue::object({{"session_id", owner}, {"runtime_id", runtime}}));
+                if (const auto* resource_page = successful_tool_data(resources)) {
+                    const auto& entries = resource_page->at("resources").as_array();
+                    check(entries.size() == 2U && resource_page->at("resource_count").as_integer() == 2,
+                          "the synthetic store reaches the MCP surface");
+                    if (entries.size() == 2U) {
+                        check(entries[0].at("name").as_string() == "ContractOre" &&
+                              entries[0].at("quantity").as_integer() == 5 &&
+                              entries[0].at("acquired").as_bool() && entries[0].at("unlimited").as_bool() &&
+                              entries[0].at("maximum").is_null(),
+                              "an acquired uncapped resource is reported with its quantity");
+                        check(entries[1].at("name").as_string() == "ContractKey" &&
+                              !entries[1].at("acquired").as_bool() && entries[1].at("quantity").as_integer() == 0 &&
+                              entries[1].at("maximum").as_integer() == 1,
+                              "a never-acquired resource reports zero and its cap");
+                    }
+                    check(resource_page->at("consistency").as_string() == "validated_best_effort" &&
+                          !resource_page->at("mutation_safe").as_bool(), "resource pages declare their consistency");
+                } else {
+                    check(false, "resources are readable from a read-only session");
+                }
+                auto filtered = call_tool(native_server, 81, "memory_debug_santamonica_runtime_resources",
+                    JsonValue::object({{"session_id", owner}, {"runtime_id", runtime}, {"name_contains", "ORE"},
+                                       {"acquired_only", true}}));
+                const auto* narrowed = successful_tool_data(filtered);
+                check(narrowed != nullptr && narrowed->at("total_matched").as_integer() == 1,
+                      "the resource filter is case-insensitive and honors acquired_only");
+                auto first_page = call_tool(native_server, 82, "memory_debug_santamonica_runtime_resources",
+                    JsonValue::object({{"session_id", owner}, {"runtime_id", runtime}, {"limit", 1}}));
+                const auto* paged = successful_tool_data(first_page);
+                check(paged != nullptr && paged->at("next_page_token").is_string(),
+                      "a partial resource page carries a continuation");
+                if (paged != nullptr && paged->at("next_page_token").is_string()) {
+                    const auto token = paged->at("next_page_token").as_string();
+                    auto second_page = call_tool(native_server, 83, "memory_debug_santamonica_runtime_resources",
+                        JsonValue::object({{"session_id", owner}, {"runtime_id", runtime}, {"limit", 1},
+                                           {"page_token", token}}));
+                    const auto* rest = successful_tool_data(second_page);
+                    check(rest != nullptr && rest->at("resources").as_array().size() == 1U &&
+                          rest->at("resources").as_array().front().at("name").as_string() == "ContractKey" &&
+                          rest->at("next_page_token").is_null(),
+                          "the continuation returns the last resource");
+                    auto mixed = call_tool(native_server, 84, "memory_debug_santamonica_runtime_resources",
+                        JsonValue::object({{"session_id", owner}, {"runtime_id", runtime}, {"refresh", true},
+                                           {"page_token", token}}));
+                    check(tool_failed(mixed), "refresh cannot continue an old page");
+                    auto refreshed = call_tool(native_server, 86, "memory_debug_santamonica_runtime_resources",
+                        JsonValue::object({{"session_id", owner}, {"runtime_id", runtime}, {"refresh", true}}));
+                    const auto* renewed = successful_tool_data(refreshed);
+                    check(renewed != nullptr && renewed->at("generation").as_integer() == 2,
+                          "a refresh publishes a new generation");
+                    auto stale = call_tool(native_server, 87, "memory_debug_santamonica_runtime_resources",
+                        JsonValue::object({{"session_id", owner}, {"runtime_id", runtime}, {"limit", 1},
+                                           {"page_token", token}}));
+                    check(tool_failed(stale), "a page token from before a refresh is stale");
+                }
+                auto read_only_write = call_tool(native_server, 85, "memory_debug_santamonica_runtime_set_resource",
+                    JsonValue::object({{"session_id", owner}, {"runtime_id", runtime}, {"name", "ContractOre"},
+                                       {"quantity", 9}, {"confirmation", "AUTHORIZED_DEBUG_WRITE"}}));
+                check(tool_failed(read_only_write), "a read-only session cannot set a resource");
+
+                auto release = call_tool(native_server, 74, "memory_debug_santamonica_runtime_release",
+                                         JsonValue::object({{"session_id", owner}, {"runtime_id", runtime}}));
+                check(successful_tool_data(release) != nullptr, "native context releases normally");
+            }
+        }
+    }
+
+    // Resource writes through a read_write session over the same synthetic image.
+    {
+        auto profiles = argos::security::parse_santamonica_build_profiles(
+            "contract|gow2018-reflection-x64-v2|Contract.exe|4096|" + std::string(64, 'a') +
+            "|100|150|800|A00|200|220|300|320|400|420|B00");
+        check(profiles.has_value(), "the writable contract profile parses");
+        argos::security::SecurityPolicy writable_policy;
+        writable_policy.enable_santamonica_runtime = true;
+        if (profiles) writable_policy.santamonica_build_profiles = *profiles;
+        argos::application::MemoryDebugService writable_service{
+            std::make_unique<ContractProvider>(true), writable_policy
+        };
+        argos::protocol::mcp::ToolCatalog writable_catalog{writable_service, logger};
+        argos::protocol::mcp::Server writable_server{writable_catalog, logger};
+        const auto tool_failed = [](const std::optional<JsonValue>& response) {
+            return !response.has_value() || response->find("error") != nullptr ||
+                response->at("result").at("isError").as_bool();
+        };
+
+        std::size_t resource_tools = 0;
+        for (const auto& tool : writable_catalog.definitions()) {
+            if (tool.name == "memory_debug_santamonica_runtime_resources" ||
+                tool.name == "memory_debug_santamonica_runtime_set_resource") {
+                ++resource_tools;
+            }
+        }
+        check(resource_tools == 2U, "a rooted build profile advertises both resource tools");
+
+        auto attach = call_tool(writable_server, 90, "memory_debug_attach", JsonValue::object({
+            {"pid", 4242}, {"authorized", true}, {"access", "read_write"}}));
+        const auto* attached = successful_tool_data(attach);
+        check(attached != nullptr, "a read_write session attaches to the synthetic target");
+        if (attached != nullptr) {
+            const auto owner = attached->at("session_id").as_string();
+            auto discover = call_tool(writable_server, 91, "memory_debug_santamonica_runtime_discover",
+                                      JsonValue::object({{"session_id", owner}}));
+            const auto* found = successful_tool_data(discover);
+            check(found != nullptr, "a read_write session discovers the synthetic build");
+            if (found != nullptr) {
+                const auto runtime = found->at("runtime_id").as_string();
+                const auto set = [&](const std::int64_t id, const std::string& resource,
+                                     const std::int64_t quantity, const std::string& confirmation) {
+                    return call_tool(writable_server, id, "memory_debug_santamonica_runtime_set_resource",
+                        JsonValue::object({{"session_id", owner}, {"runtime_id", runtime}, {"name", resource},
+                                           {"quantity", quantity}, {"confirmation", confirmation}}));
+                };
+                auto warm = call_tool(writable_server, 92, "memory_debug_santamonica_runtime_resources",
+                    JsonValue::object({{"session_id", owner}, {"runtime_id", runtime}}));
+                check(successful_tool_data(warm) != nullptr, "the store is readable before a write");
+
+                auto written = set(93, "ContractOre", 9, "AUTHORIZED_DEBUG_WRITE");
+                if (const auto* outcome = successful_tool_data(written)) {
+                    check(outcome->at("previous").as_integer() == 5 && outcome->at("observed").as_integer() == 9 &&
+                          outcome->at("requested").as_integer() == 9 && outcome->at("verified").as_bool(),
+                          "a resource write is verified by reading it back");
+                    check(outcome->at("mechanism").as_string() == "direct_balance_write" &&
+                          !outcome->at("engine_transaction").as_bool(),
+                          "a resource write never claims an engine transaction");
+                } else {
+                    check(false, "an acquired resource can be set");
+                }
+                auto cached = call_tool(writable_server, 94, "memory_debug_santamonica_runtime_resources",
+                    JsonValue::object({{"session_id", owner}, {"runtime_id", runtime},
+                                       {"name_contains", "ContractOre"}}));
+                const auto* after = successful_tool_data(cached);
+                check(after != nullptr && after->at("resources").as_array().size() == 1U &&
+                      after->at("resources").as_array().front().at("quantity").as_integer() == 9,
+                      "a write invalidates the cached snapshot");
+                check(tool_failed(set(95, "ContractKey", 1, "AUTHORIZED_DEBUG_WRITE")),
+                      "a never-acquired resource cannot be set");
+                check(tool_failed(set(96, "ContractOre", 7, "please")), "a write without the phrase is refused");
+                check(tool_failed(set(97, "MissingResource", 1, "AUTHORIZED_DEBUG_WRITE")),
+                      "an unknown resource name is refused");
+                check(tool_failed(set(98, "contractore", 1, "AUTHORIZED_DEBUG_WRITE")),
+                      "the resource name used for a write is exact");
+                auto unchanged = call_tool(writable_server, 99, "memory_debug_santamonica_runtime_resources",
+                    JsonValue::object({{"session_id", owner}, {"runtime_id", runtime}, {"refresh", true},
+                                       {"name_contains", "ContractOre"}}));
+                const auto* kept = successful_tool_data(unchanged);
+                check(kept != nullptr && kept->at("resources").as_array().front().at("quantity").as_integer() == 9,
+                      "refused writes leave the balance untouched");
+            }
+        }
+    }
+
+    // A profile without a resource root advertises no resource tool.
+    {
+        auto profiles = argos::security::parse_santamonica_build_profiles(
+            "contract|gow2018-reflection-x64-v2|Contract.exe|4096|" + std::string(64, 'a') +
+            "|100|150|800|A00|200|220|300|320|400|420");
+        argos::security::SecurityPolicy unrooted_policy;
+        unrooted_policy.enable_santamonica_runtime = true;
+        if (profiles) unrooted_policy.santamonica_build_profiles = *profiles;
+        argos::application::MemoryDebugService unrooted_service{
+            std::make_unique<ContractProvider>(true), unrooted_policy
+        };
+        argos::protocol::mcp::ToolCatalog unrooted_catalog{unrooted_service, logger};
+        const bool advertises_resources = std::ranges::any_of(unrooted_catalog.definitions(), [](const auto& tool) {
+            return tool.name == "memory_debug_santamonica_runtime_resources" ||
+                tool.name == "memory_debug_santamonica_runtime_set_resource";
+        });
+        check(!advertises_resources, "resource tools stay hidden without a resource root");
     }
 
     const auto notification = argos::protocol::json::Value::object({

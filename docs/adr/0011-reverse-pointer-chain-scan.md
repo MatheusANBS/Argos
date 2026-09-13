@@ -11,7 +11,7 @@ dinâmico (heap/stack, que muda a cada execução), descobrir automaticamente
 uma cadeia ESTÁVEL — ancorada em `module_base + offset` estático, que
 sobrevive a reinícios porque os módulos recarregam em base relativa fixa
 mesmo com ASLR. Hoje o cliente teria que alternar manualmente
-`scan_pointers_to` + `memory_debug.modules`, checando à mão se cada hit caiu
+`scan_pointers_to` + `memory_debug_modules`, checando à mão se cada hit caiu
 num módulo e recorrendo à mão o que não caiu — muitas idas e voltas, sem
 proteção contra ciclos, propenso a erro. Não é problema de performance de
 varredura (o scan via leitura direta de memória já é o caminho eficiente); é
@@ -19,7 +19,7 @@ uma orquestração ausente.
 
 ## Decisão
 
-Adicionar `memory_debug.scan_pointer_chains`, implementada em
+Adicionar `memory_debug_scan_pointer_chains`, implementada em
 `MemoryDebugService::scan_pointer_chains`, como uma BFS limitada por cima da
 MESMA rotina interna de varredura de `scan_pointers_to`/`scan_exact` (mandato
 de reuso da ADR-0007 — sem duplicar a lógica de scan). Cada nível da BFS é

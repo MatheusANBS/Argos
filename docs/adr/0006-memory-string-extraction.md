@@ -4,7 +4,7 @@ Status: aceito
 
 ## Contexto
 
-Ler um módulo inteiro com `memory_debug.read` para localizar nomes de campos
+Ler um módulo inteiro com `memory_debug_read` para localizar nomes de campos
 e tags de depuração produz um payload hex grande o suficiente para estourar
 limites de tokens do cliente MCP, obrigando a salvar em arquivo e pós-
 processar fora do protocolo. O caso de uso "encontrar classes e campos sem
@@ -14,7 +14,7 @@ tags de alocador, mensagens de log), não dos bytes crus.
 
 ## Decisão
 
-Adicionar a tool `memory_debug.strings`, implementada inteiramente na camada
+Adicionar a tool `memory_debug_strings`, implementada inteiramente na camada
 de aplicação (`MemoryDebugService::extract_strings`) sobre `ProcessSession::read`
 e `regions()`/`modules()` já existentes — nenhuma porta nova de domínio é
 necessária. O servidor varre o intervalo pedido (ou módulo/região indicada),

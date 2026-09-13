@@ -5,11 +5,11 @@ do jogo e nao injeta DLL, thread ou codigo no processo-alvo.
 
 ## Metodo implementado: PDB
 
-Depois de `memory_debug.attach` e `memory_debug.modules`, use:
+Depois de `memory_debug_attach` e `memory_debug_modules`, use:
 
 ```json
 {
-  "name": "memory_debug.pdb_type",
+  "name": "memory_debug_pdb_type",
   "arguments": {
     "session_id": "...",
     "module": "Game.exe",
@@ -19,7 +19,7 @@ Depois de `memory_debug.attach` e `memory_debug.modules`, use:
 }
 ```
 
-O `module` precisa ser o nome ou caminho retornado por `memory_debug.modules`.
+O `module` precisa ser o nome ou caminho retornado por `memory_debug_modules`.
 O MCP chama DbgHelp no proprio processo, carrega o modulo e consulta o PDB
 correspondente. A resposta informa tamanho, nome, offset e tamanho de cada
 campo, alem de `source: pdb:dbghelp`, `confidence: high` e `truncated`.
@@ -33,7 +33,7 @@ Fontes oficiais:
 Sem PDB correspondente, o MCP nao transforma assinatura, scan ou nome de
 funcao em layout confirmado.
 
-Quando o nome do tipo ainda nao e conhecido, `memory_debug.pdb_list_types`
+Quando o nome do tipo ainda nao e conhecido, `memory_debug_pdb_list_types`
 enumera os tipos (`class`/`struct`/`enum`/`union`) presentes no PDB do modulo
 carregado (via `SymEnumTypesW`), com filtro opcional por nome/kind. O
 resultado e so um indice leve (`name`, `kind`, `size`); o layout completo de
@@ -53,7 +53,7 @@ Fontes oficiais:
 - [Arquivos gerados por build Windows IL2CPP (Unity)](https://docs.unity3d.com/ja/current/Manual/WindowsPlayerIL2CPPScriptingBackend.html)
 - [PreserveAttribute e stripping (Unity)](https://docs.unity3d.com/es/current/ScriptReference/Scripting.PreserveAttribute.html)
 
-Implementacao real no MCP: `memory_debug.unity_type`.
+Implementacao real no MCP: `memory_debug_unity_type`.
 
 O adapter procura `global-metadata.dat` em localizacoes de build ao lado do
 modulo carregado, valida o magic/header, versao 24--31, limites das tabelas e
@@ -66,7 +66,7 @@ Exemplo:
 
 ```json
 {
-  "name": "memory_debug.unity_type",
+  "name": "memory_debug_unity_type",
   "arguments": {
     "session_id": "...",
     "module": "GameAssembly.dll",
@@ -81,7 +81,7 @@ Metodo de maior eficacia sem injecao:
 1. Identificar Mono ou IL2CPP a partir dos artefatos do build.
 2. Para IL2CPP, conferir `GameAssembly.dll`, `SymbolMap` e, quando o build
    preservou debug, os PDB/arquivos de debug gerados.
-3. Consultar `memory_debug.pdb_type` no modulo cujo PDB corresponde exatamente
+3. Consultar `memory_debug_pdb_type` no modulo cujo PDB corresponde exatamente
    ao binario carregado.
 4. Tratar metadata ausente, criptografada ou removida por stripping como
    ausencia de evidencia; o parser retorna erro, nao tenta descriptografar ou
@@ -93,11 +93,11 @@ versoes futuras ou layouts obfuscados retornam `unsupported`/`parse_error`.
 
 ## Unreal Engine
 
-Implementacao real no MCP: `memory_debug.unreal_type` e
-`memory_debug.unreal_reflection`.
+Implementacao real no MCP: `memory_debug_unreal_type` e
+`memory_debug_unreal_reflection`.
 
-`memory_debug.unreal_type` consulta tipos `A/U/F/E/I` emitidos pelo build nativo
-e pelo Unreal Header Tool no PDB correspondente. `memory_debug.unreal_reflection`
+`memory_debug_unreal_type` consulta tipos `A/U/F/E/I` emitidos pelo build nativo
+e pelo Unreal Header Tool no PDB correspondente. `memory_debug_unreal_reflection`
 enumera simbolos UHT `StaticClass` e `StaticStruct`, devolvendo seus RVAs
 relativos ao modulo carregado. Ambos rodam no processo MCP e nao chamam funcoes
 do processo-alvo.

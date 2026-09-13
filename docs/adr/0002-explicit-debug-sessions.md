@@ -8,7 +8,7 @@ Reutilizar PID diretamente em cada tool facilitaria chamadas acidentais e dificu
 
 ## Decisão
 
-`memory_debug.attach` exige `authorized: true` e retorna um `session_id` opaco. Todas as operações posteriores usam esse handle. O servidor restringe processos ao mesmo usuário por padrão. Escrita depende de configuração no startup, sessão `read_write` e confirmação por chamada.
+`memory_debug_attach` exige `authorized: true` e retorna um `session_id` opaco. Todas as operações posteriores usam esse handle. O servidor restringe processos ao mesmo usuário por padrão. Escrita depende de configuração no startup, sessão `read_write` e confirmação por chamada.
 
 ## Consequências
 

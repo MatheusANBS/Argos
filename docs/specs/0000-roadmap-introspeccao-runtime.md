@@ -12,11 +12,11 @@ tarefa "encontrar classes e offsets" muito mais lenta do que deveria:
    os próprios endereços de `GameState`, `Player`, `Pattern` e o comando
    `scan_exact` correto no `stdout` — informação inacessível porque o MCP só
    anexa a processos já em execução.
-2. `memory_debug.read` devolve bytes crus em hex. Para extrair nomes de
+2. `memory_debug_read` devolve bytes crus em hex. Para extrair nomes de
    campos foi preciso ler um módulo inteiro, estourar o limite de tokens do
    cliente, salvar em arquivo e escrever um script externo de extração de
    strings.
-3. `memory_debug.pdb_type` exige o nome exato do tipo. Sem enumeração, só é
+3. `memory_debug_pdb_type` exige o nome exato do tipo. Sem enumeração, só é
    possível consultar tipos cujo nome já é conhecido por outra via.
 4. Não existe scan incremental (estilo Cheat Engine). `scan_exact` só
    encontra um padrão de bytes já conhecido; não há como isolar o offset de

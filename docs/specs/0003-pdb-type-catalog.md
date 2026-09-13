@@ -1,4 +1,4 @@
-# Spec 0003 — `memory_debug.pdb_list_types`
+# Spec 0003 — `memory_debug_pdb_list_types`
 
 Status: aceito · ADR: [0008](../adr/0008-pdb-type-catalog-enumeration.md)
 
@@ -7,7 +7,7 @@ Status: aceito · ADR: [0008](../adr/0008-pdb-type-catalog-enumeration.md)
 Enumerar os tipos nativos disponíveis no PDB de um módulo já carregado na
 sessão, para que o cliente descubra nomes de tipo (`GameState`, `Player`,
 `FMyStruct`...) sem precisar já conhecê-los por outra via antes de chamar
-`memory_debug.pdb_type`.
+`memory_debug_pdb_type`.
 
 ## Contrato de domínio
 
@@ -65,7 +65,7 @@ std::size_t max_type_catalog_symbols{2048U};
 
 ## Contrato de API (MCP)
 
-Tool: `memory_debug.pdb_list_types`
+Tool: `memory_debug_pdb_list_types`
 
 ```json
 {

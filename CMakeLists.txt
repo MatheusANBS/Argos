@@ -40,10 +40,25 @@ include(CompilerWarnings)
 include(Sanitizers)
 include(StaticAnalysis)
 
+# Vendored x86/x64 decoder for the read-only disassembler (ADR-0029). Build only
+# the static library; the upstream examples, tools, tests and Doxygen are not
+# part of this project. Zydis is third-party C: its own warning and analysis
+# settings apply, not ours.
+set(ZYDIS_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/zydis EXCLUDE_FROM_ALL)
+
 add_library(argos_domain
     src/domain/types.cpp
     src/domain/address_inspection.cpp
     src/domain/unreal_runtime.cpp
+    src/domain/santa_monica_runtime.cpp
+    src/domain/santa_monica_bridge.cpp
+    src/domain/santa_monica_inventory.cpp
+    src/domain/disassembly.cpp
 )
 target_include_directories(argos_domain PUBLIC include)
 target_compile_features(argos_domain PUBLIC cxx_std_23)
@@ -55,15 +70,29 @@ add_library(argos_infrastructure
     src/infrastructure/native_process_memory.cpp
     src/infrastructure/pdb_type_metadata.cpp
     src/infrastructure/output_ring_buffer.cpp
+    src/infrastructure/santa_monica_reflection_stream.cpp
+    src/infrastructure/santa_monica_bridge_crypto.cpp
+    src/infrastructure/santa_monica_handshake_stream.cpp
+    src/infrastructure/santa_monica_bridge_channel.cpp
+    src/infrastructure/santa_monica_bridge_peer.cpp
+    src/infrastructure/santa_monica_native_reader.cpp
+    src/infrastructure/santa_monica_inventory_reader.cpp
+    src/infrastructure/zydis_disassembler.cpp
 )
 target_include_directories(argos_infrastructure PUBLIC include)
 target_link_libraries(argos_infrastructure PUBLIC argos_domain)
+# Zydis is an implementation detail behind the Disassembler port, so it is a
+# private link dependency: no Zydis type appears in argos_infrastructure's
+# public headers (ADR-0029).
+target_link_libraries(argos_infrastructure PRIVATE Zydis)
 target_compile_features(argos_infrastructure PUBLIC cxx_std_23)
 argos_set_warnings(argos_infrastructure)
 argos_enable_sanitizers(argos_infrastructure)
 argos_enable_static_analysis(argos_infrastructure)
 if(WIN32)
-    target_link_libraries(argos_infrastructure PRIVATE advapi32 dbghelp)
+    # bcrypt is the system CNG provider used for HMAC-SHA-256 and nonces
+    # (ADR-0024); no cryptographic primitive is implemented in this repository.
+    target_link_libraries(argos_infrastructure PRIVATE advapi32 dbghelp bcrypt)
 endif()
 
 add_library(argos_application
@@ -71,6 +100,8 @@ add_library(argos_application
     src/application/scan_session_manager.cpp
     src/application/unreal_runtime_manager.cpp
     src/application/memory_debug_service.cpp
+    src/application/memory_debug_service_santamonica.cpp
+    src/application/santa_monica_runtime_manager.cpp
     src/application/analysis_job_manager.cpp
     src/security/policy.cpp
 )
@@ -113,6 +144,15 @@ argos_enable_sanitizers(argos_debug_target_game)
 if(WIN32)
     target_link_libraries(argos_debug_target_game PRIVATE user32)
 
+    # Controlled synthetic peer for the Santa Monica channel (ADR-0025). It
+    # speaks the protocol with made-up metadata; it is not a game bridge.
+    add_executable(argos_santa_monica_peer tools/santa_monica_peer.cpp)
+    target_link_libraries(argos_santa_monica_peer PRIVATE argos_infrastructure)
+    target_compile_features(argos_santa_monica_peer PRIVATE cxx_std_23)
+    argos_set_warnings(argos_santa_monica_peer)
+    argos_enable_sanitizers(argos_santa_monica_peer)
+    argos_enable_static_analysis(argos_santa_monica_peer)
+
     add_library(argos_debug_bridge SHARED tools/debug_bridge.cpp)
     target_compile_features(argos_debug_bridge PRIVATE cxx_std_23)
     argos_set_warnings(argos_debug_bridge)
@@ -123,7 +163,7 @@ endif()
 
 install(TARGETS argos_runtime_memory_mcp RUNTIME DESTINATION bin)
 if(WIN32)
-    install(TARGETS argos_debug_bridge RUNTIME DESTINATION bin)
+    install(TARGETS argos_debug_bridge argos_santa_monica_peer RUNTIME DESTINATION bin)
 endif()
 
 if(ARGOS_BUILD_TESTS)
@@ -164,5 +204,73 @@ if(ARGOS_BUILD_TESTS)
     target_compile_features(argos_contract_tests PRIVATE cxx_std_23)
     argos_set_warnings(argos_contract_tests)
     argos_enable_sanitizers(argos_contract_tests)
+    if(WIN32)
+        # The contract test drives the whole chain against the controlled peer,
+        # so it needs the exact binary CMake just built.
+        target_compile_definitions(argos_contract_tests PRIVATE
+            ARGOS_SANTAMONICA_PEER="$<TARGET_FILE:argos_santa_monica_peer>")
+        add_dependencies(argos_contract_tests argos_santa_monica_peer)
+    endif()
     add_test(NAME argos_contract_tests COMMAND argos_contract_tests)
+
+    add_executable(argos_disassembly_tests tests/unit/test_disassembly.cpp)
+    target_include_directories(argos_disassembly_tests PRIVATE tests/unit)
+    target_link_libraries(argos_disassembly_tests PRIVATE argos_protocol)
+    target_compile_features(argos_disassembly_tests PRIVATE cxx_std_23)
+    argos_set_warnings(argos_disassembly_tests)
+    argos_enable_sanitizers(argos_disassembly_tests)
+    add_test(NAME argos_disassembly_tests COMMAND argos_disassembly_tests)
+
+    add_executable(argos_santa_monica_runtime_tests tests/unit/test_santa_monica_runtime.cpp)
+    target_link_libraries(argos_santa_monica_runtime_tests PRIVATE argos_domain)
+    target_compile_features(argos_santa_monica_runtime_tests PRIVATE cxx_std_23)
+    argos_set_warnings(argos_santa_monica_runtime_tests)
+    argos_enable_sanitizers(argos_santa_monica_runtime_tests)
+    argos_enable_static_analysis(argos_santa_monica_runtime_tests)
+    add_test(NAME argos_santa_monica_runtime_tests COMMAND argos_santa_monica_runtime_tests)
+
+    add_executable(argos_santa_monica_stream_tests tests/unit/test_santa_monica_reflection_stream.cpp)
+    target_link_libraries(argos_santa_monica_stream_tests PRIVATE argos_infrastructure)
+    target_compile_features(argos_santa_monica_stream_tests PRIVATE cxx_std_23)
+    argos_set_warnings(argos_santa_monica_stream_tests)
+    argos_enable_sanitizers(argos_santa_monica_stream_tests)
+    argos_enable_static_analysis(argos_santa_monica_stream_tests)
+    add_test(NAME argos_santa_monica_stream_tests COMMAND argos_santa_monica_stream_tests)
+
+    add_executable(argos_santa_monica_bridge_tests tests/unit/test_santa_monica_bridge.cpp)
+    target_link_libraries(argos_santa_monica_bridge_tests PRIVATE argos_infrastructure)
+    target_compile_features(argos_santa_monica_bridge_tests PRIVATE cxx_std_23)
+    argos_set_warnings(argos_santa_monica_bridge_tests)
+    argos_enable_sanitizers(argos_santa_monica_bridge_tests)
+    argos_enable_static_analysis(argos_santa_monica_bridge_tests)
+    if(WIN32)
+        # The test cross-checks the provider HMAC against the RFC 2104
+        # construction, so it calls CNG directly as well.
+        target_link_libraries(argos_santa_monica_bridge_tests PRIVATE bcrypt)
+    endif()
+    add_test(NAME argos_santa_monica_bridge_tests COMMAND argos_santa_monica_bridge_tests)
+
+    add_executable(argos_santa_monica_channel_tests tests/unit/test_santa_monica_channel.cpp)
+    target_link_libraries(argos_santa_monica_channel_tests PRIVATE argos_infrastructure)
+    target_compile_features(argos_santa_monica_channel_tests PRIVATE cxx_std_23)
+    argos_set_warnings(argos_santa_monica_channel_tests)
+    argos_enable_sanitizers(argos_santa_monica_channel_tests)
+    argos_enable_static_analysis(argos_santa_monica_channel_tests)
+    add_test(NAME argos_santa_monica_channel_tests COMMAND argos_santa_monica_channel_tests)
+
+    add_executable(argos_santa_monica_native_tests tests/unit/test_santa_monica_native_reader.cpp)
+    target_link_libraries(argos_santa_monica_native_tests PRIVATE argos_infrastructure)
+    target_compile_features(argos_santa_monica_native_tests PRIVATE cxx_std_23)
+    argos_set_warnings(argos_santa_monica_native_tests)
+    argos_enable_sanitizers(argos_santa_monica_native_tests)
+    argos_enable_static_analysis(argos_santa_monica_native_tests)
+    add_test(NAME argos_santa_monica_native_tests COMMAND argos_santa_monica_native_tests)
+
+    add_executable(argos_santa_monica_inventory_tests tests/unit/test_santa_monica_inventory.cpp)
+    target_link_libraries(argos_santa_monica_inventory_tests PRIVATE argos_infrastructure)
+    target_compile_features(argos_santa_monica_inventory_tests PRIVATE cxx_std_23)
+    argos_set_warnings(argos_santa_monica_inventory_tests)
+    argos_enable_sanitizers(argos_santa_monica_inventory_tests)
+    argos_enable_static_analysis(argos_santa_monica_inventory_tests)
+    add_test(NAME argos_santa_monica_inventory_tests COMMAND argos_santa_monica_inventory_tests)
 endif()

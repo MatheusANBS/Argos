@@ -8,8 +8,8 @@ pela ADR-0020; jobs e descoberta multipadrão permanecem propostos)
 O suporte Unreal atual consulta exclusivamente o PDB correspondente ao módulo
 carregado. Esse caminho é reproduzível e continua sendo a fonte preferida para
 layout nativo, mas builds distribuídas frequentemente não preservam símbolos.
-Nesses casos, `memory_debug.unreal_type` e
-`memory_debug.unreal_reflection` não conseguem enumerar classes, objetos ou
+Nesses casos, `memory_debug_unreal_type` e
+`memory_debug_unreal_reflection` não conseguem enumerar classes, objetos ou
 `FProperty`, embora o próprio runtime mantenha metadados de reflexão.
 
 ADR-0005 deliberadamente proibiu transformar scans genéricos em layouts
@@ -66,11 +66,11 @@ fato apenas porque um nome legível foi encontrado.
 
 A superfície MCP será distinta das tools PDB atuais:
 
-- `memory_debug.unreal_runtime_discover`;
-- `memory_debug.unreal_runtime_classes`;
-- `memory_debug.unreal_runtime_type`;
-- `memory_debug.unreal_runtime_objects`;
-- `memory_debug.unreal_runtime_release`.
+- `memory_debug_unreal_runtime_discover`;
+- `memory_debug_unreal_runtime_classes`;
+- `memory_debug_unreal_runtime_type`;
+- `memory_debug_unreal_runtime_objects`;
+- `memory_debug_unreal_runtime_release`.
 
 Operações que varrem módulo/object array usam o mecanismo de jobs assíncronos
 da Spec 0008: `AnalysisJobKind::unreal_runtime` no mesmo

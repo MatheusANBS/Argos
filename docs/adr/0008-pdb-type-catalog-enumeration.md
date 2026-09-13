@@ -4,7 +4,7 @@ Status: aceito
 
 ## Contexto
 
-`memory_debug.pdb_type` (ADR-0005) exige o nome exato do tipo nativo. Sem uma
+`memory_debug_pdb_type` (ADR-0005) exige o nome exato do tipo nativo. Sem uma
 forma de listar os tipos presentes no PDB de um módulo carregado, o cliente
 só consegue usar a tool se já conhecer os nomes por outra via (código-fonte,
 strings do binário, documentação) — o que contraria o objetivo de

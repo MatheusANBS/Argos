@@ -5,8 +5,8 @@ Status: aceito e implementado (referências por índice permanecem propostas)
 ## Contexto
 
 Classificar um endereço encontrado por `scan_exact`, `scan_first` ou por uma
-cadeia de ponteiros exige hoje combinar manualmente `memory_debug.regions`,
-`memory_debug.modules`, várias leituras e um scan reverso. O cliente precisa
+cadeia de ponteiros exige hoje combinar manualmente `memory_debug_regions`,
+`memory_debug_modules`, várias leituras e um scan reverso. O cliente precisa
 correlacionar proteções, calcular RVA, procurar um possível início de objeto
 antes do campo e decidir se um qword/dword se parece com uma vtable. Esse fluxo
 repete I/O, transfere bytes crus e incentiva conclusões fortes a partir de uma
@@ -23,7 +23,7 @@ essas evidências de forma pequena, determinística e honesta.
 
 ## Decisão
 
-Adicionar `memory_debug.inspect_address`. A tool recebe uma sessão autorizada,
+Adicionar `memory_debug_inspect_address`. A tool recebe uma sessão autorizada,
 um endereço e largura explícita de ponteiro (`4` ou `8`). Ela devolve:
 
 - a região que contém o endereço e suas proteções;

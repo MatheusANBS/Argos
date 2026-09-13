@@ -44,11 +44,11 @@ A criação é específica do tipo de análise; status, resultados, cancelamento
 liberação são genéricos para que pointer index e introspecção possam reutilizar
 o mesmo lifecycle:
 
-- `memory_debug.scan_start`;
-- `memory_debug.job_status`;
-- `memory_debug.job_results`;
-- `memory_debug.job_cancel`;
-- `memory_debug.job_release`.
+- `memory_debug_scan_start`;
+- `memory_debug_job_status`;
+- `memory_debug_job_results`;
+- `memory_debug_job_cancel`;
+- `memory_debug_job_release`.
 
 Polling é o contrato obrigatório porque funciona nas três eras MCP suportadas.
 Notificações de progresso podem ser avaliadas futuramente como otimização, mas

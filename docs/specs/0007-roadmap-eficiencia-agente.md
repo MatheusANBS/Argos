@@ -35,7 +35,7 @@ disponíveis depois da entrega de código e testes.
 | Índice reutilizável/persistente para pointer chains | [Spec 0010](0010-persistent-pointer-index.md) | [ADR-0018](../adr/0018-persistent-pointer-index.md) | jobs e identidade do processo | proposto |
 | Inspeção derivada de endereço, vtable provável e referências | [Spec 0011](0011-inspect-address.md) | [ADR-0013](../adr/0013-address-inspection-derived-evidence.md) | cobertura e pointer index | **implementado**; referências por índice aguardam a Spec 0010 |
 | Reflexão Unreal em runtime sem PDB | [Spec 0012](0012-unreal-runtime-reflection.md) | [ADR-0019](../adr/0019-unreal-runtime-reflection.md) | jobs, multipadrão e perfis | **implementado** de forma síncrona; migração para jobs (Spec 0008, já disponível) e descoberta `auto` (Spec 0009) permanecem trabalho futuro |
-| Runtime Santa Monica/Kinetica: RTTI, SLI, Lua e gameplay | [Spec 0014](0014-santa-monica-kinetica-runtime-instrumentation.md) | [ADR-0022](../adr/0022-santa-monica-kinetica-runtime-instrumentation.md) | bridge, perfis de build e canal main-thread | proposto |
+| Runtime Santa Monica/Kinetica: RTTI, SLI, Lua e gameplay | [Spec 0014](0014-santa-monica-kinetica-runtime-instrumentation.md) | [ADR-0022](../adr/0022-santa-monica-kinetica-runtime-instrumentation.md) | viabilidade por build, novo IPC/dispatcher sobre a bridge de presença; mutações com lifecycle próprio | aprovado; identidade e catálogo normalizado implementados no domínio; reader nativo e MVP MCP pendentes |
 
 As três capacidades entregues (0008, 0011 e 0012) preservam o contrato
 original: `inspect_address` expõe cobertura e `resume_token` no próprio
@@ -153,9 +153,9 @@ Para as novas fases, cada benchmark/ensaio também registra:
   por variante de operação (`max_depth`, `max_fanout`, `stale_snapshot`,
   `unstable_snapshot`). Estado terminal e motivo não são o mesmo campo;
   `truncated` permanece derivado por compatibilidade.
-- **A4. Scan completo assíncrono.** `memory_debug.scan_start` devolve `job_id`
+- **A4. Scan completo assíncrono.** `memory_debug_scan_start` devolve `job_id`
   antes de concluir I/O. Auto-janelamento interno cobre todo o snapshot
-  elegível; `memory_debug.job_status`, `job_results`, `job_cancel` e
+  elegível; `memory_debug_job_status`, `job_results`, `job_cancel` e
   `job_release` permanecem responsivos enquanto o worker roda.
 - **A5. Lifecycle e backpressure.** Estados monotônicos
   `queued → running → completed|cancelled|failed`, terminais imutáveis,
@@ -167,7 +167,7 @@ Para as novas fases, cada benchmark/ensaio também registra:
 
 - **B1. `regions` ganha filtros e paginação.** `writable`, `readable`,
   `executable`, `private`, `min_size`, `name_contains`, `offset`, `limit`.
-- **B2. Nova `memory_debug.address_space_summary`.** Totais e contagens por
+- **B2. Nova `memory_debug_address_space_summary`.** Totais e contagens por
   classe (gravável, privada, imagem, mapeada), maior bloco, faixa mínima e
   máxima. Uma resposta de ~20 linhas que responde "quanto há para varrer" —
   exatamente o que precisei e obtive com script.
@@ -177,18 +177,18 @@ Para as novas fases, cada benchmark/ensaio também registra:
 - **C1.** Com A1, `scan_first` passa a devolver **um único `scan_id`** cobrindo
   todo o alvo, publicado somente após cobertura e resultados completos.
   Resolve a causa do atrito sem transformar janela parcial em sessão global.
-- **C2. `memory_debug.scan_merge` (deferido).** União de scan sessions continua
+- **C2. `memory_debug_scan_merge` (deferido).** União de scan sessions continua
   útil, mas não entra neste pacote: compatibilidade de tipo, owner, coverage e
   geração ainda exigem contrato próprio. C3 resolve primeiro o caso necessário
   ao importar a união explícita de endereços.
-- **C3. `memory_debug.scan_import`.** Cria scan session a partir de uma lista
+- **C3. `memory_debug_scan_import`.** Cria scan session a partir de uma lista
   explícita de endereços. O servidor valida overflow, ordena, deduplica e lê o
   baseline atual; bytes fornecidos pelo cliente nunca viram baseline.
   `reject_all` é transacional por padrão e `skip_unreadable` é opt-in, com
   contagens bounded de rejeições. Ownership, geração COW, quotas e teardown são
   os mesmos de uma scan session normal. Endereços só valem para a identidade
   viva da sessão; import não promete portabilidade após restart/PID reuse.
-- **C4. `memory_debug.scan_start` / `multi_pattern`.** Aceita IDs estáveis e
+- **C4. `memory_debug_scan_start` / `multi_pattern`.** Aceita IDs estáveis e
   uma lista limitada de valores tipados/padrões binários. Cada chunk do alvo é
   lido uma vez, independentemente da quantidade de padrões; o resultado é
   `{pattern_id,address}` com limites globais e por item. Entradas tipadas podem
@@ -215,7 +215,7 @@ Para as novas fases, cada benchmark/ensaio também registra:
 
   Uma linha por candidato no lugar de 84 KB de hex.
 
-- **D2. `memory_debug.scan_cluster`.** Agrupa por assinatura estrutural
+- **D2. `memory_debug_scan_cluster`.** Agrupa por assinatura estrutural
   (vtable + offset, stride de array, `signature_hash`) e devolve apenas os
   grupos, com representante e contagem. Reduz 40 candidatos aos 5 grupos que
   montei manualmente — que é a forma em que a informação é acionável.
@@ -224,7 +224,7 @@ Para as novas fases, cada benchmark/ensaio também registra:
   std::byte>` mais o mapa de módulos, no domínio, sem depender de handle de OS
   nem de JSON. Isso o torna unit-testável sem processo vivo (`cpp-testing`).
 
-- **D3. `memory_debug.inspect_address`.** Consolida evidência sobre um endereço:
+- **D3. `memory_debug_inspect_address`.** Consolida evidência sobre um endereço:
   região/proteções; módulo dono + RVA; bases de objeto e vtables **prováveis**;
   e referências. A heurística não afirma “vtable” apenas porque um qword aponta
   para código: procura uma base alinhada num lookbehind limitado, exige que o
@@ -239,7 +239,7 @@ Para as novas fases, cada benchmark/ensaio também registra:
 
 ### E — Dimensão temporal (atritos 7, 8)
 
-- **E1. `memory_debug.scan_watch`.** Reamostra os candidatos N vezes com
+- **E1. `memory_debug_scan_watch`.** Reamostra os candidatos N vezes com
   intervalo e devolve, por candidato, `changed_count`, `stable`, `min`, `max`.
   Separa campo estável de buffer transitório numa única chamada. Duração
   limitada e cancelamento cooperativo via `stop_token`, sem mutex retido

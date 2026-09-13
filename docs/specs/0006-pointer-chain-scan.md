@@ -1,4 +1,4 @@
-# Spec 0006 — `memory_debug.scan_pointer_chains`
+# Spec 0006 — `memory_debug_scan_pointer_chains`
 
 Status: aceito · ADR: [0011](../adr/0011-reverse-pointer-chain-scan.md)
 
@@ -7,7 +7,7 @@ Status: aceito · ADR: [0011](../adr/0011-reverse-pointer-chain-scan.md)
 Dado o endereço de um valor dinâmico, achar cadeias de ponteiros estáveis
 (`módulo + offset estático + hops`) que sobrevivem a reinícios —
 automatizando a busca reversa multi-nível que hoje seria manual (alternar
-`scan_pointers_to` + `memory_debug.modules` à mão, sem proteção contra
+`scan_pointers_to` + `memory_debug_modules` à mão, sem proteção contra
 ciclos).
 
 ## Contrato de domínio
@@ -57,7 +57,7 @@ herdados da varredura.
 
 ## Contrato de API (MCP)
 
-Tool: `memory_debug.scan_pointer_chains`
+Tool: `memory_debug_scan_pointer_chains`
 
 ```json
 {
@@ -95,7 +95,7 @@ Resposta:
 }
 ```
 
-Fluxo após reinício: chamar `memory_debug.modules` para a base fresca do
+Fluxo após reinício: chamar `memory_debug_modules` para a base fresca do
 módulo, `resolve_pointer_chain(base_fresca, hop_offsets, pointer_size)` para o
 endereço fresco de `X_1`, depois `read`/`read_typed` com mais um deref para o
 valor vivo. Se `target` já está num módulo, `candidates` volta vazio

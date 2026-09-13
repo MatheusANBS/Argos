@@ -60,12 +60,73 @@ thread-safe.
 
 ## Adapters de runtime específicos de engine
 
-O suporte proposto Santa Monica/Kinetica (ADR-0022 / Spec 0014) preserva a
+O suporte aprovado Santa Monica/Kinetica (ADR-0022 / Spec 0014) preserva a
 mesma direção de dependências. O domínio recebe leitores e canais de bridge
 tipados, enquanto a infraestrutura Windows contém PE, carga antecipada/attach,
 assinaturas, RTTI, SLI, Lua e ABI nativa. A camada MCP só valida e apresenta
 handles opacos. O adapter é orientado a perfis exatos de build, nunca a
 endereços ou assinaturas fornecidos pelo cliente.
+
+O primeiro incremento já implementa `domain::santamonica::ReflectionCatalog`
+e a porta `SantaMonicaRuntimeReader`: admissão integral de registros
+normalizados com identidade, limites e validação de referências. O catálogo
+possui seus dados e é publicado como `unique_ptr<const ...>`; a validação usa
+índices temporários ordenados, sem threads, JSON ou OS. O reader sintético dos
+testes não é distribuído como adapter nativo nem atesta autenticação de bridge.
+
+O segundo incremento acrescenta a infraestrutura do snapshot (ADR-0023):
+`encode_reflection_frame` e `ReflectionStreamReader` traduzem frames binários
+versionados para os registros tipados do domínio. O codec vive fora do domínio,
+não usa JSON, MCP nem API de SO, não cria threads e não serializa structs
+nativas. A porta `ReflectionByteStream` isola o transporte, que ainda não
+existe: autenticação, ACL e bootstrap permanecem responsabilidade da futura
+fábrica nativa, não do codec.
+
+O terceiro incremento acrescenta o handshake (ADR-0024) com a mesma direção de
+dependências: o domínio possui segredo, transcript, verificação em tempo
+constante e a máquina de estados de uso único, expondo as portas
+`MessageAuthenticator` e `RandomSource`; a infraestrutura implementa essas
+portas com o provedor do sistema (CNG) e acrescenta o enquadramento `SMBH`.
+Nenhuma primitiva criptográfica é escrita neste repositório, o domínio
+continua sem OS, relógio ou bytes de transporte, e os dois codecs compartilham
+as primitivas internas de bytes em `src/infrastructure/detail/wire_bytes.hpp`.
+
+O quarto incremento fecha a pilha na mesma direção: a infraestrutura acrescenta
+`LocalBridgeChannel` (named pipe com ACL, deadlines e verificação do par),
+`BridgePeerProcess` (lançamento do peer com bootstrap do segredo por stdin) e os
+drivers de sessão dos dois lados; a aplicação ganha `SantaMonicaRuntimeManager`,
+com quotas, TTL e um único dono por instância/época, além dos casos de uso em
+`memory_debug_service_santamonica.cpp`; a camada MCP só valida entrada, pagina
+com tokens opacos e serializa. O domínio permanece sem Win32, JSON ou MCP, e o
+peer controlado (`tools/santa_monica_peer.cpp`) é um executável separado que
+consome as mesmas portas — ele não é linkado ao servidor nem fala com o jogo.
+
+O `SantaMonicaRuntimeManager` proposto possui snapshots imutáveis, handles por
+geração e registros de mutação com deduplicação e resultado incerto. Ele não
+encaminha gameplay ao `AnalysisJobManager`, cujo contrato é de scans. Um único
+owner por processo/época serializa engine e Lua. O canal da bridge exige
+handshake autenticado e framing limitado, ainda ausentes na bridge de presença
+da Spec 0013. Release fecha admissão e cancela fila; callbacks ativos conservam
+estado até cleanup seguro, sem unload e sem espera local ilimitada pelo alvo.
+
+O caminho nativo da ADR-0027 implementa a mesma porta, lendo tabelas de tipos,
+atributos, enums e SLI pela sessão autorizada. A infraestrutura resolve índices
+de dono/base/enum e normaliza os registros; o domínio continua sem JSON ou OS.
+Faixas de atributos selecionam declarações próprias sem seguir arrays de membros
+no heap. Ponteiros/coleções podem ter alvo sem tipo refletido, mas objetos
+embutidos exigem referência e tamanho exatos. Toda referência fornecida é validada
+pelo catálogo. A aplicação propaga todas as faixas do perfil e calcula sua identidade.
+
+O inventário de recursos da ADR-0028 segue a mesma divisão. O domínio
+(`santa_monica_inventory`) define entradas por valor, validação UTF-8 dos nomes
+e a admissão de quantidade para escrita, sem OS nem JSON. A infraestrutura
+(`santa_monica_inventory_reader`) segue a raiz do perfil até o store, valida
+`ResourcesPerm`, ligações e estados em duas passadas estruturais e localiza o
+slot de um recurso, sem jamais escrever. A aplicação guarda o snapshot em cache
+no contexto publicado, com lock apenas na troca do ponteiro, e faz a escrita
+direta pela sessão `read_write` com revalidação e releitura. A camada MCP expõe
+`santamonica_runtime_resources` e `santamonica_runtime_set_resource` somente
+quando algum perfil publica a raiz.
 
 ## Shutdown
 

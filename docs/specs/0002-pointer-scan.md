@@ -1,4 +1,4 @@
-# Spec 0002 — `memory_debug.scan_pointers_to`
+# Spec 0002 — `memory_debug_scan_pointers_to`
 
 Status: aceito · ADR: [0007](../adr/0007-reverse-pointer-scan.md)
 
@@ -37,7 +37,7 @@ mesmos demais códigos de `scan_exact`.
 
 ## Contrato de API (MCP)
 
-Tool: `memory_debug.scan_pointers_to`
+Tool: `memory_debug_scan_pointers_to`
 
 ```json
 {

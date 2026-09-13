@@ -19,7 +19,7 @@ para código escolhido pelo cliente.
 
 ## Decisão
 
-Adicionar uma capacidade `memory_debug.debug_bridge_inject` com estas regras:
+Adicionar uma capacidade `memory_debug_debug_bridge_inject` com estas regras:
 
 1. A tool fica ausente de `tools/list` salvo quando
    `ARGOS_MCP_ALLOW_DEBUG_BRIDGE_INJECTION=1` estiver definido na inicialização
@@ -30,7 +30,7 @@ Adicionar uma capacidade `memory_debug.debug_bridge_inject` com estas regras:
    distribuída é `argos_debug_bridge.dll`.
 3. A chamada exige uma sessão existente, do mesmo usuário por padrão, e uma
    confirmação explícita `authorized: true`. A sessão não precisa habilitar
-   `memory_debug.write`: injeção é uma capacidade diferente, nunca implícita
+   `memory_debug_write`: injeção é uma capacidade diferente, nunca implícita
    em escrita de bytes.
 4. No Windows, a infraestrutura executa somente o carregamento de uma DLL
    validada pelo loader do sistema. Detalhes Win32, handles e conversões

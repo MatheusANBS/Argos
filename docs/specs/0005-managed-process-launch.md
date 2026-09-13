@@ -1,4 +1,4 @@
-# Spec 0005 — Início gerenciado de processo (`memory_debug.launch`)
+# Spec 0005 — Início gerenciado de processo (`memory_debug_launch`)
 
 Status: aceito · ADR: [0010](../adr/0010-managed-process-launch.md)
 
@@ -92,7 +92,7 @@ allowlist) são validados na infraestrutura antes de `CreateProcessW`.
 
 ## Contrato de API (MCP)
 
-`memory_debug.launch`:
+`memory_debug_launch`:
 
 ```json
 {
@@ -108,7 +108,7 @@ allowlist) são validados na infraestrutura antes de `CreateProcessW`.
 {"ok": true, "data": {"session_id": "…", "pid": 28640, "process_name": "argos_debug_target_game.exe", "access": "read_only"}}
 ```
 
-`memory_debug.read_output`:
+`memory_debug_read_output`:
 
 ```json
 {"session_id": "…", "since_cursor": 0, "max_bytes": 65536}
@@ -126,7 +126,7 @@ allowlist) são validados na infraestrutura antes de `CreateProcessW`.
 }
 ```
 
-`memory_debug.detach` (extensão): `{"session_id": "…", "terminate": true}` —
+`memory_debug_detach` (extensão): `{"session_id": "…", "terminate": true}` —
 só aceito para sessões `owned`.
 
 Erros: `access_denied` (gate desligado, path fora da allowlist, terminate
@@ -171,7 +171,7 @@ capturada — nunca o conteúdo de `stdout_text`/`stderr_text` em log.
   sessão.
 - regressão manual: `launch` de `argos_debug_target_game.exe`, `read_output`
   até capturar o banner completo, confirmar que os endereços impressos
-  batem com o que `memory_debug.regions`/`modules` reportam para a mesma
+  batem com o que `memory_debug_regions`/`modules` reportam para a mesma
   sessão.
 
 ## Critérios de aceite

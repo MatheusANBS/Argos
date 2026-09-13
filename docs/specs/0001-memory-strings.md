@@ -1,4 +1,4 @@
-# Spec 0001 — `memory_debug.strings`
+# Spec 0001 — `memory_debug_strings`
 
 Status: aceito · ADR: [0006](../adr/0006-memory-string-extraction.md)
 
@@ -64,7 +64,7 @@ já usados por `scan_exact`.
 
 ## Contrato de API (MCP)
 
-Tool: `memory_debug.strings`
+Tool: `memory_debug_strings`
 
 ```json
 {

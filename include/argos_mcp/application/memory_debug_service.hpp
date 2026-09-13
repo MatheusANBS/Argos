@@ -2,10 +2,13 @@
 
 #include "argos_mcp/application/scan_session_manager.hpp"
 #include "argos_mcp/application/session_manager.hpp"
+#include "argos_mcp/application/santa_monica_runtime_manager.hpp"
 #include "argos_mcp/application/unreal_runtime_manager.hpp"
 #include "argos_mcp/domain/address_inspection.hpp"
+#include "argos_mcp/domain/disassembly.hpp"
 #include "argos_mcp/domain/process_memory.hpp"
 #include "argos_mcp/domain/type_metadata.hpp"
+#include "argos_mcp/domain/santa_monica_runtime.hpp"
 #include "argos_mcp/domain/unreal_runtime.hpp"
 #include "argos_mcp/security/policy.hpp"
 
@@ -87,7 +90,7 @@ struct PointerChainScanResult {
     bool truncated{false};
 };
 
-// --- memory_debug.inspect_address ------------------------------------------
+// --- memory_debug_inspect_address ------------------------------------------
 
 // `index` is declared here because the contract distinguishes the three modes,
 // but it stays unavailable until the persistent pointer index of Spec 0010
@@ -179,7 +182,45 @@ struct AddressInspectionRequest {
     ReferenceQuery references;
 };
 
-// --- memory_debug.unreal_runtime_* -----------------------------------------
+// --- memory_debug_disassemble / find_code_references (ADR-0029) -------------
+
+struct DisassembleRequest {
+    domain::Address address{};
+    domain::TargetPointerWidth pointer_width{domain::TargetPointerWidth::x64};
+    std::size_t instruction_count{};
+};
+
+struct DisassembleResult {
+    std::vector<domain::DecodedInstruction> instructions;
+    // True when decoding stopped before instruction_count because the next bytes
+    // could not be read or did not form a valid instruction -- so an empty or
+    // short list is not mistaken for "the function is this short".
+    bool stopped_early{false};
+    std::uint64_t bytes_read{};
+};
+
+struct CodeReferenceRequest {
+    domain::Address target{};
+    // Matches a reference whose resolved target lies in [target, target+window].
+    // Zero means an exact match, which is the common case for a single slot.
+    std::uint64_t window{};
+    domain::TargetPointerWidth pointer_width{domain::TargetPointerWidth::x64};
+    // Optional ways to bound the sweep. A module name restricts it to that
+    // module's image; an explicit [start,end) overrides. Absent means every
+    // executable region.
+    std::optional<std::string> module;
+    std::optional<domain::Address> start_address;
+    std::optional<domain::Address> end_address;
+    std::uint64_t byte_budget{};
+    std::size_t result_limit{};
+};
+
+struct CodeReferenceResult {
+    std::vector<domain::CodeReferenceHit> hits;
+    domain::ScanCoverage coverage;
+};
+
+// --- memory_debug_unreal_runtime_* -----------------------------------------
 
 // Attached to every runtime-derived response, in success and in partial
 // results. It never claims the PDB path's confidence, and it keeps the two
@@ -235,6 +276,88 @@ struct UnrealObjectsPage {
     bool truncated{false};
     std::optional<std::string> next_page_token;
     UnrealProvenance provenance;
+};
+
+// Santa Monica/Kinetica reflection (Spec 0014). Every result describes a
+// snapshot already admitted by the domain: no query parses a target again.
+struct SantaMonicaDiscoverResult {
+    std::string runtime_id;
+    // Where the snapshot came from: a profiled build read natively, or the
+    // controlled synthetic peer. Reported so a client never mistakes one for
+    // the other.
+    std::string source;
+    std::string profile_id;
+    std::string process_instance;
+    std::string bridge_epoch;
+    std::uint64_t generation{};
+    std::string consistency;
+    bool coverage_complete{false};
+    std::size_t type_count{};
+    std::size_t field_count{};
+    std::size_t enum_count{};
+    std::size_t enum_value_count{};
+    std::size_t function_count{};
+    std::size_t retained_bytes{};
+    std::uint64_t expires_in_ms{};
+    // True when the build profile also locates the player's resource store.
+    bool resources_published{false};
+};
+
+struct SantaMonicaTypePage {
+    std::vector<domain::santamonica::TypeRecord> types;
+    std::size_t total_matched{};
+    std::size_t offset{};
+    std::optional<std::string> next_page_token;
+    std::uint64_t generation{};
+};
+
+struct SantaMonicaInventoryPage {
+    std::vector<domain::santamonica::ResourceEntry> entries;
+    std::uint64_t generation{};
+    std::size_t total_matched{};
+    std::size_t offset{};
+    std::size_t resource_count{};
+    std::optional<std::string> next_page_token;
+};
+
+// Outcome of a direct balance write. It never claims an engine transaction: the
+// quantity slot was written and read back, and no game code ran.
+struct SantaMonicaResourceWrite {
+    domain::santamonica::ResourceEntry resource;  // As located, before the write.
+    std::int32_t previous{};
+    std::int32_t requested{};
+    std::int32_t observed{};  // Quantity read back after the write.
+    bool verified{false};
+};
+
+struct SantaMonicaTypeResult {
+    domain::santamonica::TypeRecord type;
+    std::vector<domain::santamonica::FieldRecord> fields;
+    std::vector<domain::santamonica::TypeKey> inheritance;
+    bool fields_truncated{false};
+    std::uint64_t generation{};
+};
+
+struct SantaMonicaEnumEntry {
+    domain::santamonica::EnumRecord declaration;
+    std::vector<domain::santamonica::EnumValueRecord> values;
+    bool values_truncated{false};
+};
+
+struct SantaMonicaEnumPage {
+    std::vector<SantaMonicaEnumEntry> enums;
+    std::size_t total_matched{};
+    std::size_t offset{};
+    std::optional<std::string> next_page_token;
+    std::uint64_t generation{};
+};
+
+struct SantaMonicaFunctionPage {
+    std::vector<domain::santamonica::SliFunctionRecord> functions;
+    std::size_t total_matched{};
+    std::size_t offset{};
+    std::optional<std::string> next_page_token;
+    std::uint64_t generation{};
 };
 
 // Forward-declared only: AnalysisJobManager's header includes this one fully
@@ -315,6 +438,24 @@ public:
 
     [[nodiscard]] domain::Result<std::vector<domain::ModuleInfo>> modules(
         const domain::SessionId& id
+    ) const;
+
+    // Read-only x86/x64 disassembly (ADR-0029): decode instruction_count
+    // instructions from `address`, resolving relative branches and RIP-relative
+    // operands to absolute targets. Does not write, hook or execute.
+    [[nodiscard]] domain::Result<DisassembleResult> disassemble(
+        const domain::SessionId& id,
+        const DisassembleRequest& request,
+        std::stop_token cancellation
+    ) const;
+
+    // Linear sweep over executable memory returning the instructions whose
+    // resolved target lands in the requested window. Evidence of a reference,
+    // not proof of a function boundary (ADR-0029).
+    [[nodiscard]] domain::Result<CodeReferenceResult> find_code_references(
+        const domain::SessionId& id,
+        const CodeReferenceRequest& request,
+        std::stop_token cancellation
     ) const;
 
     [[nodiscard]] domain::Result<domain::TypeMetadata> pdb_type(
@@ -530,6 +671,63 @@ public:
     // Validates the engine roots against an explicitly enabled layout profile
     // and publishes a runtime context plus its class catalog. Read-only: no
     // function in the target is ever called.
+    [[nodiscard]] domain::Result<SantaMonicaDiscoverResult> santamonica_runtime_discover(
+        const domain::SessionId& id,
+        std::stop_token cancellation = {}
+    );
+
+    [[nodiscard]] domain::Result<SantaMonicaTypePage> santamonica_runtime_types(
+        const domain::SessionId& id,
+        const domain::RuntimeId& runtime_id,
+        std::string_view name_contains,
+        std::size_t limit,
+        std::string_view page_token
+    ) const;
+
+    [[nodiscard]] domain::Result<SantaMonicaTypeResult> santamonica_runtime_type(
+        const domain::SessionId& id,
+        const domain::RuntimeId& runtime_id,
+        std::uint64_t type_id,
+        bool include_inherited,
+        std::size_t max_fields
+    ) const;
+
+    [[nodiscard]] domain::Result<SantaMonicaEnumPage> santamonica_runtime_enums(
+        const domain::SessionId& id,
+        const domain::RuntimeId& runtime_id,
+        std::string_view name_contains,
+        std::size_t limit,
+        std::size_t max_values,
+        std::string_view page_token
+    ) const;
+
+    [[nodiscard]] domain::Result<SantaMonicaFunctionPage> santamonica_runtime_sli_functions(
+        const domain::SessionId& id,
+        const domain::RuntimeId& runtime_id,
+        std::string_view name_contains,
+        std::size_t limit,
+        std::string_view page_token
+    ) const;
+
+    [[nodiscard]] domain::Result<void> santamonica_runtime_release(
+        const domain::SessionId& id,
+        const domain::RuntimeId& runtime_id
+    );
+
+    // Pages through the player's resource balances. The snapshot is read on
+    // first use or on refresh and cached per context; refresh restarts paging.
+    [[nodiscard]] domain::Result<SantaMonicaInventoryPage> santamonica_runtime_resources(
+        const domain::SessionId& id, const domain::RuntimeId& runtime_id,
+        std::string_view name_contains, std::size_t limit, std::string_view page_token,
+        bool acquired_only, bool refresh, std::stop_token cancellation = {});
+
+    // Direct write of one acquired resource's quantity, gated like any memory
+    // write. Not an engine grant: no game code runs.
+    [[nodiscard]] domain::Result<SantaMonicaResourceWrite> santamonica_runtime_set_resource(
+        const domain::SessionId& id, const domain::RuntimeId& runtime_id,
+        std::string_view name, std::int64_t quantity, std::string_view confirmation,
+        std::stop_token cancellation = {});
+
     [[nodiscard]] domain::Result<UnrealDiscoverResult> unreal_runtime_discover(
         const domain::SessionId& id,
         const UnrealDiscoverRequest& request,
@@ -630,6 +828,7 @@ private:
     SessionManager sessions_;
     mutable ScanSessionManager scan_sessions_;
     mutable UnrealRuntimeManager unreal_contexts_;
+    mutable SantaMonicaRuntimeManager santamonica_contexts_;
     // Per-process key for resume tokens. It never leaves the server, so a token
     // cannot be forged or replayed against a different query, and it dies with
     // the process -- a restarted server rejects stale continuations instead of

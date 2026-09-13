@@ -344,7 +344,7 @@ proposto é no máximo um scan longo `running` por sessão.
 
 ### `detach`
 
-`memory_debug.detach` segue esta ordem:
+`memory_debug_detach` segue esta ordem:
 
 1. marca a sessão como `closing` e impede novos jobs;
 2. remove jobs `queued` da fila e terminaliza-os como `cancelled` com
@@ -420,11 +420,11 @@ de protocolo preservadas pela ADR-0016. A criação é específica de scan; as
 quatro tools de controle são genéricas para poderem servir também a futuros
 jobs de indexação e introspecção:
 
-- `memory_debug.scan_start`;
-- `memory_debug.job_status`;
-- `memory_debug.job_results`;
-- `memory_debug.job_cancel`;
-- `memory_debug.job_release`.
+- `memory_debug_scan_start`;
+- `memory_debug_job_status`;
+- `memory_debug_job_results`;
+- `memory_debug_job_cancel`;
+- `memory_debug_job_release`.
 
 Todas exigem `session_id`; as quatro últimas também exigem `job_id`. Um par
 `session_id`/`job_id` que não pertença ao mesmo owner retorna `not_found`, sem
@@ -434,7 +434,7 @@ revelar que o job existe em outra sessão.
 
 ```json
 {
-  "name": "memory_debug.scan_start",
+  "name": "memory_debug_scan_start",
   "arguments": {
     "session_id": "session_…",
     "operation": "scan_exact",
@@ -481,7 +481,7 @@ cliente usa `job_cancel`.
 
 ```json
 {
-  "name": "memory_debug.job_status",
+  "name": "memory_debug_job_status",
   "arguments": {"session_id": "session_…", "job_id": "job_…"}
 }
 ```
@@ -563,7 +563,7 @@ tombstone, mas `results_available` é `false`, `results_expired` é `true`,
 
 ```json
 {
-  "name": "memory_debug.job_results",
+  "name": "memory_debug_job_results",
   "arguments": {
     "session_id": "session_…",
     "job_id": "job_…",
@@ -620,7 +620,7 @@ não publica um vetor parcialmente construído como se fosse resultado válido.
 
 ```json
 {
-  "name": "memory_debug.job_cancel",
+  "name": "memory_debug_job_cancel",
   "arguments": {"session_id": "session_…", "job_id": "job_…"}
 }
 ```
@@ -646,7 +646,7 @@ reescrevê-lo.
 
 ```json
 {
-  "name": "memory_debug.job_release",
+  "name": "memory_debug_job_release",
   "arguments": {"session_id": "session_…", "job_id": "job_…"}
 }
 ```
@@ -667,7 +667,7 @@ recebe somente um `resume_token` além de `session_id` e limites de execução.
 
 ```json
 {
-  "name": "memory_debug.scan_start",
+  "name": "memory_debug_scan_start",
   "arguments": {
     "session_id": "session_…",
     "resume_token": "resume_…",

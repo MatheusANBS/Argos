@@ -4,7 +4,7 @@ Status: implementado · ADR: [0013](../adr/0013-address-inspection-derived-evide
 
 ## Estado da entrega
 
-`memory_debug.inspect_address` está implementada: classificador puro no domínio
+`memory_debug_inspect_address` está implementada: classificador puro no domínio
 (`domain/address_inspection.hpp`), orquestração em `MemoryDebugService` e
 contrato MCP em `protocol/mcp/tools.cpp`. Região, módulo/RVA, candidatos
 rankeados com `probable`/confidence/evidence/provenance, limites, limitações
@@ -29,7 +29,7 @@ contrato em `tests/contract/test_mcp_contract.cpp`.
 
 ## Objetivo
 
-Adicionar `memory_debug.inspect_address` para correlacionar, em uma resposta
+Adicionar `memory_debug_inspect_address` para correlacionar, em uma resposta
 pequena e somente-leitura, um endereço com região, proteções, módulo/RVA,
 candidatos prováveis de objeto/vtable e referências opcionais. A tool reduz a
 classificação manual de candidatos sem transformar heurística em fato.
@@ -155,7 +155,7 @@ Application é responsável por obter um único snapshot de regiões e módulos,
 validá-lo, efetuar leituras fora de mutexes de registry e passar observações ao
 domínio. Infrastructure continua responsável apenas pelas leituras nativas.
 
-## API MCP — `memory_debug.inspect_address`
+## API MCP — `memory_debug_inspect_address`
 
 ### Requisição
 

@@ -1,10 +1,10 @@
-# Spec 0013 — `memory_debug.debug_bridge_inject`
+# Spec 0013 — `memory_debug_debug_bridge_inject`
 
 Status: implementado (Windows)
 
 ## Contrato
 
-`memory_debug.debug_bridge_inject` carrega uma bridge de depuração Argos
+`memory_debug_debug_bridge_inject` carrega uma bridge de depuração Argos
 previamente aprovada em uma sessão autorizada. A operação não recebe código,
 exports, argumentos arbitrários ou bytes de payload.
 

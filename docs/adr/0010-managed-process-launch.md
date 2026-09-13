@@ -36,11 +36,11 @@ Autorização é um gate novo e independente de `ARGOS_MCP_ALLOW_WRITE`:
 - `max_captured_output_bytes` limita o buffer de saída retido por sessão
   (buffer circular; excedente descarta o mais antigo).
 
-Nova tool `memory_debug.launch` devolve `SessionInfo` (reaproveitando o
+Nova tool `memory_debug_launch` devolve `SessionInfo` (reaproveitando o
 registry de sessões existente) marcada como `owned: true`. Nova tool
-`memory_debug.read_output(session_id, since_cursor?, max_bytes?)` faz
+`memory_debug_read_output(session_id, since_cursor?, max_bytes?)` faz
 polling do buffer capturado — sem streaming, mantendo o modelo
-request/response do transporte atual. `memory_debug.detach` ganha parâmetro
+request/response do transporte atual. `memory_debug_detach` ganha parâmetro
 opcional `terminate: bool = false`; `terminate: true` só é aceito quando a
 sessão é `owned` — uma sessão obtida por `attach` a um processo pré-
 existente nunca pode ser encerrada pelo MCP.

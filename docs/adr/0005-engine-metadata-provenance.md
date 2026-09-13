@@ -23,11 +23,11 @@ permita ao MCP reconstruir com alta confianca toda a reflexao de qualquer jogo.
   resolvido pelo proprio DbgHelp. O cliente nao fornece um caminho arbitrario.
 - O resultado informa `source: pdb:dbghelp` e `confidence: high` somente quando
   o tipo foi encontrado no PDB correspondente.
-- Unity: `memory_debug.unity_type` valida e le `global-metadata.dat` IL2CPP;
+- Unity: `memory_debug_unity_type` valida e le `global-metadata.dat` IL2CPP;
   quando existe PDB correspondente, combina a evidencia para obter offsets
   nativos. Versoes/layouts fora dos perfis suportados retornam erro seguro.
-- Unreal: `memory_debug.unreal_type` usa os tipos UHT do PDB e
-  `memory_debug.unreal_reflection` enumera simbolos `StaticClass`/`StaticStruct`.
+- Unreal: `memory_debug_unreal_type` usa os tipos UHT do PDB e
+  `memory_debug_unreal_reflection` enumera simbolos `StaticClass`/`StaticStruct`.
   O MCP nao inventa offsets de `UClass`, `FProperty` ou objetos a partir de
   scans genericos.
 - Nao usar DLL injection, remote thread, patching ou qualquer alteracao no

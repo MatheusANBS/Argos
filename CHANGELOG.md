@@ -2,6 +2,31 @@
 
 ## Não lançado
 
+- **quebra de contrato — nomes das tools:** o separador passou de `.` para `_`
+  (`memory_debug.attach` → `memory_debug_attach`) em todas as 48 tools. O
+  motivo é prático: o cliente MCP da Anthropic valida nome de tool contra
+  `^[a-zA-Z0-9_-]{1,128}$`, então **todo** nome com ponto era descartado na
+  validação e o servidor aparecia conectado com `tool_count: 0` — nenhuma tool
+  utilizável, sem erro visível. Não há alias para os nomes antigos: manter os
+  dois dobraria a superfície publicada para preservar nomes que nenhum cliente
+  conseguia chamar;
+- `memory_debug_disassemble` e `memory_debug_find_code_references`
+  (ADR [0029](docs/adr/0029-native-disassembler-and-code-xrefs.md)):
+  desmontagem x86/x64 **somente leitura** sobre bytes que a sessão já pode ler,
+  resolvendo branches relativos e operandos RIP-relativos para alvos absolutos.
+  `find_code_references` varre memória executável e devolve as instruções cujo
+  alvo cai numa janela em torno do endereço pedido, separando leitura de
+  escrita — responde "quem lê/escreve este slot" e "quem chama esta função" sem
+  rodadas repetidas de scan por diferença. A decodificação usa
+  [Zydis](https://github.com/zyantific/zydis) v4.1.1 (Zycore `0b2432c`, MIT)
+  vendorizado em `third_party/zydis` e compilado estático, isolado atrás da
+  porta de domínio `Disassembler`. Varredura linear pode decodificar
+  preenchimento entre funções, então um hit é declarado como evidência de
+  referência, não prova de limite de função; uma lista vazia só é conclusiva
+  com `coverage.complete: true`. Sem gate próprio: não escreve, não injeta, não
+  instala hook e não executa código. Limites novos
+  `max_disassemble_instructions`, `max_code_ref_byte_budget` e
+  `max_code_ref_results`;
 - `ARGOS_MCP_MAX_ASYNC_RESULTS_RETAINED_BYTES` (Spec 0008) agora é imposto de
   fato: `AnalysisJobManager` mantém um agregado de bytes retidos somado sobre
   todos os jobs simultaneamente (não por job), contabilizando o conteúdo
@@ -12,7 +37,7 @@
   `"retained_bytes_budget"` em `truncation_reasons` — nunca descarte
   silencioso. `job_release`, a expiração do TTL de resultados e
   `detach_session` devolvem os bytes ao orçamento;
-- `memory_debug.scan_start`/`job_status`/`job_results`/`job_cancel`/
+- `memory_debug_scan_start`/`job_status`/`job_results`/`job_cancel`/
   `job_release` (Spec [0008](docs/specs/0008-async-scan-operations.md), ADR
   [0012](docs/adr/0012-async-scan-progress-resumption.md)): `scan_exact`,
   `strings`, `scan_pointers_to`, `scan_pointer_chains`, `scan_first` e
@@ -37,7 +62,7 @@
   `install/bin` (`-Install`), para que um servidor MCP em execução não bloqueie
   mais o link com `LNK1104`. A leitura de `rules.ninja` força UTF-8 no
   Windows PowerShell 5.1, preservando prefixos localizados;
-- `memory_debug.inspect_address` ([Spec 0011](docs/specs/0011-inspect-address.md)):
+- `memory_debug_inspect_address` ([Spec 0011](docs/specs/0011-inspect-address.md)):
   correlaciona um endereço com região, proteções, módulo/RVA e candidatos
   rankeados de objeto/vtable numa resposta pequena e somente-leitura. Toda
   classificação é `probable`, com confiança, evidências (`observed`/`sampled`) e
@@ -49,7 +74,7 @@
   Spec 0010 existir, em vez de virar um `live_scan` silencioso;
 - reflexão Unreal em runtime sem PDB
   ([Spec 0012](docs/specs/0012-unreal-runtime-reflection.md)):
-  `memory_debug.unreal_runtime_discover`/`classes`/`type`/`objects`/`release`,
+  `memory_debug_unreal_runtime_discover`/`classes`/`type`/`objects`/`release`,
   com perfis versionados `ue5-fproperty-x64` e `ue4-uproperty-x64` selecionados
   explicitamente e sem fallback entre si. Enumera `GUObjectArray`, resolve
   `FNamePool`, classes, herança e `FProperty`/`UProperty` com offsets. Cada
@@ -85,19 +110,19 @@
   tool inexistente;
 - captura de processo usa buffer circular real e shutdown seguro das threads de
   pipe no Windows;
-- `memory_debug.strings`: extração de strings ASCII/UTF-16LE no servidor;
-- `memory_debug.scan_pointers_to`: scan reverso de ponteiro, reaproveitando o
+- `memory_debug_strings`: extração de strings ASCII/UTF-16LE no servidor;
+- `memory_debug_scan_pointers_to`: scan reverso de ponteiro, reaproveitando o
   mecanismo de `scan_exact`;
-- `memory_debug.pdb_list_types`: enumeração de tipos do PDB via `SymEnumTypesW`;
-- `memory_debug.scan_first`/`scan_next`/`scan_results`/`scan_reset`: scan
+- `memory_debug_pdb_list_types`: enumeração de tipos do PDB via `SymEnumTypesW`;
+- `memory_debug_scan_first`/`scan_next`/`scan_results`/`scan_reset`: scan
   incremental (first scan/next scan) para localizar offsets sem PDB/RTTI;
-- `memory_debug.launch`/`read_output`: início gerenciado de processo com
+- `memory_debug_launch`/`read_output`: início gerenciado de processo com
   captura de `stdout`/`stderr`, atrás do gate `ARGOS_MCP_ALLOW_LAUNCH`
-  (desligado por padrão); `memory_debug.detach` ganhou `terminate`;
+  (desligado por padrão); `memory_debug_detach` ganhou `terminate`;
 - correção de segurança: `SessionManager`/`ScanSessionManager` geravam IDs
   com baixa entropia (dígitos hex recém-gerados eram zerados em vez de
   receberem padding à esquerda), colidindo na maioria das chamadas;
-- correção de segurança: `memory_debug.launch` restringe explicitamente quais
+- correção de segurança: `memory_debug_launch` restringe explicitamente quais
   handles um processo filho herda (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`),
   evitando que o filho herde o próprio `stdout` de protocolo do MCP.
 

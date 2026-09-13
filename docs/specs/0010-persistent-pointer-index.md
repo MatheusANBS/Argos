@@ -22,7 +22,7 @@ ser anunciada como implementada antes de código, testes e revisão de seguranç
 
 ## Lacuna atual
 
-`memory_debug.scan_pointer_chains` faz uma passagem multi-alvo por
+`memory_debug_scan_pointer_chains` faz uma passagem multi-alvo por
 profundidade. Isso evita uma passagem por item da fronteira, mas ainda relê o
 espaço elegível em cada nível da BFS. Além disso, a busca atual só encontra
 referências exatas: os hops não estáticos resultam em zero e o cliente ainda
@@ -182,14 +182,14 @@ profundidade.
 
 ### Job assíncrono e publicação COW
 
-`memory_debug.pointer_index_build` apenas valida/admite o pedido e devolve um
+`memory_debug_pointer_index_build` apenas valida/admite o pedido e devolve um
 `job_id`. Execução, progresso, cancelamento, TTL e release usam o
 `AnalysisJobManager` e as tools genéricas da Spec 0008:
 
-- `memory_debug.job_status`;
-- `memory_debug.job_results`;
-- `memory_debug.job_cancel`;
-- `memory_debug.job_release`.
+- `memory_debug_job_status`;
+- `memory_debug_job_results`;
+- `memory_debug_job_cancel`;
+- `memory_debug_job_release`.
 
 O job constrói um vetor mutável privado. A publicação terminal faz uma única
 troca no `PointerIndexManager`, sob lock curto, para um
@@ -354,7 +354,7 @@ são carregados como índices.
 Todos os endereços são strings hexadecimais. `index_id` e `job_id` são opacos.
 Erros de owner retornam `not_found`, sem revelar índice de outra sessão.
 
-### `memory_debug.pointer_index_build`
+### `memory_debug_pointer_index_build`
 
 ```json
 {
@@ -388,7 +388,7 @@ processados, arestas plausíveis encontradas/retidas, memória aproximada e fase
 arestas, storage, tamanho retido e expiração. Cancelamento/falha não contém
 `index_id` novo.
 
-### `memory_debug.pointer_index_query`
+### `memory_debug_pointer_index_query`
 
 ```json
 {
@@ -437,7 +437,7 @@ de dois e a faixa absoluta não pode exceder a policy. `include_zero: false`
 força hops dinâmicos não zero. O primeiro item de `offsets` é sempre o RVA
 estático e não é filtrado pela política de offsets dinâmicos.
 
-### `memory_debug.pointer_index_list`
+### `memory_debug_pointer_index_list`
 
 ```json
 {
@@ -454,7 +454,7 @@ endianness, storage, completude, edge count, bytes, criação, expiração e
 arestas, endereços, paths nem checksum bruto. Artefato incompatível não é
 carregado em memória só para ser listado.
 
-### `memory_debug.pointer_index_delete`
+### `memory_debug_pointer_index_delete`
 
 ```json
 {
@@ -656,7 +656,7 @@ Critérios estruturais:
 
 ## Referências internas
 
-- [Spec 0006 — `memory_debug.scan_pointer_chains`](0006-pointer-chain-scan.md)
+- [Spec 0006 — `memory_debug_scan_pointer_chains`](0006-pointer-chain-scan.md)
 - [ADR-0011 — Scan reverso de cadeia de ponteiros](../adr/0011-reverse-pointer-chain-scan.md)
 - [Spec 0008 — Operações assíncronas de scan](0008-async-scan-operations.md)
 - [Roadmap 0007 — Eficiência do agente em alvo real](0007-roadmap-eficiencia-agente.md)

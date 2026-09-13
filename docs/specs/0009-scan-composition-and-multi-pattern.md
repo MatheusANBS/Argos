@@ -88,7 +88,7 @@ cliente não a torna portável: restart do alvo, PID reuse ou outra sessão exig
 nova descoberta/revalidação, ainda que um endereço antigo por acaso seja
 legível. O baseline sempre é o valor atual lido pelo servidor.
 
-## API MCP — `memory_debug.scan_import`
+## API MCP — `memory_debug_scan_import`
 
 ```json
 {
@@ -127,7 +127,7 @@ Em `skip_unreadable`, `errors` segue o modelo seguro por item de `read_batch` e
 é truncado por um limite próprio. A resposta sempre diferencia `supplied`,
 `accepted`, `duplicates`, `rejected` e `candidate_count`.
 
-### `memory_debug.scan_close`
+### `memory_debug_scan_close`
 
 ```json
 {"session_id":"…","scan_id":"…"}
@@ -143,11 +143,11 @@ cliente pode tentar novamente. `detach` continua fechando todas as sessões do
 owner. Fechar duas vezes é idempotente para o mesmo owner durante um tombstone
 curto, sem revelar IDs pertencentes a outra sessão.
 
-## API MCP — `memory_debug.scan_start` / `multi_pattern`
+## API MCP — `memory_debug_scan_start` / `multi_pattern`
 
 ```json
 {
-  "name": "memory_debug.scan_start",
+  "name": "memory_debug_scan_start",
   "arguments": {
     "session_id": "…",
     "operation": "multi_pattern",
@@ -200,11 +200,11 @@ Resposta imediata:
 }
 ```
 
-`memory_debug.job_results` pagina:
+`memory_debug_job_results` pagina:
 
 ```json
 {
-  "name": "memory_debug.job_results",
+  "name": "memory_debug_job_results",
   "arguments": {
     "session_id": "…",
     "job_id": "…",

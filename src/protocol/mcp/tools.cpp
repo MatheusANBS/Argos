@@ -606,6 +606,41 @@ using InputResult = std::expected<T, InputError>;
     });
 }
 
+[[nodiscard]] Value instruction_reference_to_json(const domain::InstructionReference& reference) {
+    return Value::object({
+        {"target", hex_address(reference.target)},
+        {"kind", std::string{domain::to_string(reference.kind)}},
+        {"rip_relative", reference.rip_relative}
+    });
+}
+
+[[nodiscard]] Value decoded_instruction_to_json(const domain::DecodedInstruction& instruction) {
+    Value::Array references;
+    references.reserve(instruction.references.size());
+    for (const auto& reference : instruction.references) {
+        references.push_back(instruction_reference_to_json(reference));
+    }
+    return Value::object({
+        {"address", hex_address(instruction.address)},
+        {"length", static_cast<std::int64_t>(instruction.length)},
+        {"mnemonic", instruction.mnemonic},
+        {"text", instruction.text},
+        {"bytes_hex", hex_bytes(instruction.bytes)},
+        {"references", Value{std::move(references)}}
+    });
+}
+
+[[nodiscard]] Value code_reference_hit_to_json(const domain::CodeReferenceHit& hit) {
+    return Value::object({
+        {"address", hex_address(hit.address)},
+        {"length", static_cast<std::int64_t>(hit.length)},
+        {"mnemonic", hit.mnemonic},
+        {"text", hit.text},
+        {"target", hex_address(hit.target)},
+        {"kind", std::string{domain::to_string(hit.kind)}}
+    });
+}
+
 [[nodiscard]] Value region_page_to_json(const domain::RegionPage& page) {
     Value::Array regions;
     regions.reserve(page.regions.size());
@@ -821,6 +856,106 @@ using InputResult = std::expected<T, InputError>;
     return value;
 }
 
+// Metadata ids are opaque decimal strings, never JSON numbers: a 64-bit id
+// must not lose precision in a client, and it is not an address.
+[[nodiscard]] Value metadata_id_to_json(const std::uint64_t value) {
+    return Value{std::to_string(value)};
+}
+
+[[nodiscard]] InputResult<std::uint64_t> metadata_id_arg(
+    const Value& arguments,
+    std::string_view key,
+    bool required
+) {
+    const Value* value = arguments.find(key);
+    if (value == nullptr) {
+        if (required) {
+            return std::unexpected(InputError{"missing string argument: " + std::string{key}});
+        }
+        return std::uint64_t{0};
+    }
+    if (!value->is_string()) {
+        return std::unexpected(InputError{"argument must be a decimal string: " + std::string{key}});
+    }
+    const auto text = value->as_string();
+    if (text.empty() || text.size() > 20U) {
+        return std::unexpected(InputError{"argument is not a valid id: " + std::string{key}});
+    }
+    std::uint64_t parsed = 0;
+    const auto* first = text.data();
+    const auto* last = first + text.size();
+    const auto outcome = std::from_chars(first, last, parsed);
+    if (outcome.ec != std::errc{} || outcome.ptr != last) {
+        return std::unexpected(InputError{"argument is not a valid id: " + std::string{key}});
+    }
+    return parsed;
+}
+
+[[nodiscard]] std::string_view santamonica_field_kind_name(const domain::santamonica::FieldKind kind) {
+    switch (kind) {
+        case domain::santamonica::FieldKind::object: return "object";
+        case domain::santamonica::FieldKind::pointer: return "pointer";
+        case domain::santamonica::FieldKind::array: return "array";
+        case domain::santamonica::FieldKind::map: return "map";
+        case domain::santamonica::FieldKind::enumeration: return "enumeration";
+        case domain::santamonica::FieldKind::scalar: break;
+    }
+    return "scalar";
+}
+
+[[nodiscard]] Value santamonica_type_to_json(const domain::santamonica::TypeRecord& record) {
+    Value value = Value::object({
+        {"type_id", metadata_id_to_json(record.id.value)},
+        {"name", record.name},
+        {"size", unsigned_json(record.size)}
+    });
+    value["base_type_id"] = record.base ? metadata_id_to_json(record.base->value) : Value{nullptr};
+    return value;
+}
+
+[[nodiscard]] Value santamonica_field_to_json(const domain::santamonica::FieldRecord& record) {
+    Value value = Value::object({
+        {"owner_type_id", metadata_id_to_json(record.owner.value)},
+        {"name", record.name},
+        {"offset", unsigned_json(record.offset)},
+        {"size", unsigned_json(record.size)},
+        {"kind", std::string{santamonica_field_kind_name(record.kind)}}
+    });
+    value["type_id"] = record.referenced_type
+        ? metadata_id_to_json(record.referenced_type->value)
+        : Value{nullptr};
+    value["enum_id"] = record.referenced_enum
+        ? metadata_id_to_json(record.referenced_enum->value)
+        : Value{nullptr};
+    return value;
+}
+
+[[nodiscard]] Value santamonica_resource_to_json(const domain::santamonica::ResourceEntry& entry) {
+    const auto unlimited = entry.maximum == domain::santamonica::resource_unlimited;
+    return Value::object({
+        {"index", static_cast<std::int64_t>(entry.index)},
+        {"name", entry.name},
+        {"acquired", entry.acquired},
+        {"quantity", static_cast<std::int64_t>(entry.quantity)},
+        {"maximum", unlimited ? Value{nullptr} : Value{static_cast<std::int64_t>(entry.maximum)}},
+        {"unlimited", unlimited},
+        {"lams_name_id", static_cast<std::int64_t>(entry.lams_name_id)},
+        {"display_ui", entry.display_ui}
+    });
+}
+
+[[nodiscard]] Value santamonica_function_to_json(
+    const domain::santamonica::SliFunctionRecord& record) {
+    return Value::object({
+        {"function_id", metadata_id_to_json(record.id.value)},
+        {"name", record.name},
+        {"signature", record.signature},
+        // Appearing in a registry is not authorization to call anything: this
+        // version has no invocation path at all.
+        {"invocable", false}
+    });
+}
+
 [[nodiscard]] Value unreal_property_to_json(const domain::UnrealPropertyInfo& property) {
     return Value::object({
         {"metadata_address", hex_address(property.metadata_address)},
@@ -990,11 +1125,11 @@ ToolCatalog::ToolCatalog(
 
 std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     const auto address = string_schema("Hexadecimal address such as 0x7FF612340000.");
-    const auto session = string_schema("Opaque session_id returned by memory_debug.attach.");
+    const auto session = string_schema("Opaque session_id returned by memory_debug_attach.");
     std::vector<ToolDefinition> tools;
 
     tools.push_back(ToolDefinition{
-        "memory_debug.process_list",
+        "memory_debug_process_list",
         "List local processes. Results indicate whether ownership matches the server user.",
         object_schema({
             {"filter", string_schema("Optional case-insensitive process-name filter.")},
@@ -1004,7 +1139,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.attach",
+        "memory_debug_attach",
         "Open an authorized debugging session for a process. Write access is disabled unless explicitly enabled in server configuration.",
         object_schema({
             {"pid", integer_schema(1, static_cast<std::int64_t>(std::numeric_limits<domain::ProcessId>::max()))},
@@ -1015,8 +1150,8 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.detach",
-        "Close a debugging session and release its native process handle. terminate is only accepted for sessions created by memory_debug.launch.",
+        "memory_debug_detach",
+        "Close a debugging session and release its native process handle. terminate is only accepted for sessions created by memory_debug_launch.",
         object_schema({
             {"session_id", session},
             {"terminate", boolean_schema()}
@@ -1025,7 +1160,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.launch",
+        "memory_debug_launch",
         "Start an executable chosen by the operator and capture its stdout/stderr. Disabled unless the server was started with ARGOS_MCP_ALLOW_LAUNCH=1; not intended for attaching to third-party processes already running.",
         object_schema({
             {"executable", string_schema("Absolute path to the executable to launch.")},
@@ -1044,7 +1179,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     if (service_.policy().allow_debug_bridge_injection &&
         !service_.policy().debug_bridge_allowed_paths.empty()) {
         tools.push_back(ToolDefinition{
-            "memory_debug.debug_bridge_inject",
+            "memory_debug_debug_bridge_inject",
             "Load an operator-approved Argos debug bridge into an explicitly authorized session. Disabled unless the server was started with ARGOS_MCP_ALLOW_DEBUG_BRIDGE_INJECTION=1. It accepts no arbitrary code, exports, or payload arguments.",
             object_schema({
                 {"session_id", session},
@@ -1056,8 +1191,8 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     }
 
     tools.push_back(ToolDefinition{
-        "memory_debug.read_output",
-        "Poll captured stdout/stderr from a session created by memory_debug.launch.",
+        "memory_debug_read_output",
+        "Poll captured stdout/stderr from a session created by memory_debug_launch.",
         object_schema({
             {"session_id", session},
             {"since_cursor", integer_schema(0, std::numeric_limits<std::int64_t>::max())},
@@ -1067,14 +1202,14 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.sessions",
+        "memory_debug_sessions",
         "List active debugging sessions created by this MCP server process.",
         object_schema({}),
         read_only_annotations()
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.regions",
+        "memory_debug_regions",
         "List virtual memory regions and their read/write/execute attributes. Supports server-side filtering and paging; a real target has tens of thousands of regions, so prefer a filter over listing everything.",
         object_schema({
             {"session_id", session},
@@ -1094,25 +1229,25 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.address_space_summary",
+        "memory_debug_address_space_summary",
         "Aggregate size and counts of the target address space by class (readable, writable, executable, private). Answers how much memory a scan would have to sweep, in one small response, without listing regions.",
         object_schema({{"session_id", session}}, {"session_id"}),
         read_only_annotations()
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.modules",
+        "memory_debug_modules",
         "List loaded executable modules or file-backed mappings.",
         object_schema({{"session_id", session}}, {"session_id"}),
         read_only_annotations()
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.pdb_type",
+        "memory_debug_pdb_type",
         "Inspect one native type from the PDB matching a loaded module. This is read-only and does not inject code into the target.",
         object_schema({
             {"session_id", session},
-            {"module", string_schema("Loaded module name or exact path returned by memory_debug.modules.")},
+            {"module", string_schema("Loaded module name or exact path returned by memory_debug_modules.")},
             {"type", string_schema("Native type name, for example GameState or FMyActor.")},
             {"max_fields", integer_schema(1, 4096)}
         }, {"session_id", "module", "type"}),
@@ -1120,11 +1255,11 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.unity_type",
+        "memory_debug_unity_type",
         "Read a Unity IL2CPP type from global-metadata.dat beside the loaded module, enriching it with a matching PDB when available.",
         object_schema({
             {"session_id", session},
-            {"module", string_schema("Loaded GameAssembly module name or exact path returned by memory_debug.modules.")},
+            {"module", string_schema("Loaded GameAssembly module name or exact path returned by memory_debug_modules.")},
             {"type", string_schema("Unity type name, optionally namespace-qualified.")},
             {"max_fields", integer_schema(1, 4096)}
         }, {"session_id", "module", "type"}),
@@ -1132,11 +1267,11 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.unreal_type",
+        "memory_debug_unreal_type",
         "Read a reflected Unreal A/U/F/E/I type from the matching PDB emitted by the UHT/native build.",
         object_schema({
             {"session_id", session},
-            {"module", string_schema("Loaded Unreal executable/module name or exact path returned by memory_debug.modules.")},
+            {"module", string_schema("Loaded Unreal executable/module name or exact path returned by memory_debug_modules.")},
             {"type", string_schema("Unreal reflected type such as AActor, UObject or FMyStruct.")},
             {"max_fields", integer_schema(1, 4096)}
         }, {"session_id", "module", "type"}),
@@ -1144,22 +1279,22 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.unreal_reflection",
+        "memory_debug_unreal_reflection",
         "Enumerate Unreal UHT StaticClass and StaticStruct symbols from the matching PDB.",
         object_schema({
             {"session_id", session},
-            {"module", string_schema("Loaded Unreal executable/module name or exact path returned by memory_debug.modules.")},
+            {"module", string_schema("Loaded Unreal executable/module name or exact path returned by memory_debug_modules.")},
             {"max_symbols", integer_schema(1, 4096)}
         }, {"session_id", "module"}),
         read_only_annotations()
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.pdb_list_types",
-        "Enumerate native types available in the PDB matching a loaded module, so a type name does not need to be already known before calling memory_debug.pdb_type.",
+        "memory_debug_pdb_list_types",
+        "Enumerate native types available in the PDB matching a loaded module, so a type name does not need to be already known before calling memory_debug_pdb_type.",
         object_schema({
             {"session_id", session},
-            {"module", string_schema("Loaded module name or exact path returned by memory_debug.modules.")},
+            {"module", string_schema("Loaded module name or exact path returned by memory_debug_modules.")},
             {"name_filter", string_schema("Optional case-insensitive substring filter on the type name.")},
             {"kind_filter", enum_string_schema({"", "class", "struct", "enum", "union"})},
             {"max_symbols", integer_schema(1, 65536)}
@@ -1168,7 +1303,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.read",
+        "memory_debug_read",
         "Read a bounded byte range from an authorized process and return lowercase hexadecimal bytes.",
         object_schema({
             {"session_id", session},
@@ -1179,7 +1314,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.read_batch",
+        "memory_debug_read_batch",
         "Read multiple small ranges in one call. Each item reports success or a safe error.",
         object_schema({
             {"session_id", session},
@@ -1197,7 +1332,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.read_typed",
+        "memory_debug_read_typed",
         "Read and decode a little-endian integer, floating-point value, or bounded UTF-8 string.",
         object_schema({
             {"session_id", session},
@@ -1209,7 +1344,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.scan_exact",
+        "memory_debug_scan_exact",
         "Search readable memory for an exact byte pattern within explicit server limits.",
         object_schema({
             {"session_id", session},
@@ -1225,7 +1360,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.scan_pointers_to",
+        "memory_debug_scan_pointers_to",
         "Search memory for pointers referencing a known target address, the inverse of following a pointer.",
         object_schema({
             {"session_id", session},
@@ -1241,7 +1376,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.scan_pointer_chains",
+        "memory_debug_scan_pointer_chains",
         "Perform a bounded multi-hop reverse pointer chain scan from a dynamic address back to a static module base + offset chain that stays stable across process restarts, reusing the same scan engine as scan_pointers_to.",
         object_schema({
             {"session_id", session},
@@ -1259,7 +1394,42 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.inspect_address",
+        "memory_debug_disassemble",
+        "Decode x86/x64 instructions starting at an address, resolving relative branches and RIP-relative operands to absolute targets. Read-only: it decodes bytes the session can already read and never writes, hooks or executes.",
+        object_schema({
+            {"session_id", session},
+            {"address", address},
+            {"pointer_size", enum_string_schema({"4", "8"})},
+            {"instruction_count", integer_schema(
+                1, static_cast<std::int64_t>(service_.policy().max_disassemble_instructions)
+            )}
+        }, {"session_id", "address", "instruction_count"}),
+        read_only_annotations()
+    });
+
+    tools.push_back(ToolDefinition{
+        "memory_debug_find_code_references",
+        "Linear sweep over executable memory that returns the instructions whose resolved target lands in [target_address, target_address+window]. Finds who reads/writes a slot or calls a function. Evidence of a reference, not a proven function boundary; a sweep can decode padding between functions.",
+        object_schema({
+            {"session_id", session},
+            {"target_address", address},
+            {"pointer_size", enum_string_schema({"4", "8"})},
+            {"window", integer_schema(0, 4096)},
+            {"module", string_schema("Restrict the sweep to this loaded module's image (name or exact path).")},
+            {"start_address", address},
+            {"end_address", address},
+            {"byte_budget", integer_schema(
+                1, static_cast<std::int64_t>(service_.policy().max_code_ref_byte_budget)
+            )},
+            {"result_limit", integer_schema(
+                1, static_cast<std::int64_t>(service_.policy().max_code_ref_results)
+            )}
+        }, {"session_id", "target_address", "byte_budget", "result_limit"}),
+        read_only_annotations()
+    });
+
+    tools.push_back(ToolDefinition{
+        "memory_debug_inspect_address",
         "Correlate one address with its region, protections, owning module/RVA and ranked probable object/vtable candidates in a single read-only response, optionally with references to it within an explicit budget. Every candidate is probable, never a confirmed type or field.",
         object_schema({
             {"session_id", session},
@@ -1319,14 +1489,14 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
         "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64"
     });
     const auto hex_value_schema = string_schema("Bytes in hexadecimal form matching value_type size.");
-    const auto scan_id_schema = string_schema("Opaque scan_id returned by memory_debug.scan_first.");
+    const auto scan_id_schema = string_schema("Opaque scan_id returned by memory_debug_scan_first.");
     const auto decimal_value_schema = string_schema(
         "Decimal literal encoded server-side into little-endian bytes of value_type width, "
         "for example \"91293908\" or \"-1.5\". Mutually exclusive with the hex form."
     );
 
     tools.push_back(ToolDefinition{
-        "memory_debug.scan_first",
+        "memory_debug_scan_first",
         "Start an incremental (first scan / next scan) value-diff scan session to locate a dynamic field offset without a known value, PDB or RTTI.",
         object_schema({
             {"session_id", session},
@@ -1348,7 +1518,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.scan_next",
+        "memory_debug_scan_next",
         "Re-read only the candidates from an active scan session and filter them by how their value changed, narrowing toward the real field offset.",
         object_schema({
             {"scan_id", scan_id_schema},
@@ -1364,7 +1534,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.scan_results",
+        "memory_debug_scan_results",
         "Page through the current candidate addresses of an active scan session.",
         object_schema({
             {"scan_id", scan_id_schema},
@@ -1375,14 +1545,14 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.scan_reset",
+        "memory_debug_scan_reset",
         "Clear the candidates of an active scan session without a new attach/detach cycle.",
         object_schema({{"scan_id", scan_id_schema}}, {"scan_id"}),
         stateful_annotations()
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.strings",
+        "memory_debug_strings",
         "Extract printable ASCII or UTF-16LE strings directly from process memory without downloading raw hex bytes.",
         object_schema({
             {"session_id", session},
@@ -1398,7 +1568,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.resolve_pointer_chain",
+        "memory_debug_resolve_pointer_chain",
         "Resolve a conventional pointer chain. Each non-final offset is added before dereference; the final offset returns the resulting address.",
         object_schema({
             {"session_id", session},
@@ -1429,7 +1599,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     }
     if (service_.policy().enable_unreal_runtime && !enabled_profiles.empty()) {
         const auto runtime_id_schema = string_schema(
-            "Opaque runtime_id returned by memory_debug.unreal_runtime_discover."
+            "Opaque runtime_id returned by memory_debug_unreal_runtime_discover."
         );
         const auto profile_schema = Value::object({
             {"type", "string"},
@@ -1438,7 +1608,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
         });
 
         tools.push_back(ToolDefinition{
-            "memory_debug.unreal_runtime_discover",
+            "memory_debug_unreal_runtime_discover",
             "Discover and validate GUObjectArray/FNamePool, then publish a read-only runtime context. Prefer mode profile for an operator-registered build; mode auto can select a matching registered build without chat history. Use explicit only when the client already knows both roots. Complements, and never replaces, the PDB path: results carry provenance and confidence.",
             object_schema({
                 {"session_id", session},
@@ -1465,7 +1635,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
         });
 
         tools.push_back(ToolDefinition{
-            "memory_debug.unreal_runtime_classes",
+            "memory_debug_unreal_runtime_classes",
             "Page through the validated class catalog of a runtime context, filtered by name.",
             object_schema({
                 {"session_id", session},
@@ -1478,7 +1648,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
         });
 
         tools.push_back(ToolDefinition{
-            "memory_debug.unreal_runtime_type",
+            "memory_debug_unreal_runtime_type",
             "Read declared and inherited FProperty/UProperty metadata for one class in the catalog. Returns offsets and sizes, never instance values.",
             object_schema({
                 {"session_id", session},
@@ -1497,7 +1667,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
         });
 
         tools.push_back(ToolDefinition{
-            "memory_debug.unreal_runtime_objects",
+            "memory_debug_unreal_runtime_objects",
             "Enumerate live UObject summaries filtered by class, page by page. Summaries only: reading a field value still requires an explicit memory_debug read.",
             object_schema({
                 {"session_id", session},
@@ -1513,7 +1683,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
         });
 
         tools.push_back(ToolDefinition{
-            "memory_debug.unreal_runtime_release",
+            "memory_debug_unreal_runtime_release",
             "Release a runtime context and its derived catalogs. Idempotent for the owning session during a short window after release.",
             object_schema({
                 {"session_id", session},
@@ -1523,8 +1693,134 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
         });
     }
 
+    // The Santa Monica surface exists only when the operator enabled the gate
+    // *and* configured a controlled peer server-side. A request can never do
+    // either, and no tool here reads or writes a game process.
+    if (service_.policy().enable_santamonica_runtime &&
+        service_.policy().santamonica_build_profiles_valid &&
+        (!service_.policy().santamonica_peer_path.empty() ||
+         !service_.policy().santamonica_build_profiles.empty())) {
+        const auto santamonica_runtime = string_schema(
+            "Opaque runtime_id returned by memory_debug_santamonica_runtime_discover."
+        );
+        const auto metadata_id = string_schema("Opaque decimal metadata id, never an address.");
+        const auto santamonica_token = string_schema(
+            "Opaque token bound to this context, snapshot and filter."
+        );
+
+        tools.push_back(ToolDefinition{
+            "memory_debug_santamonica_runtime_discover",
+            "Publish a read-only reflection snapshot. With a matching server-side build profile it is read natively from the attached process; otherwise it comes from the operator-configured controlled peer, which is synthetic and proves the protocol rather than support for any retail build. The response names the source. Reading is never writing: nothing is injected or launched in the target.",
+            object_schema({
+                {"session_id", session}
+            }, {"session_id"}),
+            stateful_annotations()
+        });
+
+        tools.push_back(ToolDefinition{
+            "memory_debug_santamonica_runtime_types",
+            "Page through the types of a published snapshot, filtered by name. Metadata only: sizes and ids, never instance values or addresses.",
+            object_schema({
+                {"session_id", session},
+                {"runtime_id", santamonica_runtime},
+                {"name_contains", string_schema("Case-sensitive substring filter over type names.")},
+                {"limit", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_scan_results))},
+                {"page_token", santamonica_token}
+            }, {"session_id", "runtime_id"}),
+            read_only_annotations()
+        });
+
+        tools.push_back(ToolDefinition{
+            "memory_debug_santamonica_runtime_type",
+            "Read one type with its declared and, optionally, inherited fields. Offsets and sizes come from the admitted snapshot; nothing is re-read from a process.",
+            object_schema({
+                {"session_id", session},
+                {"runtime_id", santamonica_runtime},
+                {"type_id", metadata_id},
+                {"include_inherited", boolean_schema()},
+                {"max_fields", integer_schema(
+                    1, static_cast<std::int64_t>(service_.policy().max_santamonica_fields_per_type)
+                )}
+            }, {"session_id", "runtime_id", "type_id"}),
+            read_only_annotations()
+        });
+
+        tools.push_back(ToolDefinition{
+            "memory_debug_santamonica_runtime_enums",
+            "Page through enums and their values. Values keep their exact decimal spelling, including 64-bit ones.",
+            object_schema({
+                {"session_id", session},
+                {"runtime_id", santamonica_runtime},
+                {"name_contains", string_schema("Case-sensitive substring filter over enum names.")},
+                {"limit", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_scan_results))},
+                {"max_values", integer_schema(
+                    1, static_cast<std::int64_t>(service_.policy().max_santamonica_values_per_enum)
+                )},
+                {"page_token", santamonica_token}
+            }, {"session_id", "runtime_id"}),
+            read_only_annotations()
+        });
+
+        tools.push_back(ToolDefinition{
+            "memory_debug_santamonica_runtime_sli_functions",
+            "Page through descriptive SLI entries. Every entry reports invocable false: this version has no invocation path, and appearing in a registry is not authorization.",
+            object_schema({
+                {"session_id", session},
+                {"runtime_id", santamonica_runtime},
+                {"name_contains", string_schema("Case-sensitive substring filter over entry names.")},
+                {"limit", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_scan_results))},
+                {"page_token", santamonica_token}
+            }, {"session_id", "runtime_id"}),
+            read_only_annotations()
+        });
+
+        tools.push_back(ToolDefinition{
+            "memory_debug_santamonica_runtime_release",
+            "Release a snapshot and its derived pages. Idempotent for the owning session during a short window after release.",
+            object_schema({
+                {"session_id", session},
+                {"runtime_id", santamonica_runtime}
+            }, {"session_id", "runtime_id"}),
+            destructive_annotations()
+        });
+
+        // Resources exist only when a build profile also locates the store.
+        const auto resources_published = std::ranges::any_of(
+            service_.policy().santamonica_build_profiles,
+            [](const auto& profile) { return profile.resources_root_rva != 0U; });
+        if (resources_published) {
+            tools.push_back(ToolDefinition{
+                "memory_debug_santamonica_runtime_resources",
+                "Page through the player's resource balances for a native snapshot whose build profile locates the resource store. Read from the attached process on first use or on refresh and cached per context; refresh restarts pagination. Names are technical, not localized. Consistency is best effort: the game may change a quantity right after it is read.",
+                object_schema({
+                    {"session_id", session},
+                    {"runtime_id", santamonica_runtime},
+                    {"name_contains", string_schema("Case-insensitive ASCII substring filter over technical resource names.")},
+                    {"acquired_only", boolean_schema()},
+                    {"refresh", boolean_schema()},
+                    {"limit", integer_schema(1, static_cast<std::int64_t>(service_.policy().max_scan_results))},
+                    {"page_token", santamonica_token}
+                }, {"session_id", "runtime_id"}),
+                read_only_annotations()
+            });
+
+            tools.push_back(ToolDefinition{
+                "memory_debug_santamonica_runtime_set_resource",
+                "Set the quantity of one resource the player already holds, by exact technical name. This is a direct write of the balance slot, not an engine grant: no game code runs and nothing that reacts to a pickup is triggered. Requires a read_write session, server write access and the confirmation phrase. Refuses never-acquired resources and values above the resource maximum, re-validates the record right before writing and reads the value back.",
+                object_schema({
+                    {"session_id", session},
+                    {"runtime_id", santamonica_runtime},
+                    {"name", string_schema("Exact, case-sensitive technical resource name.")},
+                    {"quantity", integer_schema(0, std::numeric_limits<std::int32_t>::max())},
+                    {"confirmation", enum_string_schema({"AUTHORIZED_DEBUG_WRITE"})}
+                }, {"session_id", "runtime_id", "name", "quantity", "confirmation"}),
+                destructive_annotations()
+            });
+        }
+    }
+
     tools.push_back(ToolDefinition{
-        "memory_debug.write",
+        "memory_debug_write",
         "Write bytes to an authorized read-write session. Disabled by default and requires a fixed per-call confirmation phrase.",
         object_schema({
             {"session_id", session},
@@ -1538,7 +1834,7 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     // Spec 0008 -- async scan operations. scan_start is operation-specific;
     // the other four are generic job-control tools reused unchanged if a
     // future job kind (pointer_index, unreal_runtime) is added.
-    const auto job_id_schema = string_schema("Opaque job_id returned by memory_debug.scan_start.");
+    const auto job_id_schema = string_schema("Opaque job_id returned by memory_debug_scan_start.");
     const auto execution_schema = Value::object({
         {"type", "object"},
         {"properties", Value::object({
@@ -1549,12 +1845,17 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.scan_start",
+        "memory_debug_scan_start",
         "Start scan_exact, strings, scan_pointers_to, scan_pointer_chains, scan_first or scan_next as a background job "
         "that keeps running past this call. Poll progress with job_status, page terminal results with job_results, "
         "and stop it with job_cancel/job_release. Reuses the exact same scan engine and limits as the synchronous "
         "tools of the same name; only one long scan (sync or async) may run per session at a time.",
         Value::object({
+            // Same rule as generic_tool_output_schema: MCP requires inputSchema
+            // to be an object schema, and a bare oneOf root is rejected by
+            // clients that validate the root shape -- which drops the tool, and
+            // with it every tool in the same list.
+            {"type", "object"},
             {"oneOf", Value::array({
                 object_schema({
                     {"session_id", session},
@@ -1588,14 +1889,14 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.job_status",
+        "memory_debug_job_status",
         "Poll the state, progress and (once terminal) completion/truncation details of a background analysis job.",
         object_schema({{"session_id", session}, {"job_id", job_id_schema}}, {"session_id", "job_id"}),
         read_only_annotations()
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.job_results",
+        "memory_debug_job_results",
         "Page through the immutable terminal results of a background analysis job. Only available once the job "
         "reached a terminal state and before its result retention TTL expires.",
         object_schema({
@@ -1608,14 +1909,14 @@ std::vector<ToolDefinition> ToolCatalog::build_definitions() const {
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.job_cancel",
+        "memory_debug_job_cancel",
         "Request cooperative cancellation of a queued or running background analysis job. Idempotent once terminal.",
         object_schema({{"session_id", session}, {"job_id", job_id_schema}}, {"session_id", "job_id"}),
         stateful_annotations()
     });
 
     tools.push_back(ToolDefinition{
-        "memory_debug.job_release",
+        "memory_debug_job_release",
         "Release a terminal background analysis job, freeing its retained results and continuation state. A queued "
         "or running job must be cancelled first.",
         object_schema({{"session_id", session}, {"job_id", job_id_schema}}, {"session_id", "job_id"}),
@@ -1636,7 +1937,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
 
     logger_.log(observability::LogLevel::debug, "tool_call", name);
 
-    if (name == "memory_debug.process_list") {
+    if (name == "memory_debug_process_list") {
         auto filter = string_arg(arguments, "filter", false, "");
         auto limit = unsigned_arg(arguments, "limit", false, 256U);
         if (!filter) return input_error(filter.error().message);
@@ -1649,7 +1950,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(Value::object({{"processes", Value{std::move(processes)}}}));
     }
 
-    if (name == "memory_debug.attach") {
+    if (name == "memory_debug_attach") {
         auto pid = unsigned_arg(arguments, "pid", true);
         auto access_text = string_arg(arguments, "access", false, "read_only");
         auto authorized = bool_arg(arguments, "authorized", true);
@@ -1665,7 +1966,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(session_to_json(*result));
     }
 
-    if (name == "memory_debug.detach") {
+    if (name == "memory_debug_detach") {
         auto session = session_arg(arguments);
         auto terminate = bool_arg(arguments, "terminate", false, false);
         if (!session) return input_error(session.error().message);
@@ -1675,7 +1976,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(Value::object({{"detached", true}}));
     }
 
-    if (name == "memory_debug.launch") {
+    if (name == "memory_debug_launch") {
         auto executable = string_arg(arguments, "executable", true);
         auto working_directory = string_arg(arguments, "working_directory", false, "");
         auto access_text = string_arg(arguments, "access", false, "read_only");
@@ -1713,7 +2014,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(session_to_json(*result));
     }
 
-    if (name == "memory_debug.debug_bridge_inject") {
+    if (name == "memory_debug_debug_bridge_inject") {
         auto session = session_arg(arguments);
         auto bridge_path = string_arg(arguments, "bridge_path", true);
         auto authorized = bool_arg(arguments, "authorized", true);
@@ -1729,7 +2030,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         }));
     }
 
-    if (name == "memory_debug.read_output") {
+    if (name == "memory_debug_read_output") {
         auto session = session_arg(arguments);
         auto since_cursor = unsigned_arg(arguments, "since_cursor", false, 0U);
         auto max_bytes = unsigned_arg(arguments, "max_bytes", false, service_.policy().max_captured_output_bytes);
@@ -1741,13 +2042,13 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(output_chunk_to_json(*result));
     }
 
-    if (name == "memory_debug.sessions") {
+    if (name == "memory_debug_sessions") {
         Value::Array sessions;
         for (const auto& session : service_.list_sessions()) sessions.push_back(session_to_json(session));
         return success(Value::object({{"sessions", Value{std::move(sessions)}}}));
     }
 
-    if (name == "memory_debug.regions") {
+    if (name == "memory_debug_regions") {
         auto session = session_arg(arguments);
         auto readable = optional_bool_arg(arguments, "readable");
         auto writable = optional_bool_arg(arguments, "writable");
@@ -1797,7 +2098,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(region_page_to_json(*result));
     }
 
-    if (name == "memory_debug.address_space_summary") {
+    if (name == "memory_debug_address_space_summary") {
         auto session = session_arg(arguments);
         if (!session) return input_error(session.error().message);
         auto result = service_.address_space_summary(*session);
@@ -1805,7 +2106,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(address_space_summary_to_json(*result));
     }
 
-    if (name == "memory_debug.modules") {
+    if (name == "memory_debug_modules") {
         auto session = session_arg(arguments);
         if (!session) return input_error(session.error().message);
         auto result = service_.modules(*session);
@@ -1816,7 +2117,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(Value::object({{"modules", Value{std::move(modules)}}}));
     }
 
-    if (name == "memory_debug.pdb_type") {
+    if (name == "memory_debug_pdb_type") {
         auto session = session_arg(arguments);
         auto module = string_arg(arguments, "module", true);
         auto type = string_arg(arguments, "type", true);
@@ -1832,7 +2133,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(type_metadata_to_json(*result));
     }
 
-    if (name == "memory_debug.unity_type") {
+    if (name == "memory_debug_unity_type") {
         auto session = session_arg(arguments);
         auto module = string_arg(arguments, "module", true);
         auto type = string_arg(arguments, "type", true);
@@ -1848,7 +2149,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(type_metadata_to_json(*result));
     }
 
-    if (name == "memory_debug.unreal_type") {
+    if (name == "memory_debug_unreal_type") {
         auto session = session_arg(arguments);
         auto module = string_arg(arguments, "module", true);
         auto type = string_arg(arguments, "type", true);
@@ -1864,7 +2165,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(type_metadata_to_json(*result));
     }
 
-    if (name == "memory_debug.unreal_reflection") {
+    if (name == "memory_debug_unreal_reflection") {
         auto session = session_arg(arguments);
         auto module = string_arg(arguments, "module", true);
         auto max_symbols = unsigned_arg(arguments, "max_symbols", false, 256U);
@@ -1878,7 +2179,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(reflection_metadata_to_json(*result));
     }
 
-    if (name == "memory_debug.pdb_list_types") {
+    if (name == "memory_debug_pdb_list_types") {
         auto session = session_arg(arguments);
         auto module = string_arg(arguments, "module", true);
         auto name_filter = string_arg(arguments, "name_filter", false, "");
@@ -1898,7 +2199,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(type_catalog_to_json(*result));
     }
 
-    if (name == "memory_debug.read") {
+    if (name == "memory_debug_read") {
         auto session = session_arg(arguments);
         auto address = address_arg(arguments, "address");
         auto size = unsigned_arg(arguments, "size", true);
@@ -1914,7 +2215,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         }));
     }
 
-    if (name == "memory_debug.read_batch") {
+    if (name == "memory_debug_read_batch") {
         auto session = session_arg(arguments);
         if (!session) return input_error(session.error().message);
         const Value* items_value = arguments.find("items");
@@ -1945,7 +2246,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(Value::object({{"items", Value{std::move(values)}}}));
     }
 
-    if (name == "memory_debug.read_typed") {
+    if (name == "memory_debug_read_typed") {
         auto session = session_arg(arguments);
         auto address = address_arg(arguments, "address");
         auto type = string_arg(arguments, "type", true);
@@ -1965,7 +2266,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(std::move(decoded));
     }
 
-    if (name == "memory_debug.scan_exact") {
+    if (name == "memory_debug_scan_exact") {
         auto session = session_arg(arguments);
         auto pattern_text = string_arg(arguments, "pattern_hex", true);
         auto alignment = unsigned_arg(arguments, "alignment", false, 1U);
@@ -1999,7 +2300,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         }));
     }
 
-    if (name == "memory_debug.scan_first") {
+    if (name == "memory_debug_scan_first") {
         auto session = session_arg(arguments);
         auto value_type = value_type_arg(arguments);
         auto comparison = comparison_arg(arguments);
@@ -2043,7 +2344,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(std::move(payload));
     }
 
-    if (name == "memory_debug.scan_next") {
+    if (name == "memory_debug_scan_next") {
         auto scan_id = scan_session_arg(arguments);
         auto comparison = comparison_arg(arguments);
         if (!scan_id) return input_error(scan_id.error().message);
@@ -2059,7 +2360,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(scan_session_info_to_json(*result));
     }
 
-    if (name == "memory_debug.scan_results") {
+    if (name == "memory_debug_scan_results") {
         auto scan_id = scan_session_arg(arguments);
         auto offset = unsigned_arg(arguments, "offset", false, 0U);
         auto limit = unsigned_arg(arguments, "limit", false, 256U);
@@ -2082,7 +2383,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(std::move(payload));
     }
 
-    if (name == "memory_debug.scan_reset") {
+    if (name == "memory_debug_scan_reset") {
         auto scan_id = scan_session_arg(arguments);
         if (!scan_id) return input_error(scan_id.error().message);
         auto result = service_.scan_reset(*scan_id);
@@ -2090,7 +2391,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(Value::object({}));
     }
 
-    if (name == "memory_debug.scan_pointers_to") {
+    if (name == "memory_debug_scan_pointers_to") {
         auto session = session_arg(arguments);
         auto target = address_arg(arguments, "target_address");
         auto pointer_size_text = string_arg(arguments, "pointer_size", false, sizeof(void*) == 8U ? "8" : "4");
@@ -2124,7 +2425,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         }));
     }
 
-    if (name == "memory_debug.scan_pointer_chains") {
+    if (name == "memory_debug_scan_pointer_chains") {
         auto session = session_arg(arguments);
         auto target = address_arg(arguments, "target_address");
         auto pointer_size_text = string_arg(arguments, "pointer_size", false, sizeof(void*) == 8U ? "8" : "4");
@@ -2173,7 +2474,83 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         }));
     }
 
-    if (name == "memory_debug.inspect_address") {
+    if (name == "memory_debug_disassemble") {
+        auto session = session_arg(arguments);
+        auto address = address_arg(arguments, "address");
+        auto pointer_size_text = string_arg(arguments, "pointer_size", false, "8");
+        auto instruction_count = unsigned_arg(arguments, "instruction_count", true);
+        if (!session) return input_error(session.error().message);
+        if (!address) return input_error(address.error().message);
+        if (!pointer_size_text) return input_error(pointer_size_text.error().message);
+        if (!instruction_count) return input_error(instruction_count.error().message);
+        const auto width = domain::pointer_width_from_string(*pointer_size_text);
+        if (!width) return input_error("pointer_size must be \"4\" or \"8\"");
+
+        application::DisassembleRequest request;
+        request.address = *address;
+        request.pointer_width = *width;
+        request.instruction_count = static_cast<std::size_t>(*instruction_count);
+
+        auto result = service_.disassemble(*session, request, cancellation);
+        if (!result) return domain_error(result.error());
+        Value::Array instructions;
+        instructions.reserve(result->instructions.size());
+        for (const auto& instruction : result->instructions) {
+            instructions.push_back(decoded_instruction_to_json(instruction));
+        }
+        return success(Value::object({
+            {"instructions", Value{std::move(instructions)}},
+            {"returned", static_cast<std::int64_t>(result->instructions.size())},
+            {"stopped_early", result->stopped_early},
+            {"bytes_read", static_cast<std::int64_t>(result->bytes_read)}
+        }));
+    }
+
+    if (name == "memory_debug_find_code_references") {
+        auto session = session_arg(arguments);
+        auto target = address_arg(arguments, "target_address");
+        auto pointer_size_text = string_arg(arguments, "pointer_size", false, "8");
+        auto window = unsigned_arg(arguments, "window", false, 0U);
+        auto module = string_arg(arguments, "module", false, "");
+        auto start_address = optional_address_arg(arguments, "start_address");
+        auto end_address = optional_address_arg(arguments, "end_address");
+        auto byte_budget = unsigned_arg(arguments, "byte_budget", true);
+        auto result_limit = unsigned_arg(arguments, "result_limit", true);
+        if (!session) return input_error(session.error().message);
+        if (!target) return input_error(target.error().message);
+        if (!pointer_size_text) return input_error(pointer_size_text.error().message);
+        if (!window) return input_error(window.error().message);
+        if (!module) return input_error(module.error().message);
+        if (!start_address) return input_error(start_address.error().message);
+        if (!end_address) return input_error(end_address.error().message);
+        if (!byte_budget) return input_error(byte_budget.error().message);
+        if (!result_limit) return input_error(result_limit.error().message);
+        const auto width = domain::pointer_width_from_string(*pointer_size_text);
+        if (!width) return input_error("pointer_size must be \"4\" or \"8\"");
+
+        application::CodeReferenceRequest request;
+        request.target = *target;
+        request.window = *window;
+        request.pointer_width = *width;
+        if (!module->empty()) request.module = *module;
+        request.start_address = *start_address;
+        request.end_address = *end_address;
+        request.byte_budget = *byte_budget;
+        request.result_limit = static_cast<std::size_t>(*result_limit);
+
+        auto result = service_.find_code_references(*session, request, cancellation);
+        if (!result) return domain_error(result.error());
+        Value::Array hits;
+        hits.reserve(result->hits.size());
+        for (const auto& hit : result->hits) hits.push_back(code_reference_hit_to_json(hit));
+        return success(Value::object({
+            {"hits", Value{std::move(hits)}},
+            {"returned", static_cast<std::int64_t>(result->hits.size())},
+            {"coverage", scan_coverage_to_json(result->coverage)}
+        }));
+    }
+
+    if (name == "memory_debug_inspect_address") {
         auto session = session_arg(arguments);
         auto address = address_arg(arguments, "address");
         auto pointer_size_text = string_arg(arguments, "pointer_size", true);
@@ -2260,7 +2637,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(address_inspection_to_json(*result));
     }
 
-    if (name == "memory_debug.strings") {
+    if (name == "memory_debug_strings") {
         auto session = session_arg(arguments);
         auto start_address = optional_address_arg(arguments, "start_address");
         auto end_address = optional_address_arg(arguments, "end_address");
@@ -2286,7 +2663,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(string_scan_result_to_json(*result));
     }
 
-    if (name == "memory_debug.resolve_pointer_chain") {
+    if (name == "memory_debug_resolve_pointer_chain") {
         auto session = session_arg(arguments);
         auto base = address_arg(arguments, "base_address");
         auto offsets = offsets_arg(arguments);
@@ -2302,7 +2679,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(Value::object({{"address", hex_address(*result)}}));
     }
 
-    if (name == "memory_debug.unreal_runtime_discover") {
+    if (name == "memory_debug_unreal_runtime_discover") {
         auto session = session_arg(arguments);
         auto profile_id = string_arg(arguments, "profile_id", true);
         auto mode_text = string_arg(arguments, "mode", false, "explicit");
@@ -2365,7 +2742,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         }));
     }
 
-    if (name == "memory_debug.unreal_runtime_classes") {
+    if (name == "memory_debug_unreal_runtime_classes") {
         auto session = session_arg(arguments);
         auto runtime_id = runtime_arg(arguments);
         auto name_contains = string_arg(arguments, "name_contains", false, "");
@@ -2396,7 +2773,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(std::move(value));
     }
 
-    if (name == "memory_debug.unreal_runtime_type") {
+    if (name == "memory_debug_unreal_runtime_type") {
         auto session = session_arg(arguments);
         auto runtime_id = runtime_arg(arguments);
         auto class_address = optional_address_arg(arguments, "class_address");
@@ -2440,7 +2817,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         }));
     }
 
-    if (name == "memory_debug.unreal_runtime_objects") {
+    if (name == "memory_debug_unreal_runtime_objects") {
         auto session = session_arg(arguments);
         auto runtime_id = runtime_arg(arguments);
         auto class_name = string_arg(arguments, "class_name", false, "");
@@ -2477,7 +2854,266 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(std::move(value));
     }
 
-    if (name == "memory_debug.unreal_runtime_release") {
+    if (name == "memory_debug_santamonica_runtime_discover") {
+        auto session = session_arg(arguments);
+        if (!session) return input_error(session.error().message);
+        auto result = service_.santamonica_runtime_discover(*session, cancellation);
+        if (!result) return domain_error(result.error());
+        return success(Value::object({
+            {"runtime_id", result->runtime_id},
+            {"profile_id", result->profile_id},
+            {"process_instance", result->process_instance},
+            {"bridge_epoch", result->bridge_epoch},
+            {"generation", unsigned_json(result->generation)},
+            {"consistency", result->consistency},
+            {"coverage_complete", result->coverage_complete},
+            {"counts", Value::object({
+                {"types", static_cast<std::int64_t>(result->type_count)},
+                {"fields", static_cast<std::int64_t>(result->field_count)},
+                {"enums", static_cast<std::int64_t>(result->enum_count)},
+                {"enum_values", static_cast<std::int64_t>(result->enum_value_count)},
+                {"sli_functions", static_cast<std::int64_t>(result->function_count)}
+            })},
+            {"retained_bytes", static_cast<std::int64_t>(result->retained_bytes)},
+            {"expires_in_ms", unsigned_json(result->expires_in_ms)},
+            {"resources_published", result->resources_published},
+            // Naming the source in the payload keeps a client from reading a
+            // synthetic peer as support for a retail build, or a native type
+            // table as full reflection.
+            {"source", result->source}
+        }));
+    }
+
+    if (name == "memory_debug_santamonica_runtime_types") {
+        auto session = session_arg(arguments);
+        auto runtime_id = runtime_arg(arguments);
+        auto name_contains = string_arg(arguments, "name_contains", false, "");
+        auto limit = unsigned_arg(arguments, "limit", false, 100U);
+        auto page_token = string_arg(arguments, "page_token", false, "");
+        if (!session) return input_error(session.error().message);
+        if (!runtime_id) return input_error(runtime_id.error().message);
+        if (!name_contains) return input_error(name_contains.error().message);
+        if (!limit) return input_error(limit.error().message);
+        if (!page_token) return input_error(page_token.error().message);
+        auto result = service_.santamonica_runtime_types(
+            *session, *runtime_id, *name_contains, static_cast<std::size_t>(*limit), *page_token
+        );
+        if (!result) return domain_error(result.error());
+        Value::Array types;
+        types.reserve(result->types.size());
+        for (const auto& record : result->types) types.push_back(santamonica_type_to_json(record));
+        Value value = Value::object({
+            {"types", Value{std::move(types)}},
+            {"total_matched", static_cast<std::int64_t>(result->total_matched)},
+            {"offset", static_cast<std::int64_t>(result->offset)},
+            {"returned", static_cast<std::int64_t>(result->types.size())},
+            {"generation", unsigned_json(result->generation)}
+        });
+        value["next_page_token"] = result->next_page_token
+            ? Value{*result->next_page_token}
+            : Value{nullptr};
+        return success(std::move(value));
+    }
+
+    if (name == "memory_debug_santamonica_runtime_type") {
+        auto session = session_arg(arguments);
+        auto runtime_id = runtime_arg(arguments);
+        auto type_id = metadata_id_arg(arguments, "type_id", true);
+        auto include_inherited = bool_arg(arguments, "include_inherited", false, true);
+        auto max_fields = unsigned_arg(
+            arguments, "max_fields", false, service_.policy().max_santamonica_fields_per_type
+        );
+        if (!session) return input_error(session.error().message);
+        if (!runtime_id) return input_error(runtime_id.error().message);
+        if (!type_id) return input_error(type_id.error().message);
+        if (!include_inherited) return input_error(include_inherited.error().message);
+        if (!max_fields) return input_error(max_fields.error().message);
+        auto result = service_.santamonica_runtime_type(
+            *session, *runtime_id, *type_id, *include_inherited, static_cast<std::size_t>(*max_fields)
+        );
+        if (!result) return domain_error(result.error());
+        Value::Array fields;
+        fields.reserve(result->fields.size());
+        for (const auto& field : result->fields) fields.push_back(santamonica_field_to_json(field));
+        Value::Array inheritance;
+        inheritance.reserve(result->inheritance.size());
+        for (const auto& base : result->inheritance) {
+            inheritance.push_back(metadata_id_to_json(base.value));
+        }
+        return success(Value::object({
+            {"type", santamonica_type_to_json(result->type)},
+            {"fields", Value{std::move(fields)}},
+            {"inheritance", Value{std::move(inheritance)}},
+            {"fields_truncated", result->fields_truncated},
+            {"generation", unsigned_json(result->generation)}
+        }));
+    }
+
+    if (name == "memory_debug_santamonica_runtime_enums") {
+        auto session = session_arg(arguments);
+        auto runtime_id = runtime_arg(arguments);
+        auto name_contains = string_arg(arguments, "name_contains", false, "");
+        auto limit = unsigned_arg(arguments, "limit", false, 100U);
+        auto max_values = unsigned_arg(
+            arguments, "max_values", false, service_.policy().max_santamonica_values_per_enum
+        );
+        auto page_token = string_arg(arguments, "page_token", false, "");
+        if (!session) return input_error(session.error().message);
+        if (!runtime_id) return input_error(runtime_id.error().message);
+        if (!name_contains) return input_error(name_contains.error().message);
+        if (!limit) return input_error(limit.error().message);
+        if (!max_values) return input_error(max_values.error().message);
+        if (!page_token) return input_error(page_token.error().message);
+        auto result = service_.santamonica_runtime_enums(
+            *session, *runtime_id, *name_contains, static_cast<std::size_t>(*limit),
+            static_cast<std::size_t>(*max_values), *page_token
+        );
+        if (!result) return domain_error(result.error());
+        Value::Array enums;
+        enums.reserve(result->enums.size());
+        for (const auto& entry : result->enums) {
+            Value::Array values;
+            values.reserve(entry.values.size());
+            for (const auto& value : entry.values) {
+                values.push_back(Value::object({
+                    {"name", value.name},
+                    // Lossless decimal spelling, including unsigned 64-bit.
+                    {"value", value.value}
+                }));
+            }
+            enums.push_back(Value::object({
+                {"enum_id", metadata_id_to_json(entry.declaration.id.value)},
+                {"name", entry.declaration.name},
+                {"values", Value{std::move(values)}},
+                {"values_truncated", entry.values_truncated}
+            }));
+        }
+        Value value = Value::object({
+            {"enums", Value{std::move(enums)}},
+            {"total_matched", static_cast<std::int64_t>(result->total_matched)},
+            {"offset", static_cast<std::int64_t>(result->offset)},
+            {"returned", static_cast<std::int64_t>(result->enums.size())},
+            {"generation", unsigned_json(result->generation)}
+        });
+        value["next_page_token"] = result->next_page_token
+            ? Value{*result->next_page_token}
+            : Value{nullptr};
+        return success(std::move(value));
+    }
+
+    if (name == "memory_debug_santamonica_runtime_sli_functions") {
+        auto session = session_arg(arguments);
+        auto runtime_id = runtime_arg(arguments);
+        auto name_contains = string_arg(arguments, "name_contains", false, "");
+        auto limit = unsigned_arg(arguments, "limit", false, 100U);
+        auto page_token = string_arg(arguments, "page_token", false, "");
+        if (!session) return input_error(session.error().message);
+        if (!runtime_id) return input_error(runtime_id.error().message);
+        if (!name_contains) return input_error(name_contains.error().message);
+        if (!limit) return input_error(limit.error().message);
+        if (!page_token) return input_error(page_token.error().message);
+        auto result = service_.santamonica_runtime_sli_functions(
+            *session, *runtime_id, *name_contains, static_cast<std::size_t>(*limit), *page_token
+        );
+        if (!result) return domain_error(result.error());
+        Value::Array functions;
+        functions.reserve(result->functions.size());
+        for (const auto& record : result->functions) {
+            functions.push_back(santamonica_function_to_json(record));
+        }
+        Value value = Value::object({
+            {"sli_functions", Value{std::move(functions)}},
+            {"total_matched", static_cast<std::int64_t>(result->total_matched)},
+            {"offset", static_cast<std::int64_t>(result->offset)},
+            {"returned", static_cast<std::int64_t>(result->functions.size())},
+            {"generation", unsigned_json(result->generation)}
+        });
+        value["next_page_token"] = result->next_page_token
+            ? Value{*result->next_page_token}
+            : Value{nullptr};
+        return success(std::move(value));
+    }
+
+    if (name == "memory_debug_santamonica_runtime_release") {
+        auto session = session_arg(arguments);
+        auto runtime_id = runtime_arg(arguments);
+        if (!session) return input_error(session.error().message);
+        if (!runtime_id) return input_error(runtime_id.error().message);
+        auto released = service_.santamonica_runtime_release(*session, *runtime_id);
+        if (!released) return domain_error(released.error());
+        return success(Value::object({{"released", true}}));
+    }
+
+    if (name == "memory_debug_santamonica_runtime_resources") {
+        auto session = session_arg(arguments);
+        auto runtime_id = runtime_arg(arguments);
+        auto name_contains = string_arg(arguments, "name_contains", false, "");
+        auto acquired_only = bool_arg(arguments, "acquired_only", false, false);
+        auto refresh = bool_arg(arguments, "refresh", false, false);
+        auto limit = unsigned_arg(arguments, "limit", false, 100U);
+        auto page_token = string_arg(arguments, "page_token", false, "");
+        if (!session) return input_error(session.error().message);
+        if (!runtime_id) return input_error(runtime_id.error().message);
+        if (!name_contains) return input_error(name_contains.error().message);
+        if (!acquired_only) return input_error(acquired_only.error().message);
+        if (!refresh) return input_error(refresh.error().message);
+        if (!limit) return input_error(limit.error().message);
+        if (!page_token) return input_error(page_token.error().message);
+        auto result = service_.santamonica_runtime_resources(
+            *session, *runtime_id, *name_contains, static_cast<std::size_t>(*limit), *page_token,
+            *acquired_only, *refresh, cancellation
+        );
+        if (!result) return domain_error(result.error());
+        Value::Array entries;
+        entries.reserve(result->entries.size());
+        for (const auto& entry : result->entries) entries.push_back(santamonica_resource_to_json(entry));
+        Value value = Value::object({
+            {"resources", Value{std::move(entries)}},
+            {"total_matched", static_cast<std::int64_t>(result->total_matched)},
+            {"offset", static_cast<std::int64_t>(result->offset)},
+            {"returned", static_cast<std::int64_t>(result->entries.size())},
+            {"resource_count", static_cast<std::int64_t>(result->resource_count)},
+            {"generation", unsigned_json(result->generation)},
+            {"consistency", "validated_best_effort"},
+            {"scope", "resources"},
+            {"mutation_safe", false}
+        });
+        value["next_page_token"] = result->next_page_token
+            ? Value{*result->next_page_token}
+            : Value{nullptr};
+        return success(std::move(value));
+    }
+
+    if (name == "memory_debug_santamonica_runtime_set_resource") {
+        auto session = session_arg(arguments);
+        auto runtime_id = runtime_arg(arguments);
+        auto resource = string_arg(arguments, "name", true);
+        auto quantity = unsigned_arg(arguments, "quantity", true, 0U);
+        auto confirmation = string_arg(arguments, "confirmation", true);
+        if (!session) return input_error(session.error().message);
+        if (!runtime_id) return input_error(runtime_id.error().message);
+        if (!resource) return input_error(resource.error().message);
+        if (!quantity) return input_error(quantity.error().message);
+        if (!confirmation) return input_error(confirmation.error().message);
+        if (*quantity > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+            return input_error("quantity exceeds the 32-bit resource range");
+        }
+        auto result = service_.santamonica_runtime_set_resource(
+            *session, *runtime_id, *resource, static_cast<std::int64_t>(*quantity), *confirmation, cancellation
+        );
+        if (!result) return domain_error(result.error());
+        return success(Value::object({
+            {"resource", santamonica_resource_to_json(result->resource)},
+            {"previous", static_cast<std::int64_t>(result->previous)},
+            {"requested", static_cast<std::int64_t>(result->requested)},
+            {"observed", static_cast<std::int64_t>(result->observed)},
+            {"verified", result->verified},
+            {"mechanism", "direct_balance_write"},
+            {"engine_transaction", false}
+        }));
+    }
+
+    if (name == "memory_debug_unreal_runtime_release") {
         auto session = session_arg(arguments);
         auto runtime_id = runtime_arg(arguments);
         if (!session) return input_error(session.error().message);
@@ -2490,7 +3126,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         }));
     }
 
-    if (name == "memory_debug.write") {
+    if (name == "memory_debug_write") {
         auto session = session_arg(arguments);
         auto address = address_arg(arguments, "address");
         auto bytes_text = string_arg(arguments, "bytes_hex", true);
@@ -2509,7 +3145,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         }));
     }
 
-    if (name == "memory_debug.scan_start") {
+    if (name == "memory_debug_scan_start") {
         auto session = session_arg(arguments);
         if (!session) return input_error(session.error().message);
 
@@ -2733,7 +3369,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(job_info_to_json(*result));
     }
 
-    if (name == "memory_debug.job_status") {
+    if (name == "memory_debug_job_status") {
         auto session = session_arg(arguments);
         auto job_id = job_id_arg(arguments);
         if (!session) return input_error(session.error().message);
@@ -2743,7 +3379,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(job_info_to_json(*result));
     }
 
-    if (name == "memory_debug.job_results") {
+    if (name == "memory_debug_job_results") {
         auto session = session_arg(arguments);
         auto job_id = job_id_arg(arguments);
         auto offset = unsigned_arg(arguments, "offset", false, 0U);
@@ -2829,7 +3465,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         return success(std::move(payload));
     }
 
-    if (name == "memory_debug.job_cancel") {
+    if (name == "memory_debug_job_cancel") {
         auto session = session_arg(arguments);
         auto job_id = job_id_arg(arguments);
         if (!session) return input_error(session.error().message);
@@ -2844,7 +3480,7 @@ std::optional<ToolCallResult> ToolCatalog::invoke(
         }));
     }
 
-    if (name == "memory_debug.job_release") {
+    if (name == "memory_debug_job_release") {
         auto session = session_arg(arguments);
         auto job_id = job_id_arg(arguments);
         if (!session) return input_error(session.error().message);

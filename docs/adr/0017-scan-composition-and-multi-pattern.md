@@ -22,13 +22,13 @@ inconsistentes ou contorne os limites de sessão.
 
 Serão adicionadas duas capacidades somente-leitura:
 
-1. `memory_debug.scan_import` cria uma `ScanSession` a partir de endereços
+1. `memory_debug_scan_import` cria uma `ScanSession` a partir de endereços
    explícitos. O servidor ordena e deduplica os endereços, valida overflow de
    `address + value_size` e lê o valor inicial diretamente do processo. O
    cliente não fornece o baseline. A sessão resultante usa o mesmo ownership,
    geração, batching, COW, limites e teardown de ADR-0009 e pode ser consumida
    imediatamente por `scan_next`.
-2. `memory_debug.scan_start` com `operation: "multi_pattern"` compila uma lista
+2. `memory_debug_scan_start` com `operation: "multi_pattern"` compila uma lista
    limitada de valores tipados e padrões exatos e os compara durante uma única
    leitura de cada chunk elegível. Cada entrada possui `pattern_id` estável e
    único. O resultado é materializado pelo modelo de jobs da Spec 0008, com
@@ -64,7 +64,7 @@ resultados de todos os padrões tipados forem completos. Não publica sessão
 parcial nem um subconjunto silencioso na primeira versão.
 
 Como uma importação ou materialização consome quota até `detach`, será
-adicionada também `memory_debug.scan_close`. Ela remove uma scan session do
+adicionada também `memory_debug_scan_close`. Ela remove uma scan session do
 owner somente quando não existe lease de `scan_next`; não substitui
 `scan_reset`, que conserva a identidade e apenas esvazia candidatos.
 

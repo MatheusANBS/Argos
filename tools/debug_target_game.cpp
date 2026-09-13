@@ -84,9 +84,9 @@ void print_memory_info() {
     std::cout << "Game Magic:        0x" << std::hex << GAME_MAGIC << std::dec << "\n";
     std::cout << "========================================\n";
     std::cout << "Attach with MCP server and use:\n";
-    std::cout << "  memory_debug.attach --pid " << GetCurrentProcessId() << " --authorized true\n";
-    std::cout << "  memory_debug.read --session-id <id> --address <Player address> --size 128\n";
-    std::cout << "  memory_debug.scan_exact --session-id <id> --pattern-hex 4152474f532d47414d452d5441524745542d323032362100\n";
+    std::cout << "  memory_debug_attach --pid " << GetCurrentProcessId() << " --authorized true\n";
+    std::cout << "  memory_debug_read --session-id <id> --address <Player address> --size 128\n";
+    std::cout << "  memory_debug_scan_exact --session-id <id> --pattern-hex 4152474f532d47414d452d5441524745542d323032362100\n";
     std::cout << "========================================\n\n";
 }
 

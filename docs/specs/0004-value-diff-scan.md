@@ -98,7 +98,7 @@ com os parâmetros fornecidos, ex.: `exact` sem `value`).
 
 ## Contrato de API (MCP)
 
-`memory_debug.scan_first`:
+`memory_debug_scan_first`:
 
 ```json
 {
@@ -117,7 +117,7 @@ Resposta:
 {"ok": true, "data": {"scan_id": "…", "value_type": "i32", "candidate_count": 51302, "generation": 0}}
 ```
 
-`memory_debug.scan_next`:
+`memory_debug_scan_next`:
 
 ```json
 {"scan_id": "…", "comparison": "decreased"}
@@ -127,7 +127,7 @@ Resposta:
 {"ok": true, "data": {"scan_id": "…", "value_type": "i32", "candidate_count": 3, "generation": 1}}
 ```
 
-`memory_debug.scan_results`:
+`memory_debug_scan_results`:
 
 ```json
 {"scan_id": "…", "offset": 0, "limit": 50}
@@ -137,7 +137,7 @@ Resposta:
 {"ok": true, "data": {"matches": ["0x21142FC10", "0x21142FC20", "0x21142FC30"]}}
 ```
 
-`memory_debug.scan_reset`: `{"scan_id": "…"}` → `{"ok": true}`.
+`memory_debug_scan_reset`: `{"scan_id": "…"}` → `{"ok": true}`.
 
 ## Segurança
 

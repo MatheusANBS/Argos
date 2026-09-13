@@ -10,7 +10,7 @@ Por padrão:
 
 - somente processos do mesmo usuário podem ser anexados;
 - sessões são somente leitura;
-- escrita de memória fica desabilitada;
+- escrita de memória exige sessão read-write explícita e a frase de confirmação por chamada;
 - leituras e scans possuem limites rígidos;
 - cada `attach` exige `authorized: true`;
 - cada escrita exige a frase `AUTHORIZED_DEBUG_WRITE`.
@@ -22,47 +22,66 @@ assinaturas permanecem candidatos e não são promovidos a layout confirmado.
 
 | Tool | Função |
 |---|---|
-| `memory_debug.process_list` | Lista processos locais e informa correspondência de usuário. |
-| `memory_debug.attach` | Abre uma sessão explícita para um PID autorizado. |
-| `memory_debug.detach` | Fecha a sessão e libera handles; `terminate: true` encerra sessões criadas por `launch`. |
-| `memory_debug.sessions` | Lista sessões ativas. |
-| `memory_debug.regions` | Lista regiões de memória e permissões, com filtro por atributo/tamanho/nome e paginação aplicados no servidor. |
-| `memory_debug.address_space_summary` | Agrega tamanho e contagem do espaço de endereçamento por classe; dimensiona o alvo antes de varrer. |
-| `memory_debug.modules` | Lista módulos carregados/mapeamentos de arquivo. |
-| `memory_debug.pdb_list_types` | Enumera tipos disponíveis no PDB de um módulo carregado. |
-| `memory_debug.pdb_type` | Consulta o layout de um tipo no PDB correspondente ao módulo carregado. |
-| `memory_debug.unity_type` | Extrai tipos de `global-metadata.dat` IL2CPP e usa PDB para completar offsets. |
-| `memory_debug.unreal_type` | Extrai tipos UHT do PDB nativo. |
-| `memory_debug.unreal_reflection` | Extrai símbolos de reflexão UHT do PDB nativo. |
-| `memory_debug.read` | Lê bytes limitados e retorna hexadecimal. |
-| `memory_debug.read_batch` | Executa múltiplas leituras limitadas, coalescendo intervalos adjacentes/sobrepostos em uma única leitura nativa. |
-| `memory_debug.read_typed` | Decodifica inteiros, floats e UTF-8 little-endian. |
-| `memory_debug.strings` | Extrai strings ASCII/UTF-16LE legíveis da memória do processo. |
-| `memory_debug.scan_exact` | Busca um padrão exato de bytes com orçamento explícito. |
-| `memory_debug.scan_pointers_to` | Busca ponteiros que referenciam um endereço conhecido. |
-| `memory_debug.scan_pointer_chains` | Descobre cadeias reversas estáveis com uma única passagem multi-alvo por profundidade. |
-| `memory_debug.scan_first` / `scan_next` / `scan_results` / `scan_reset` | Scan incremental (first scan/next scan) para localizar offsets de campos dinâmicos sem PDB/RTTI. `scan_first` e `scan_next` aceitam decimal; cobertura e páginas trazem metadados completos. |
-| `memory_debug.inspect_address` | Correlaciona um endereço com região, proteções, módulo/RVA e candidatos **prováveis** de objeto/vtable, com referências opcionais dentro de orçamento explícito. |
-| `memory_debug.resolve_pointer_chain` | Resolve pointer chains de 32 ou 64 bits. |
-| `memory_debug.write` | Escreve bytes somente quando habilitado e confirmado. |
-| `memory_debug.launch` / `read_output` | Inicia um executável escolhido pelo operador e captura `stdout`/`stderr`. Desligado por padrão (`ARGOS_MCP_ALLOW_LAUNCH`). |
-| `memory_debug.debug_bridge_inject` | Carrega uma DLL bridge do próprio Argos, explicitamente aprovada, em uma sessão autorizada do Windows. Desligada por padrão (`ARGOS_MCP_ALLOW_DEBUG_BRIDGE_INJECTION`). Não aceita código, exports ou argumentos arbitrários. |
-| `memory_debug.scan_start` | Inicia `scan_exact`/`strings`/`scan_pointers_to`/`scan_pointer_chains`/`scan_first`/`scan_next` como job em background que sobrevive à chamada MCP ([Spec 0008](docs/specs/0008-async-scan-operations.md)). |
-| `memory_debug.job_status` | Consulta estado, progresso monotônico e motivo de término de um job em background. |
-| `memory_debug.job_results` | Pagina o resultado imutável de um job terminal. |
-| `memory_debug.job_cancel` | Pede cancelamento cooperativo de um job em fila ou em execução; idempotente após terminal. |
-| `memory_debug.job_release` | Libera resultados e estado retido de um job terminal. |
+| `memory_debug_process_list` | Lista processos locais e informa correspondência de usuário. |
+| `memory_debug_attach` | Abre uma sessão explícita para um PID autorizado. |
+| `memory_debug_detach` | Fecha a sessão e libera handles; `terminate: true` encerra sessões criadas por `launch`. |
+| `memory_debug_sessions` | Lista sessões ativas. |
+| `memory_debug_regions` | Lista regiões de memória e permissões, com filtro por atributo/tamanho/nome e paginação aplicados no servidor. |
+| `memory_debug_address_space_summary` | Agrega tamanho e contagem do espaço de endereçamento por classe; dimensiona o alvo antes de varrer. |
+| `memory_debug_modules` | Lista módulos carregados/mapeamentos de arquivo. |
+| `memory_debug_pdb_list_types` | Enumera tipos disponíveis no PDB de um módulo carregado. |
+| `memory_debug_pdb_type` | Consulta o layout de um tipo no PDB correspondente ao módulo carregado. |
+| `memory_debug_unity_type` | Extrai tipos de `global-metadata.dat` IL2CPP e usa PDB para completar offsets. |
+| `memory_debug_unreal_type` | Extrai tipos UHT do PDB nativo. |
+| `memory_debug_unreal_reflection` | Extrai símbolos de reflexão UHT do PDB nativo. |
+| `memory_debug_read` | Lê bytes limitados e retorna hexadecimal. |
+| `memory_debug_read_batch` | Executa múltiplas leituras limitadas, coalescendo intervalos adjacentes/sobrepostos em uma única leitura nativa. |
+| `memory_debug_read_typed` | Decodifica inteiros, floats e UTF-8 little-endian. |
+| `memory_debug_strings` | Extrai strings ASCII/UTF-16LE legíveis da memória do processo. |
+| `memory_debug_scan_exact` | Busca um padrão exato de bytes com orçamento explícito. |
+| `memory_debug_scan_pointers_to` | Busca ponteiros que referenciam um endereço conhecido. |
+| `memory_debug_scan_pointer_chains` | Descobre cadeias reversas estáveis com uma única passagem multi-alvo por profundidade. |
+| `memory_debug_scan_first` / `scan_next` / `scan_results` / `scan_reset` | Scan incremental (first scan/next scan) para localizar offsets de campos dinâmicos sem PDB/RTTI. `scan_first` e `scan_next` aceitam decimal; cobertura e páginas trazem metadados completos. |
+| `memory_debug_inspect_address` | Correlaciona um endereço com região, proteções, módulo/RVA e candidatos **prováveis** de objeto/vtable, com referências opcionais dentro de orçamento explícito. |
+| `memory_debug_disassemble` | Desmonta x86/x64 somente leitura a partir de um endereço, resolvendo branches relativos e operandos RIP-relativos para alvos absolutos (ADR-0029). |
+| `memory_debug_find_code_references` | Varre memória executável e devolve as instruções que referenciam um endereço-alvo (quem lê/escreve um slot, quem chama uma função). Evidência de referência, não limite de função. |
+| `memory_debug_resolve_pointer_chain` | Resolve pointer chains de 32 ou 64 bits. |
+| `memory_debug_write` | Escreve bytes somente quando habilitado e confirmado. |
+| `memory_debug_launch` / `read_output` | Inicia um executável escolhido pelo operador e captura `stdout`/`stderr`. Desligado por padrão (`ARGOS_MCP_ALLOW_LAUNCH`). |
+| `memory_debug_debug_bridge_inject` | Carrega uma DLL bridge do próprio Argos, explicitamente aprovada, em uma sessão autorizada do Windows. Desligada por padrão (`ARGOS_MCP_ALLOW_DEBUG_BRIDGE_INJECTION`). Não aceita código, exports ou argumentos arbitrários. |
+| `memory_debug_scan_start` | Inicia `scan_exact`/`strings`/`scan_pointers_to`/`scan_pointer_chains`/`scan_first`/`scan_next` como job em background que sobrevive à chamada MCP ([Spec 0008](docs/specs/0008-async-scan-operations.md)). |
+| `memory_debug_job_status` | Consulta estado, progresso monotônico e motivo de término de um job em background. |
+| `memory_debug_job_results` | Pagina o resultado imutável de um job terminal. |
+| `memory_debug_job_cancel` | Pede cancelamento cooperativo de um job em fila ou em execução; idempotente após terminal. |
+| `memory_debug_job_release` | Libera resultados e estado retido de um job terminal. |
 
 Atrás de gate, desligadas por padrão (`ARGOS_MCP_ENABLE_UNREAL_RUNTIME` mais
 uma allowlist de perfis) e ausentes de `tools/list` enquanto isso:
 
 | Tool | Função |
 |---|---|
-| `memory_debug.unreal_runtime_discover` | Valida as raízes `GUObjectArray`/`FNamePool` contra um perfil de layout habilitado e publica um contexto somente-leitura com o catálogo de classes. |
-| `memory_debug.unreal_runtime_classes` | Pagina o catálogo de classes validado, com filtro por nome. |
-| `memory_debug.unreal_runtime_type` | Lê `FProperty`/`UProperty` declaradas e herdadas de uma classe do catálogo: offsets e tamanhos, nunca valores de instância. |
-| `memory_debug.unreal_runtime_objects` | Enumera summaries de `UObject` vivos filtrados por classe, página a página. |
-| `memory_debug.unreal_runtime_release` | Libera o contexto e os catálogos derivados. |
+| `memory_debug_unreal_runtime_discover` | Valida as raízes `GUObjectArray`/`FNamePool` contra um perfil de layout habilitado e publica um contexto somente-leitura com o catálogo de classes. |
+| `memory_debug_unreal_runtime_classes` | Pagina o catálogo de classes validado, com filtro por nome. |
+| `memory_debug_unreal_runtime_type` | Lê `FProperty`/`UProperty` declaradas e herdadas de uma classe do catálogo: offsets e tamanhos, nunca valores de instância. |
+| `memory_debug_unreal_runtime_objects` | Enumera summaries de `UObject` vivos filtrados por classe, página a página. |
+| `memory_debug_unreal_runtime_release` | Libera o contexto e os catálogos derivados. |
+
+Atrás de gate próprio (`ARGOS_MCP_ENABLE_SANTAMONICA_RUNTIME` **mais** um perfil
+de build ou o peer controlado) e ausentes de `tools/list` enquanto isso. Elas
+leem, com perfil de build, a tabela de tipos da build real pela sessão
+autorizada, somente leitura; sem perfil, falam com o peer sintético da
+[ADR-0025](docs/adr/0025-santa-monica-local-channel.md). Em nenhum caso
+escrevem, injetam ou iniciam processo. Esta build não expõe campos, enums nem
+SLI, e as páginas correspondentes vêm vazias em vez de inventadas.
+
+| Tool | Função |
+|---|---|
+| `memory_debug_santamonica_runtime_discover` | Publica um snapshot somente leitura: da build real quando há perfil casando ([ADR-0026](docs/adr/0026-santa-monica-native-type-reader.md)), do peer controlado caso contrário. |
+| `memory_debug_santamonica_runtime_types` | Pagina os tipos do snapshot, com filtro por nome. |
+| `memory_debug_santamonica_runtime_type` | Lê um tipo com campos declarados e, opcionalmente, herdados. |
+| `memory_debug_santamonica_runtime_enums` | Pagina enums e valores, preservando a grafia decimal exata de 64 bits. |
+| `memory_debug_santamonica_runtime_sli_functions` | Pagina entradas SLI descritivas, sempre com `invocable: false`. |
+| `memory_debug_santamonica_runtime_release` | Libera o snapshot e as páginas derivadas. |
 
 ## Roadmap
 
@@ -94,6 +113,11 @@ Requisitos:
 - CMake 3.25 ou superior;
 - compilador com C++23: MSVC, Clang ou GCC;
 - Ninja para os presets fornecidos.
+
+O desmontador (ADR-0029) usa [Zydis](https://github.com/zyantific/zydis) v4.1.1
+(Zycore `0b2432c`), licença MIT, vendorizado em `third_party/zydis` e compilado
+como biblioteca estática pelo próprio build — sem dependência de rede, pacote de
+sistema ou submódulo a inicializar.
 
 ```bash
 cmake --preset dev
@@ -210,13 +234,13 @@ Linux:
 ARGOS_MCP_ALLOW_WRITE=1 ./build/dev/argos_runtime_memory_mcp
 ```
 
-Depois disso, o `attach` deve solicitar `access: "read_write"`, e cada chamada de `memory_debug.write` deve enviar `confirmation: "AUTHORIZED_DEBUG_WRITE"`.
+Depois disso, o `attach` deve solicitar `access: "read_write"`, e cada chamada de `memory_debug_write` deve enviar `confirmation: "AUTHORIZED_DEBUG_WRITE"`.
 
 ## Variáveis de ambiente
 
 | Variável | Padrão | Limite rígido |
 |---|---:|---:|
-| `ARGOS_MCP_ALLOW_WRITE` | `0` | booleano |
+| `ARGOS_MCP_ALLOW_WRITE` | `1` | booleano (`0` restaura o modo somente leitura) |
 | `ARGOS_MCP_ALLOW_FOREIGN_USER` | `0` | booleano |
 | `ARGOS_MCP_MAX_READ_BYTES` | 65.536 | 1 MiB |
 | `ARGOS_MCP_MAX_WRITE_BYTES` | 4.096 | 64 KiB |
@@ -261,10 +285,43 @@ Depois disso, o `attach` deve solicitar `access: "read_write"`, e cada chamada d
 | `ARGOS_MCP_MAX_UNREAL_PAGE_RETRIES` | 2 | 8 |
 | `ARGOS_MCP_MAX_UNREAL_CONTEXT_BYTES` | 64 MiB | 256 MiB |
 | `ARGOS_MCP_UNREAL_CONTEXT_TTL_SECONDS` | 900 | 3.600 |
+| `ARGOS_MCP_ENABLE_SANTAMONICA_RUNTIME` | `0` | booleano |
+| `ARGOS_MCP_SANTAMONICA_PEER` | (vazio) | caminho absoluto do peer controlado |
+| `ARGOS_MCP_SANTAMONICA_BUILD_PROFILES` | (vazio) | até 16 registros / 8 KiB |
+| `ARGOS_MCP_MAX_SANTAMONICA_CONTEXTS_PER_SESSION` | 1 | 8 |
+| `ARGOS_MCP_MAX_SANTAMONICA_CONTEXTS` | 2 | 16 |
+| `ARGOS_MCP_MAX_SANTAMONICA_RECORDS` | 100.000 | 100.000 |
+| `ARGOS_MCP_MAX_SANTAMONICA_STRING_BYTES` | 4.096 | 4.096 |
+| `ARGOS_MCP_MAX_SANTAMONICA_RETAINED_BYTES` | 32 MiB | 32 MiB |
+| `ARGOS_MCP_MAX_SANTAMONICA_FIELDS` | 1.024 | 4.096 |
+| `ARGOS_MCP_MAX_SANTAMONICA_ENUM_VALUES` | 1.024 | 4.096 |
+| `ARGOS_MCP_MAX_SANTAMONICA_SESSION_MS` | 10.000 | 60.000 |
+| `ARGOS_MCP_SANTAMONICA_CONTEXT_TTL_SECONDS` | 900 | 3.600 |
 | `ARGOS_MCP_LOG_LEVEL` | `info` | `debug`, `info`, `warning`, `error` |
 
 Os limites de `inspect_address` só podem ser **reduzidos** pelo operador: o teto
 rígido do domínio continua sendo o limite superior.
+
+`ARGOS_MCP_ENABLE_SANTAMONICA_RUNTIME=1` sozinho também não habilita nada: é
+preciso uma das duas origens, `ARGOS_MCP_SANTAMONICA_PEER` (peer controlado) ou
+`ARGOS_MCP_SANTAMONICA_BUILD_PROFILES` (perfil de build lido nativamente).
+Com um perfil casando o módulo carregado da sessão, `discover` lê a build real;
+sem perfil, usa o peer. A resposta sempre declara a origem em `source`. O peer é o alvo sintético controlado descrito na
+[ADR-0025](docs/adr/0025-santa-monica-local-channel.md), publicado em
+`install\bin\argos_santa_monica_peer.exe`; ele prova o protocolo, não a
+compatibilidade com uma build do jogo.
+
+A reflexão nativa usa `gow2018-reflection-x64-v2` e o formato de perfil da
+[ADR-0027](docs/adr/0027-santa-monica-native-reflection.md): nove campos para
+tipos, quinze para acrescentar atributos, enums e SLI, ou dezesseis para
+publicar também o inventário de recursos
+([ADR-0028](docs/adr/0028-santa-monica-resources-and-execution.md)) com
+`santamonica_runtime_resources` e `santamonica_runtime_set_resource` — esta é
+escrita direta de saldo, não concessão da engine. A família antiga
+`gow2018-typetable-x64` é recusada; a migração exige corrigir também os RVAs.
+Na instalação validada, o MCP publica 1.192 tipos, 7.041 campos, 482 enums,
+3.791 valores e 309 funções SLI. A cobertura é parcial e SLI é descritivo;
+invocação, inventário e Lua permanecem pendentes.
 
 `ARGOS_MCP_ENABLE_UNREAL_RUNTIME=1` sozinho não habilita nada. Um perfil precisa
 ser nomeado em `ARGOS_MCP_UNREAL_PROFILES` (allowlist vazia = nenhum perfil), e
@@ -284,11 +341,11 @@ corresponder, e as invariantes completas do runtime ainda são validadas.
 
 `ARGOS_MCP_ALLOW_FOREIGN_USER=1` remove somente a validação interna de proprietário. Ele não contorna permissões do sistema operacional e deve ser usado apenas em ambientes de laboratório controlados.
 
-`ARGOS_MCP_ALLOW_LAUNCH=1` habilita `memory_debug.launch` (o servidor cria um processo em vez de apenas ler um já existente). Desligado por padrão; útil apenas para alvos de teste/desenvolvimento controlados pelo próprio operador, não para anexar a processos de terceiros já em execução. Ver o threat model para os controles completos.
+`ARGOS_MCP_ALLOW_LAUNCH=1` habilita `memory_debug_launch` (o servidor cria um processo em vez de apenas ler um já existente). Desligado por padrão; útil apenas para alvos de teste/desenvolvimento controlados pelo próprio operador, não para anexar a processos de terceiros já em execução. Ver o threat model para os controles completos.
 
 ## Habilitar bridge de depuração no Windows
 
-`memory_debug.debug_bridge_inject` é uma capacidade separada de escrita de
+`memory_debug_debug_bridge_inject` é uma capacidade separada de escrita de
 memória. Ela só aparece quando o servidor inicia com os dois controles abaixo:
 
 ```powershell
@@ -337,7 +394,7 @@ O domínio não depende de JSON, MCP, `stdin`, `stdout` ou APIs específicas do 
 
 ## Unity, Unreal e PDB
 
-O caminho de maior confianca implementado e `memory_debug.pdb_type`, usando
+O caminho de maior confianca implementado e `memory_debug_pdb_type`, usando
 DbgHelp no Windows para consultar o PDB correspondente ao modulo carregado.
 Unity e Unreal possuem metadados dependentes do backend/versao; o metodo
 recomendado e os limites oficiais estao em
@@ -354,12 +411,26 @@ sendo o caminho preferido para layout nativo completo. Perfis embutidos:
 `ue5-fproperty-x64` (`FField`/`FProperty`) e `ue4-uproperty-x64`
 (`UField`/`UProperty`), selecionados explicitamente e sem fallback entre si.
 
-## Santa Monica/Kinetica (proposto)
+## Santa Monica/Kinetica (em desenvolvimento)
 
 O suporte por build para a engine proprietária de *God of War* (2018) está
-documentado, mas ainda não implementado. A proposta inclui RTTI, SLI, Lua,
+em implementação incremental. A etapa 1 está fechada e o servidor já lê tipos
+reais da build Steam 11168363: catálogo validado no domínio, codec de snapshot
+([ADR-0023](docs/adr/0023-santa-monica-reflection-stream.md)), handshake
+autenticado ([ADR-0024](docs/adr/0024-santa-monica-bridge-handshake.md)),
+canal local com ACL e bootstrap
+([ADR-0025](docs/adr/0025-santa-monica-local-channel.md)), manager com quotas e
+TTL, e seis tools MCP somente leitura atrás de gate. Elas funcionam ponta a
+ponta contra um **peer sintético controlado** e, com perfil de build
+([ADR-0027](docs/adr/0027-santa-monica-native-reflection.md)), contra o jogo
+real, publicando tipos, herança, campos próprios, enums/valores e funções SLI
+descritivas. A cobertura é parcial: coleções auxiliares, mapas sem tamanho
+comprovado e propriedades SLI ficam de fora. Inventário, gameplay e Lua
+continuam pendentes. O plano aprovado inclui RTTI, SLI, Lua,
 inventário e operações de gameplay por bridge, sempre vinculadas a um perfil
-exato e a gates opt-in. Consulte
+exato e a gates opt-in. O plano começa por reflexão somente leitura; bridge
+com canal autenticado, gameplay com deduplicação e Lua com isolamento são
+etapas posteriores, condicionadas à validação da build. Consulte
 [`docs/engines/santa-monica-kinetica.md`](docs/engines/santa-monica-kinetica.md),
 [Spec 0014](docs/specs/0014-santa-monica-kinetica-runtime-instrumentation.md)
 e [ADR-0022](docs/adr/0022-santa-monica-kinetica-runtime-instrumentation.md).

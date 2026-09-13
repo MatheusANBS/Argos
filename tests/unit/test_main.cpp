@@ -526,8 +526,22 @@ void test_policy() {
     argos::security::SecurityPolicy policy;
     check(!policy.authorize_attach(false, argos::domain::AccessMode::read_only).has_value(),
           "attach requires explicit authorization");
-    check(!policy.authorize_attach(true, argos::domain::AccessMode::read_write).has_value(),
-          "write session is disabled by default");
+    check(policy.authorize_attach(true, argos::domain::AccessMode::read_write).has_value(),
+          "a read-write session is allowed by default");
+    argos::security::SecurityPolicy read_only_policy;
+    read_only_policy.allow_write = false;
+    check(!read_only_policy.authorize_attach(true, argos::domain::AccessMode::read_write).has_value(),
+          "ARGOS_MCP_ALLOW_WRITE=0 still refuses a read-write session");
+    // Enabling the gate is not enabling writes: the per-call phrase and the
+    // size ceiling are separate controls and both still apply.
+    check(!policy.authorize_write(8U, "").has_value(),
+          "a write without the confirmation phrase is refused even with the gate on");
+    check(!policy.authorize_write(8U, "please").has_value(),
+          "a wrong confirmation phrase is refused");
+    check(policy.authorize_write(8U, "AUTHORIZED_DEBUG_WRITE").has_value(),
+          "a confirmed write within the limit is allowed");
+    check(!policy.authorize_write(policy.max_write_bytes + 1U, "AUTHORIZED_DEBUG_WRITE").has_value(),
+          "an oversized write is refused even when confirmed");
     check(policy.authorize_read(32U).has_value(), "small read is allowed");
     check(!policy.authorize_read(policy.max_read_bytes + 1U).has_value(), "oversized read is denied");
 }
@@ -2775,6 +2789,98 @@ void test_analysis_job_manager_retained_bytes_budget() {
     (void)manager.release(session->id, job3->id);
 }
 
+void test_santamonica_build_profile_parsing() {
+    using argos::security::parse_santamonica_build_profiles;
+    const std::string digest(64, 'a');
+    const std::string valid =
+        "gow2018-steam-11168363|gow2018-typetable-x64|GoW.exe|85839872|" + digest +
+        "|11DAA40|11F20A0|D48000|105A000";
+
+    auto parsed = parse_santamonica_build_profiles(valid);
+    check(parsed.has_value(), "a well-formed santa monica build profile parses");
+    if (parsed) {
+        check(parsed->size() == 1U, "one record yields one profile");
+        if (!parsed->empty()) {
+            const auto& profile = parsed->front();
+            check(profile.build_id == "gow2018-steam-11168363", "build id survives");
+            check(profile.profile_id == "gow2018-typetable-x64", "layout family survives");
+            check(profile.module_size == 85839872U, "module size survives");
+            check(profile.module_digest.size() == 32U, "the digest is 32 bytes");
+            check(profile.table_begin_rva == 0x11DAA40U && profile.table_end_rva == 0x11F20A0U,
+                  "table range is parsed as hexadecimal");
+            check(profile.names_begin_rva == 0xD48000U && profile.names_end_rva == 0x105A000U,
+                  "names range is parsed as hexadecimal");
+        }
+    }
+
+    check(parse_santamonica_build_profiles("").has_value(), "an empty configuration is valid");
+    check(!parse_santamonica_build_profiles(valid + ";" + valid),
+          "a duplicated build id is refused");
+
+    // Ranges must stay inside the module and be ordered.
+    const std::string outside =
+        "b|gow2018-typetable-x64|GoW.exe|4096|" + digest + "|100|200|300|2000";
+    check(!parse_santamonica_build_profiles(outside), "a range beyond the module is refused");
+    const std::string inverted =
+        "b|gow2018-typetable-x64|GoW.exe|85839872|" + digest + "|200|100|D48000|105A000";
+    check(!parse_santamonica_build_profiles(inverted), "an inverted range is refused");
+    const std::string short_digest =
+        "b|gow2018-typetable-x64|GoW.exe|85839872|aabb|11DAA40|11F20A0|D48000|105A000";
+    check(!parse_santamonica_build_profiles(short_digest), "a digest that is not 32 bytes is refused");
+    const std::string missing_field =
+        "b|gow2018-typetable-x64|GoW.exe|85839872|" + digest + "|11DAA40|11F20A0|D48000";
+    check(!parse_santamonica_build_profiles(missing_field), "a record with too few fields is refused");
+    const std::string traversal =
+        "b|gow2018-typetable-x64|..\\\\GoW.exe|85839872|" + digest + "|11DAA40|11F20A0|D48000|105A000";
+    check(!parse_santamonica_build_profiles(traversal), "a module name with a path is refused");
+
+    const std::string extended = valid + "|1082030|1118990|1184E70|1188AB0|11CA300|11CC9A0";
+    auto full = parse_santamonica_build_profiles(extended);
+    check(full.has_value() && full->front().attribute_begin_rva == 0x1082030U &&
+          full->front().attribute_end_rva == 0x1118990U &&
+          full->front().enum_begin_rva == 0x1184E70U && full->front().enum_end_rva == 0x1188AB0U &&
+          full->front().sli_begin_rva == 0x11CA300U && full->front().sli_end_rva == 0x11CC9A0U,
+          "the fifteen-field profile preserves every optional range");
+    check(parse_santamonica_build_profiles(valid + "|0|0|0|0|0|0").has_value(),
+          "zero pairs explicitly omit optional reflection tables");
+    for (const auto* suffix : {"|100|120", "|100|120|0|0", "|100|121|0|0|0|0",
+                               "|0|120|0|0|0|0", "|100|0|0|0|0|0", "|200|100|0|0|0|0",
+                               "|100|FFFFFFFFFFFFFFFF|0|0|0|0", "|0|0|0|0|0|x", "|0|0|0|0|0|0|0|0"}) {
+        check(!parse_santamonica_build_profiles(valid + suffix),
+              "partial, excessive, ragged, inverted and overflowing optional ranges are refused");
+    }
+
+    // Sixteenth field: the resource root (ADR-0028).
+    auto rooted = parse_santamonica_build_profiles(extended + "|502A4B0");
+    check(rooted.has_value() && rooted->front().resources_root_rva == 0x502A4B0U &&
+          rooted->front().sli_end_rva == 0x11CC9A0U,
+          "the sixteen-field profile carries the resource root without disturbing the ranges");
+    auto unrooted = parse_santamonica_build_profiles(valid + "|0|0|0|0|0|0|0");
+    check(unrooted.has_value() && unrooted->front().resources_root_rva == 0U,
+          "a zero resource root leaves resources unpublished");
+    check(full.has_value() && full->front().resources_root_rva == 0U,
+          "a fifteen-field profile publishes no resources");
+    const std::string small_module =
+        "r|gow2018-typetable-x64|GoW.exe|4096|" + digest + "|100|200|300|400|0|0|0|0|0|0";
+    check(parse_santamonica_build_profiles(small_module + "|FF8").has_value(),
+          "a root on the last pointer-sized slot of the module is accepted");
+    for (const auto* root : {"|FF9", "|1000", "|FFFFFFFFFFFFFFFF", "|x", "|"}) {
+        check(!parse_santamonica_build_profiles(small_module + root),
+              "a resource root outside the module or malformed is refused");
+    }
+
+    argos::security::SecurityPolicy policy;
+    policy.enable_santamonica_runtime = true;
+    check(!policy.authorize_santamonica_runtime().has_value(),
+          "the gate alone does not authorize: a peer or a build profile is required");
+    if (parsed) policy.santamonica_build_profiles = *parsed;
+    check(policy.authorize_santamonica_runtime().has_value(),
+          "a build profile alone authorizes the runtime");
+    policy.santamonica_build_profiles_valid = false;
+    check(!policy.authorize_santamonica_runtime().has_value(),
+          "an invalid profile configuration is refused rather than ignored");
+}
+
 int main() {
     test_json();
     test_policy();
@@ -2789,6 +2895,7 @@ int main() {
     test_domain_query_helpers();
     test_output_ring_buffer();
     test_authorize_launch_policy();
+    test_santamonica_build_profile_parsing();
     test_debug_bridge_policy_and_service();
     test_launch_and_managed_process();
     test_extract_strings();

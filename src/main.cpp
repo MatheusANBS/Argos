@@ -20,7 +20,7 @@ int main() {
     try {
 #if defined(_WIN32)
         // Defense in depth alongside the explicit handle allowlist used by
-        // memory_debug.launch (see native_process_memory.cpp): make sure
+        // memory_debug_launch (see native_process_memory.cpp): make sure
         // this process's own standard handles are never inheritable, so a
         // launched child can never end up holding the MCP's own protocol
         // pipe open regardless of how it was started.

@@ -23,11 +23,19 @@ namespace {
     return std::string_view{value};
 }
 
-[[nodiscard]] bool env_flag(std::string_view name) {
+// The fallback is what an absent or unrecognised value means, so a gate whose
+// default is on can still be turned off explicitly.
+[[nodiscard]] bool env_flag(std::string_view name, const bool fallback = false) {
     const auto value = env_text(name);
-    if (!value) return false;
+    if (!value) return fallback;
     const std::string_view text{*value};
-    return text == "1" || text == "true" || text == "TRUE" || text == "yes" || text == "YES";
+    if (text == "1" || text == "true" || text == "TRUE" || text == "yes" || text == "YES") {
+        return true;
+    }
+    if (text == "0" || text == "false" || text == "FALSE" || text == "no" || text == "NO") {
+        return false;
+    }
+    return fallback;
 }
 
 [[nodiscard]] std::size_t env_size(
@@ -134,6 +142,125 @@ namespace {
 
 }  // namespace
 
+std::expected<std::vector<SantaMonicaBuildProfile>, std::string>
+parse_santamonica_build_profiles(const std::string_view text) {
+    constexpr std::size_t max_field_count = 16U;
+    constexpr std::size_t max_profiles = 16U;
+    constexpr std::size_t max_config_bytes = 8U * 1024U;
+    constexpr std::size_t digest_bytes = 32U;
+    if (text.empty()) return std::vector<SantaMonicaBuildProfile>{};
+    if (text.size() > max_config_bytes) {
+        return std::unexpected("santa monica build profile configuration exceeds the size limit");
+    }
+
+    std::vector<SantaMonicaBuildProfile> profiles;
+    std::unordered_set<std::string> build_ids;
+    std::size_t record_start = 0U;
+    while (record_start <= text.size()) {
+        if (profiles.size() >= max_profiles) {
+            return std::unexpected("too many santa monica build profiles");
+        }
+        const auto separator = text.find(';', record_start);
+        const auto record_end = separator == std::string_view::npos ? text.size() : separator;
+        const auto record = text.substr(record_start, record_end - record_start);
+        if (record.empty()) {
+            return std::unexpected("santa monica build profile contains an empty record");
+        }
+
+        std::array<std::string_view, max_field_count> fields{};
+        const auto field_count = static_cast<std::size_t>(std::ranges::count(record, '|')) + 1U;
+        if (field_count != 9U && field_count != 15U && field_count != max_field_count) {
+            return std::unexpected("santa monica build profile requires nine, fifteen or sixteen fields");
+        }
+        std::size_t field_start = 0U;
+        for (std::size_t field = 0U; field < field_count; ++field) {
+            const auto field_separator = record.find('|', field_start);
+            if (field + 1U == field_count) {
+                if (field_separator != std::string_view::npos) {
+                    return std::unexpected("santa monica build profile has too many fields");
+                }
+                fields[field] = record.substr(field_start);
+            } else {
+                if (field_separator == std::string_view::npos) {
+                    return std::unexpected("santa monica build profile has too few fields");
+                }
+                fields[field] = record.substr(field_start, field_separator - field_start);
+                field_start = field_separator + 1U;
+            }
+        }
+
+        const auto module_size = parse_u64(fields[3], 10);
+        auto module_digest = parse_signature(fields[4]);
+        const auto table_begin = parse_u64(fields[5], 16);
+        const auto table_end = parse_u64(fields[6], 16);
+        const auto names_begin = parse_u64(fields[7], 16);
+        const auto names_end = parse_u64(fields[8], 16);
+        if (!safe_identifier(fields[0], 128U) || !safe_identifier(fields[1], 128U) ||
+            !safe_module_name(fields[2]) || !module_size || *module_size == 0U ||
+            !module_digest || module_digest->size() != digest_bytes ||
+            !table_begin || !table_end || !names_begin || !names_end) {
+            return std::unexpected("santa monica build profile contains an invalid field");
+        }
+        // Ranges must be ordered and live inside the module, so a profile can
+        // never point the reader outside the image it claims to describe.
+        if (*table_end <= *table_begin || *names_end <= *names_begin ||
+            *table_end > *module_size || *names_end > *module_size) {
+            return std::unexpected("santa monica build profile range is outside the module");
+        }
+        if (!build_ids.emplace(fields[0]).second) {
+            return std::unexpected("santa monica build profile id is duplicated");
+        }
+
+        SantaMonicaBuildProfile profile;
+        profile.build_id = std::string{fields[0]};
+        profile.profile_id = std::string{fields[1]};
+        profile.module_name = std::string{fields[2]};
+        profile.module_size = *module_size;
+        profile.module_digest = std::move(*module_digest);
+        profile.table_begin_rva = *table_begin;
+        profile.table_end_rva = *table_end;
+        profile.names_begin_rva = *names_begin;
+        profile.names_end_rva = *names_end;
+        std::array<std::uint64_t, 6> extra{};
+        if (field_count >= 15U) {
+            for (std::size_t index = 0; index < extra.size(); ++index) {
+                auto parsed = parse_u64(fields[9U + index], 16);
+                if (!parsed) return std::unexpected("invalid santa monica reflection range");
+                extra[index] = *parsed;
+            }
+            for (std::size_t index = 0; index < extra.size(); index += 2U) {
+                const auto begin = extra[index];
+                const auto end = extra[index + 1U];
+                if (begin == 0 && end == 0) continue;
+                if (begin == 0 || end <= begin || end > *module_size ||
+                    (end - begin) % 32U != 0 || end - begin > 8U * 1024U * 1024U) {
+                    return std::unexpected("invalid santa monica reflection range");
+                }
+            }
+        }
+        profile.attribute_begin_rva = extra[0];
+        profile.attribute_end_rva = extra[1];
+        profile.enum_begin_rva = extra[2];
+        profile.enum_end_rva = extra[3];
+        profile.sli_begin_rva = extra[4];
+        profile.sli_end_rva = extra[5];
+        if (field_count == max_field_count) {
+            const auto root = parse_u64(fields[15], 16);
+            // Zero leaves resources unpublished; anything else must be a whole
+            // pointer-sized slot inside the module the profile describes.
+            if (!root || (*root != 0U && (*module_size < 8U || *root > *module_size - 8U))) {
+                return std::unexpected("invalid santa monica resource root");
+            }
+            profile.resources_root_rva = *root;
+        }
+        profiles.push_back(std::move(profile));
+
+        if (separator == std::string_view::npos) break;
+        record_start = record_end + 1U;
+    }
+    return profiles;
+}
+
 std::expected<std::vector<UnrealBuildProfile>, std::string>
 parse_unreal_build_profiles(const std::string_view text) {
     constexpr std::size_t field_count = 8U;
@@ -208,7 +335,10 @@ parse_unreal_build_profiles(const std::string_view text) {
 
 SecurityPolicy SecurityPolicy::from_environment() {
     SecurityPolicy policy;
-    policy.allow_write = env_flag("ARGOS_MCP_ALLOW_WRITE");
+    // Enabled by default at the repository owner's explicit direction. Writing
+    // still needs a read-write session and the per-call confirmation phrase;
+    // set ARGOS_MCP_ALLOW_WRITE=0 to restore the read-only posture.
+    policy.allow_write = env_flag("ARGOS_MCP_ALLOW_WRITE", true);
     policy.allow_foreign_user = env_flag("ARGOS_MCP_ALLOW_FOREIGN_USER");
     policy.max_read_bytes = env_size("ARGOS_MCP_MAX_READ_BYTES", 64U * 1024U, 1024U * 1024U);
     policy.max_write_bytes = env_size("ARGOS_MCP_MAX_WRITE_BYTES", 4U * 1024U, 64U * 1024U);
@@ -290,6 +420,32 @@ SecurityPolicy SecurityPolicy::from_environment() {
         "ARGOS_MCP_MAX_UNREAL_CONTEXT_BYTES", 64U * 1024U * 1024U, 256U * 1024U * 1024U
     );
     policy.unreal_context_ttl_seconds = env_size("ARGOS_MCP_UNREAL_CONTEXT_TTL_SECONDS", 900U, 3600U);
+    policy.enable_santamonica_runtime = env_flag("ARGOS_MCP_ENABLE_SANTAMONICA_RUNTIME");
+    if (const auto configured = env_text("ARGOS_MCP_SANTAMONICA_PEER")) {
+        policy.santamonica_peer_path = std::string{*configured};
+    }
+    if (const auto configured = env_text("ARGOS_MCP_SANTAMONICA_BUILD_PROFILES")) {
+        auto profiles = parse_santamonica_build_profiles(*configured);
+        policy.santamonica_build_profiles_valid = profiles.has_value();
+        if (profiles) {
+            policy.santamonica_build_profiles = std::move(*profiles);
+        }
+    }
+    policy.max_santamonica_contexts_per_session = env_size(
+        "ARGOS_MCP_MAX_SANTAMONICA_CONTEXTS_PER_SESSION", 1U, 8U
+    );
+    policy.max_santamonica_contexts_total = env_size("ARGOS_MCP_MAX_SANTAMONICA_CONTEXTS", 2U, 16U);
+    policy.max_santamonica_records = env_size("ARGOS_MCP_MAX_SANTAMONICA_RECORDS", 100000U, 100000U);
+    policy.max_santamonica_string_bytes = env_size("ARGOS_MCP_MAX_SANTAMONICA_STRING_BYTES", 4096U, 4096U);
+    policy.max_santamonica_retained_bytes = env_size(
+        "ARGOS_MCP_MAX_SANTAMONICA_RETAINED_BYTES", 32U * 1024U * 1024U, 32U * 1024U * 1024U
+    );
+    policy.max_santamonica_fields_per_type = env_size("ARGOS_MCP_MAX_SANTAMONICA_FIELDS", 1024U, 4096U);
+    policy.max_santamonica_values_per_enum = env_size("ARGOS_MCP_MAX_SANTAMONICA_ENUM_VALUES", 1024U, 4096U);
+    policy.max_santamonica_session_ms = env_size("ARGOS_MCP_MAX_SANTAMONICA_SESSION_MS", 10000U, 60000U);
+    policy.santamonica_context_ttl_seconds = env_size(
+        "ARGOS_MCP_SANTAMONICA_CONTEXT_TTL_SECONDS", 900U, 3600U
+    );
     return policy;
 }
 
@@ -306,7 +462,7 @@ domain::Result<void> SecurityPolicy::authorize_attach(
     if (access == domain::AccessMode::read_write && !allow_write) {
         return std::unexpected(error(
             domain::DebugErrorCode::access_denied,
-            "write access is disabled; set ARGOS_MCP_ALLOW_WRITE=1 before starting the server"
+            "write access is disabled; unset ARGOS_MCP_ALLOW_WRITE=0 before starting the server"
         ));
     }
     return {};
@@ -350,6 +506,34 @@ domain::Result<void> SecurityPolicy::authorize_scan(
     }
     if (result_limit == 0U || result_limit > max_scan_results) {
         return std::unexpected(error(domain::DebugErrorCode::limit_exceeded, "scan result limit exceeds configured limit"));
+    }
+    return {};
+}
+
+domain::Result<void> SecurityPolicy::authorize_disassemble(
+    const std::size_t instruction_count
+) const {
+    if (instruction_count == 0U || instruction_count > max_disassemble_instructions) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::limit_exceeded, "instruction count exceeds configured limit"
+        ));
+    }
+    return {};
+}
+
+domain::Result<void> SecurityPolicy::authorize_code_references(
+    const std::uint64_t byte_budget,
+    const std::size_t result_limit
+) const {
+    if (byte_budget == 0U || byte_budget > max_code_ref_byte_budget) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::limit_exceeded, "code reference byte budget exceeds configured limit"
+        ));
+    }
+    if (result_limit == 0U || result_limit > max_code_ref_results) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::limit_exceeded, "code reference result limit exceeds configured limit"
+        ));
     }
     return {};
 }
@@ -562,6 +746,53 @@ domain::Result<void> SecurityPolicy::authorize_unreal_runtime(const std::string_
     if (!allowed) {
         return std::unexpected(error(
             domain::DebugErrorCode::unsupported, "profile_id is not in ARGOS_MCP_UNREAL_PROFILES"
+        ));
+    }
+    return {};
+}
+
+domain::Result<void> SecurityPolicy::authorize_santamonica_runtime() const {
+    if (!enable_santamonica_runtime) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::unsupported,
+            "santa monica runtime is disabled; set ARGOS_MCP_ENABLE_SANTAMONICA_RUNTIME=1 before starting the server"
+        ));
+    }
+    if (!santamonica_build_profiles_valid) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument,
+            "invalid_build_profile_config: ARGOS_MCP_SANTAMONICA_BUILD_PROFILES is invalid"
+        ));
+    }
+    // Either source is enough on its own: a profiled build read natively, or
+    // the controlled peer. Neither can be named by a request.
+    if (santamonica_peer_path.empty() && santamonica_build_profiles.empty()) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::unsupported,
+            "santa monica runtime requires ARGOS_MCP_SANTAMONICA_PEER or ARGOS_MCP_SANTAMONICA_BUILD_PROFILES"
+        ));
+    }
+    return {};
+}
+
+domain::Result<void> SecurityPolicy::authorize_santamonica_peer() const {
+    if (santamonica_peer_path.empty()) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::unsupported,
+            "santa monica runtime requires ARGOS_MCP_SANTAMONICA_PEER"
+        ));
+    }
+    const std::filesystem::path requested{santamonica_peer_path};
+    if (!requested.is_absolute()) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::invalid_argument, "santa monica peer path must be absolute"
+        ));
+    }
+    std::error_code path_error;
+    const auto canonical = std::filesystem::weakly_canonical(requested, path_error);
+    if (path_error || !std::filesystem::is_regular_file(canonical, path_error) || path_error) {
+        return std::unexpected(error(
+            domain::DebugErrorCode::not_found, "santa monica peer does not exist or is not a regular file"
         ));
     }
     return {};
