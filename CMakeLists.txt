@@ -57,6 +57,8 @@ add_library(argos_domain
     src/domain/unreal_runtime.cpp
     src/domain/santa_monica_runtime.cpp
     src/domain/santa_monica_bridge.cpp
+    src/domain/santa_monica_invoke.cpp
+    src/domain/santa_monica_dispatcher.cpp
     src/domain/santa_monica_inventory.cpp
     src/domain/disassembly.cpp
 )
@@ -74,6 +76,8 @@ add_library(argos_infrastructure
     src/infrastructure/santa_monica_bridge_crypto.cpp
     src/infrastructure/santa_monica_handshake_stream.cpp
     src/infrastructure/santa_monica_bridge_channel.cpp
+    src/infrastructure/santa_monica_invoke_stream.cpp
+    src/infrastructure/santa_monica_bridge_service.cpp
     src/infrastructure/santa_monica_bridge_peer.cpp
     src/infrastructure/santa_monica_native_reader.cpp
     src/infrastructure/santa_monica_inventory_reader.cpp
@@ -154,11 +158,21 @@ if(WIN32)
     argos_enable_static_analysis(argos_santa_monica_peer)
 
     add_library(argos_debug_bridge SHARED tools/debug_bridge.cpp)
+    target_link_libraries(argos_debug_bridge PRIVATE argos_infrastructure)
     target_compile_features(argos_debug_bridge PRIVATE cxx_std_23)
     argos_set_warnings(argos_debug_bridge)
     argos_enable_sanitizers(argos_debug_bridge)
     argos_enable_static_analysis(argos_debug_bridge)
     set_target_properties(argos_debug_bridge PROPERTIES OUTPUT_NAME "argos_debug_bridge")
+
+    # Client driver for the bridge's named-pipe server: sends one AddResource
+    # command and prints the result. Pairs with ARGOS_BRIDGE_PIPE on the target.
+    add_executable(argos_bridge_invoke tools/bridge_invoke.cpp)
+    target_link_libraries(argos_bridge_invoke PRIVATE argos_infrastructure)
+    target_compile_features(argos_bridge_invoke PRIVATE cxx_std_23)
+    argos_set_warnings(argos_bridge_invoke)
+    argos_enable_sanitizers(argos_bridge_invoke)
+    argos_enable_static_analysis(argos_bridge_invoke)
 endif()
 
 install(TARGETS argos_runtime_memory_mcp RUNTIME DESTINATION bin)
@@ -229,6 +243,22 @@ if(ARGOS_BUILD_TESTS)
     argos_enable_static_analysis(argos_santa_monica_runtime_tests)
     add_test(NAME argos_santa_monica_runtime_tests COMMAND argos_santa_monica_runtime_tests)
 
+    add_executable(argos_santa_monica_invoke_tests tests/unit/test_santa_monica_invoke.cpp)
+    target_link_libraries(argos_santa_monica_invoke_tests PRIVATE argos_domain)
+    target_compile_features(argos_santa_monica_invoke_tests PRIVATE cxx_std_23)
+    argos_set_warnings(argos_santa_monica_invoke_tests)
+    argos_enable_sanitizers(argos_santa_monica_invoke_tests)
+    argos_enable_static_analysis(argos_santa_monica_invoke_tests)
+    add_test(NAME argos_santa_monica_invoke_tests COMMAND argos_santa_monica_invoke_tests)
+
+    add_executable(argos_santa_monica_dispatcher_tests tests/unit/test_santa_monica_dispatcher.cpp)
+    target_link_libraries(argos_santa_monica_dispatcher_tests PRIVATE argos_domain)
+    target_compile_features(argos_santa_monica_dispatcher_tests PRIVATE cxx_std_23)
+    argos_set_warnings(argos_santa_monica_dispatcher_tests)
+    argos_enable_sanitizers(argos_santa_monica_dispatcher_tests)
+    argos_enable_static_analysis(argos_santa_monica_dispatcher_tests)
+    add_test(NAME argos_santa_monica_dispatcher_tests COMMAND argos_santa_monica_dispatcher_tests)
+
     add_executable(argos_santa_monica_stream_tests tests/unit/test_santa_monica_reflection_stream.cpp)
     target_link_libraries(argos_santa_monica_stream_tests PRIVATE argos_infrastructure)
     target_compile_features(argos_santa_monica_stream_tests PRIVATE cxx_std_23)
@@ -236,6 +266,37 @@ if(ARGOS_BUILD_TESTS)
     argos_enable_sanitizers(argos_santa_monica_stream_tests)
     argos_enable_static_analysis(argos_santa_monica_stream_tests)
     add_test(NAME argos_santa_monica_stream_tests COMMAND argos_santa_monica_stream_tests)
+
+    add_executable(argos_santa_monica_invoke_stream_tests tests/unit/test_santa_monica_invoke_stream.cpp)
+    target_link_libraries(argos_santa_monica_invoke_stream_tests PRIVATE argos_infrastructure)
+    target_compile_features(argos_santa_monica_invoke_stream_tests PRIVATE cxx_std_23)
+    argos_set_warnings(argos_santa_monica_invoke_stream_tests)
+    argos_enable_sanitizers(argos_santa_monica_invoke_stream_tests)
+    argos_enable_static_analysis(argos_santa_monica_invoke_stream_tests)
+    add_test(NAME argos_santa_monica_invoke_stream_tests COMMAND argos_santa_monica_invoke_stream_tests)
+
+    add_executable(argos_santa_monica_bridge_service_tests tests/unit/test_santa_monica_bridge_service.cpp)
+    target_link_libraries(argos_santa_monica_bridge_service_tests PRIVATE argos_infrastructure)
+    target_compile_features(argos_santa_monica_bridge_service_tests PRIVATE cxx_std_23)
+    argos_set_warnings(argos_santa_monica_bridge_service_tests)
+    argos_enable_sanitizers(argos_santa_monica_bridge_service_tests)
+    argos_enable_static_analysis(argos_santa_monica_bridge_service_tests)
+    add_test(NAME argos_santa_monica_bridge_service_tests COMMAND argos_santa_monica_bridge_service_tests)
+
+    if(WIN32)
+        # Loads the built bridge DLL (LoadLibrary == the injection code path) and
+        # drives its exported ABI end to end on the controlled target's own code.
+        add_executable(argos_debug_bridge_load_tests tests/unit/test_debug_bridge_load.cpp)
+        target_link_libraries(argos_debug_bridge_load_tests PRIVATE argos_infrastructure)
+        target_compile_features(argos_debug_bridge_load_tests PRIVATE cxx_std_23)
+        argos_set_warnings(argos_debug_bridge_load_tests)
+        argos_enable_sanitizers(argos_debug_bridge_load_tests)
+        argos_enable_static_analysis(argos_debug_bridge_load_tests)
+        target_compile_definitions(argos_debug_bridge_load_tests PRIVATE
+            ARGOS_DEBUG_BRIDGE_DLL="$<TARGET_FILE:argos_debug_bridge>")
+        add_dependencies(argos_debug_bridge_load_tests argos_debug_bridge)
+        add_test(NAME argos_debug_bridge_load_tests COMMAND argos_debug_bridge_load_tests)
+    endif()
 
     add_executable(argos_santa_monica_bridge_tests tests/unit/test_santa_monica_bridge.cpp)
     target_link_libraries(argos_santa_monica_bridge_tests PRIVATE argos_infrastructure)

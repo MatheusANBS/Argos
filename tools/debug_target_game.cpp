@@ -177,18 +177,53 @@ void input_handler() {
     }
 }
 
+// Opt-in: when ARGOS_BRIDGE_PIPE is set, load the debug bridge DLL the way an
+// injector would (LoadLibrary) and host its named-pipe server on a background
+// thread, so a client (argos_bridge_invoke) can drive engine-invoke commands
+// into this process. Default runs are unchanged.
+using BridgeServeFn = int (*)(const char*);
+
+// Returns a detached serving thread (or a non-joinable one when not hosting).
+// The module handle is intentionally leaked for the process lifetime: unloading
+// the DLL while the detached serve thread may still be inside it would crash.
+std::thread maybe_host_bridge() {
+    char pipe_buffer[256];
+    const DWORD length =
+        GetEnvironmentVariableA("ARGOS_BRIDGE_PIPE", pipe_buffer, sizeof(pipe_buffer));
+    if (length == 0 || length >= sizeof(pipe_buffer)) return {};
+    const std::string pipe_name(pipe_buffer, length);
+
+    const HMODULE module = LoadLibraryA("argos_debug_bridge.dll");
+    if (module == nullptr) {
+        std::cout << "[bridge] could not load argos_debug_bridge.dll (err " << GetLastError() << ")\n";
+        return {};
+    }
+    const auto serve = reinterpret_cast<BridgeServeFn>(
+        reinterpret_cast<void*>(GetProcAddress(module, "Argos_BridgeServe")));
+    if (serve == nullptr) {
+        std::cout << "[bridge] Argos_BridgeServe export missing\n";
+        return {};
+    }
+    std::cout << "[bridge] hosting engine-invoke on " << pipe_name << "\n";
+    return std::thread([serve, pipe_name] { serve(pipe_name.c_str()); });
+}
+
 int main() {
     SetConsoleOutputCP(CP_UTF8);
     initialize_game();
     print_memory_info();
     std::cout << "Commands: quit, pause, hurt, heal, kill, speed, tp, help\n\n";
-    
+
+    std::thread serve_thread = maybe_host_bridge();
+
     std::thread game_thread(game_loop);
     std::thread input_thread(input_handler);
-    
+
     game_thread.join();
     input_thread.join();
-    
+
+    if (serve_thread.joinable()) serve_thread.detach();
+
     std::cout << "\nGame stopped.\n";
     return 0;
 }

@@ -31,13 +31,18 @@ struct HandshakeTag {
     std::array<std::byte, handshake_tag_bytes> bytes{};
 };
 
-// Closed capability set. Lua, gameplay and SLI invocation require their own
-// ADR and proofs; this version negotiates read-only reflection alone.
+// Closed capability set. Lua and item grant require their own ADR and proofs;
+// `engine_invoke` negotiates the main-thread dispatcher that calls one
+// allowlisted SLI function (Spec 0014 stage 4). A bridge is still only offered a
+// capability its profile and gates enable, and appearing here authorizes
+// nothing on its own.
 enum class BridgeCapability : std::uint64_t {
     reflection_read = 1ULL << 0,
+    engine_invoke = 1ULL << 1,
 };
 inline constexpr std::uint64_t known_bridge_capabilities =
-    static_cast<std::uint64_t>(BridgeCapability::reflection_read);
+    static_cast<std::uint64_t>(BridgeCapability::reflection_read) |
+    static_cast<std::uint64_t>(BridgeCapability::engine_invoke);
 
 // Ephemeral per-session secret delivered by a protected bootstrap channel.
 // Fixed storage so no reallocation leaves a copy behind; zeroized on move and
